@@ -1,0 +1,3 @@
+display_name: Build Local IR Scrapers
+short_description: Local IR transcript scraper patterns.
+default_prompt: Use this skill to build or modify a local Ollama + LangChain scraper for investor-relations earnings call transcripts.

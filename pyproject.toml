@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-ir-transcripts"
+version = "0.1.0"
+description = "Local Ollama + LangChain scraper for company IR earnings call transcripts"
+requires-python = ">=3.11"
+dependencies = [
+  "beautifulsoup4>=4.12",
+  "duckduckgo-search>=6.2",
+  "langchain>=0.3",
+  "langchain-core>=0.3",
+  "langchain-ollama>=0.2",
+  "lxml>=5.2",
+  "pandas>=2.2",
+  "pydantic>=2.8",
+  "pypdf>=4.3",
+  "requests>=2.32",
+  "tenacity>=8.5",
+]
+
+[project.scripts]
+ir-transcripts = "ir_transcripts.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
