@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 
 from .agent import IRPageAgent
 from .browser import PlaywrightRenderer
-from .http import HttpClient
+from .http import HttpClient, RobotsDisallowedError, RobotsUnavailableError
 from .metadata import TranscriptMetadataAgent, extract_metadata_heuristic
 from .models import CandidateLink, CandidatePage, Company, CrawlFailure, CrawlResult, FailureType, TranscriptRecord
 from .parsing import extract_links, looks_like_js_shell, looks_like_transcript, page_title, pdf_text, visible_text
@@ -82,6 +82,12 @@ class TranscriptCrawler:
             run_visited.add(normalized)
             try:
                 response = self.http.get(url)
+            except RobotsDisallowedError as exc:
+                result.failures.append(self._failure(company, url, "robots_disallowed", exc))
+                continue
+            except RobotsUnavailableError as exc:
+                result.failures.append(self._failure(company, url, "robots_unavailable", exc))
+                continue
             except PermissionError as exc:
                 result.failures.append(self._failure(company, url, "robots_blocked", exc))
                 continue

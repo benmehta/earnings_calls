@@ -12,6 +12,18 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 DEFAULT_USER_AGENT = "local-ir-transcript-research/0.1 (+mailto:you@example.com)"
 
 
+class RobotsError(PermissionError):
+    """Base class for robots.txt permission failures."""
+
+
+class RobotsDisallowedError(RobotsError):
+    """The site's robots.txt explicitly disallows the URL."""
+
+
+class RobotsUnavailableError(RobotsError):
+    """robots.txt could not be fetched or parsed and fail-closed is enabled."""
+
+
 @dataclass
 class HttpClient:
     user_agent: str = DEFAULT_USER_AGENT
@@ -27,15 +39,25 @@ class HttpClient:
         self._last_request_at: dict[str, float] = {}
 
     def allowed(self, url: str) -> bool:
+        try:
+            self.check_robots(url)
+        except RobotsError:
+            return False
+        return True
+
+    def check_robots(self, url: str) -> None:
         if not self.respect_robots:
-            return True
+            return
 
         origin = self._origin(url)
         parser = self._robots_for(origin)
         if parser is None:
-            return not self.fail_closed_on_robots_error
+            if self.fail_closed_on_robots_error:
+                raise RobotsUnavailableError(f"Could not verify robots.txt for {url}")
+            return
 
-        return parser.can_fetch(self.user_agent, url)
+        if not parser.can_fetch(self.user_agent, url):
+            raise RobotsDisallowedError(f"Disallowed by robots.txt: {url}")
 
     def crawl_delay(self, url: str) -> float | None:
         if not self.respect_robots:
@@ -53,8 +75,7 @@ class HttpClient:
         wait=wait_exponential(multiplier=1, min=1, max=8),
     )
     def get(self, url: str) -> requests.Response:
-        if not self.allowed(url):
-            raise PermissionError(f"Blocked by robots.txt: {url}")
+        self.check_robots(url)
 
         self.wait_for_host(url)
         response = self.session.get(url, timeout=self.timeout_seconds)

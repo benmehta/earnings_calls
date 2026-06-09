@@ -82,6 +82,8 @@ class TranscriptRecord(BaseModel):
 
 FailureType = Literal[
     "robots_blocked",
+    "robots_disallowed",
+    "robots_unavailable",
     "timeout",
     "http_error",
     "parse_error",

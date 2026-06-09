@@ -1,5 +1,6 @@
-from ir_transcripts.crawler import artifact_stem, content_hash, link_score
-from ir_transcripts.models import CandidateLink
+from ir_transcripts.crawler import TranscriptCrawler, artifact_stem, content_hash, link_score
+from ir_transcripts.http import RobotsDisallowedError, RobotsUnavailableError
+from ir_transcripts.models import CandidateLink, Company
 
 
 def test_link_score_prefers_transcripts() -> None:
@@ -23,3 +24,36 @@ def test_artifact_stem_and_content_hash_are_stable() -> None:
     )
     assert content_hash("hello   world") == content_hash("hello world")
 
+
+def test_crawler_records_robots_unavailable(tmp_path) -> None:
+    class FakeHttp:
+        def get(self, url: str):
+            raise RobotsUnavailableError(f"Could not verify robots.txt for {url}")
+
+    crawler = TranscriptCrawler(
+        model="test-model",
+        out_dir=tmp_path,
+        seed_urls=["https://example.com/investors"],
+        http=FakeHttp(),  # type: ignore[arg-type]
+    )
+
+    result = crawler.crawl_company(Company(symbol="EX", name="Example"))
+
+    assert result.failures[0].failure_type == "robots_unavailable"
+
+
+def test_crawler_records_robots_disallowed(tmp_path) -> None:
+    class FakeHttp:
+        def get(self, url: str):
+            raise RobotsDisallowedError(f"Disallowed by robots.txt: {url}")
+
+    crawler = TranscriptCrawler(
+        model="test-model",
+        out_dir=tmp_path,
+        seed_urls=["https://example.com/private"],
+        http=FakeHttp(),  # type: ignore[arg-type]
+    )
+
+    result = crawler.crawl_company(Company(symbol="EX", name="Example"))
+
+    assert result.failures[0].failure_type == "robots_disallowed"

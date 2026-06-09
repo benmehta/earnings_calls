@@ -27,14 +27,31 @@ def page_title(html: str) -> str:
 def extract_links(html: str, source_url: str) -> list[CandidateLink]:
     soup = BeautifulSoup(html, "lxml")
     links: list[CandidateLink] = []
+    seen: set[str] = set()
     for anchor in soup.find_all("a", href=True):
-        label = " ".join(anchor.get_text(" ").split())
-        absolute = urljoin(source_url, anchor["href"])
-        parsed = urlparse(absolute)
-        if parsed.scheme not in {"http", "https"}:
-            continue
-        links.append(CandidateLink(url=absolute, label=label[:250], source_url=source_url))
+        link = _candidate_from_tag(anchor, "href", source_url)
+        if link and link.url not in seen:
+            seen.add(link.url)
+            links.append(link)
+
+    for tag in soup.find_all(attrs={"link": True}):
+        link = _candidate_from_tag(tag, "link", source_url)
+        if link and link.url not in seen:
+            seen.add(link.url)
+            links.append(link)
     return links
+
+
+def _candidate_from_tag(tag, attribute: str, source_url: str) -> CandidateLink | None:
+    absolute = urljoin(source_url, tag.get(attribute, ""))
+    parsed = urlparse(absolute)
+    if parsed.scheme not in {"http", "https"}:
+        return None
+
+    label = " ".join(tag.get_text(" ").split())
+    if not label:
+        label = tag.get("arialabel") or tag.get("aria-label") or tag.get("title") or ""
+    return CandidateLink(url=absolute, label=label[:250], source_url=source_url)
 
 
 def pdf_text(content: bytes) -> str:

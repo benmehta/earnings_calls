@@ -14,8 +14,7 @@ class PlaywrightRenderer:
     timeout_ms: int = 30_000
 
     def render_html(self, url: str) -> str:
-        if not self.http.allowed(url):
-            raise PermissionError(f"Blocked by robots.txt: {url}")
+        self.http.check_robots(url)
 
         self.http.wait_for_host(url)
 
@@ -29,4 +28,3 @@ class PlaywrightRenderer:
                 return page.content()
             finally:
                 browser.close()
-
