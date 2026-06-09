@@ -9,14 +9,17 @@ from langchain_ollama import ChatOllama
 from .models import CandidateLink, PageDecision
 
 
-def build_llm(model: str, temperature: float = 0.0) -> ChatOllama:
-    return ChatOllama(model=model, temperature=temperature)
+def build_llm(model: str, temperature: float = 0.0, base_url: str | None = None) -> ChatOllama:
+    kwargs = {"model": model, "temperature": temperature}
+    if base_url:
+        kwargs["base_url"] = base_url
+    return ChatOllama(**kwargs)
 
 
 class IRPageAgent:
     """Small LangChain/Ollama page classifier used by the crawler."""
 
-    def __init__(self, model: str) -> None:
+    def __init__(self, model: str, base_url: str | None = None) -> None:
         self.parser = PydanticOutputParser(pydantic_object=PageDecision)
         self.chain = (
             ChatPromptTemplate.from_messages(
@@ -39,7 +42,7 @@ class IRPageAgent:
                     ),
                 ]
             )
-            | build_llm(model)
+            | build_llm(model, base_url=base_url)
             | self.parser
         )
 
@@ -68,4 +71,3 @@ class IRPageAgent:
                 "format_instructions": self.parser.get_format_instructions(),
             }
         )
-

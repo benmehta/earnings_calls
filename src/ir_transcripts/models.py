@@ -47,10 +47,42 @@ class TranscriptRecord(BaseModel):
     metadata: dict[str, str] = Field(default_factory=dict)
 
 
+FailureType = Literal[
+    "robots_blocked",
+    "timeout",
+    "http_error",
+    "parse_error",
+    "llm_error",
+    "pdf_error",
+    "playwright_error",
+    "not_transcript",
+    "unknown_error",
+]
+
+
+class CrawlFailure(BaseModel):
+    company: Company
+    url: str
+    failure_type: FailureType
+    message: str = ""
+
+
+class CandidatePage(BaseModel):
+    company: Company
+    url: str
+    title: str = ""
+    depth: int = 0
+    heuristic_score: int = 0
+    llm_page_type: str | None = None
+    llm_confidence: float | None = None
+    reason: str = ""
+
+
 class CrawlResult(BaseModel):
     company: Company
     ir_url: str | None = None
     transcripts: list[TranscriptRecord] = Field(default_factory=list)
+    candidates: list[CandidatePage] = Field(default_factory=list)
+    failures: list[CrawlFailure] = Field(default_factory=list)
     skipped_reason: str | None = None
     visited_count: int = 0
-

@@ -9,7 +9,7 @@ import requests
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 
-DEFAULT_USER_AGENT = "local-ir-transcript-research/0.1 (+contact: you@example.com)"
+DEFAULT_USER_AGENT = "local-ir-transcript-research/0.1 (+mailto:you@example.com)"
 
 
 @dataclass
@@ -18,36 +18,74 @@ class HttpClient:
     delay_seconds: float = 1.5
     timeout_seconds: float = 25.0
     respect_robots: bool = True
+    fail_closed_on_robots_error: bool = True
 
     def __post_init__(self) -> None:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": self.user_agent})
         self._robots: dict[str, RobotFileParser] = {}
+        self._last_request_at: dict[str, float] = {}
 
     def allowed(self, url: str) -> bool:
         if not self.respect_robots:
             return True
 
-        parsed = urlparse(url)
-        base = f"{parsed.scheme}://{parsed.netloc}"
-        if base not in self._robots:
-            parser = RobotFileParser()
-            parser.set_url(f"{base}/robots.txt")
-            try:
-                parser.read()
-            except Exception:
-                return True
-            self._robots[base] = parser
+        origin = self._origin(url)
+        parser = self._robots_for(origin)
+        if parser is None:
+            return not self.fail_closed_on_robots_error
 
-        return self._robots[base].can_fetch(self.user_agent, url)
+        return parser.can_fetch(self.user_agent, url)
+
+    def crawl_delay(self, url: str) -> float | None:
+        if not self.respect_robots:
+            return None
+
+        parser = self._robots_for(self._origin(url))
+        if parser is None:
+            return None
+
+        return parser.crawl_delay(self.user_agent)
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
     def get(self, url: str) -> requests.Response:
         if not self.allowed(url):
             raise PermissionError(f"Blocked by robots.txt: {url}")
 
-        time.sleep(self.delay_seconds)
+        self.wait_for_host(url)
         response = self.session.get(url, timeout=self.timeout_seconds)
         response.raise_for_status()
         return response
 
+    def _robots_for(self, origin: str) -> RobotFileParser | None:
+        if origin in self._robots:
+            return self._robots[origin]
+
+        parser = RobotFileParser()
+        parser.set_url(f"{origin}/robots.txt")
+        try:
+            response = self.session.get(f"{origin}/robots.txt", timeout=self.timeout_seconds)
+            if response.status_code == 404:
+                parser.parse([])
+                self._robots[origin] = parser
+                return parser
+            if response.status_code >= 400:
+                return None
+            parser.parse(response.text.splitlines())
+        except Exception:
+            return None
+
+        self._robots[origin] = parser
+        return parser
+
+    def wait_for_host(self, url: str) -> None:
+        origin = self._origin(url)
+        delay = max(self.delay_seconds, self.crawl_delay(url) or 0.0)
+        elapsed = time.monotonic() - self._last_request_at.get(origin, 0.0)
+        if elapsed < delay:
+            time.sleep(delay - elapsed)
+        self._last_request_at[origin] = time.monotonic()
+
+    def _origin(self, url: str) -> str:
+        parsed = urlparse(url)
+        return f"{parsed.scheme}://{parsed.netloc}"

@@ -57,3 +57,10 @@ def looks_like_transcript(text: str) -> bool:
     ]
     return sum(marker in lower for marker in markers) >= 2
 
+
+def looks_like_js_shell(html: str, text: str) -> bool:
+    lower = html.lower()
+    if len(text) < 500 and len(html) > 5000:
+        return True
+    markers = ("__next_data__", "data-reactroot", "id=\"root\"", "id=\"app\"", "window.__")
+    return len(text) < 1500 and any(marker in lower for marker in markers)

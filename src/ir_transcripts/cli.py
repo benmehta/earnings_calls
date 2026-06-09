@@ -2,24 +2,46 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 from .crawler import TranscriptCrawler
+from .http import DEFAULT_USER_AGENT, HttpClient
+from .indexing import index_transcripts
 from .sp500 import load_sp500
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Scrape S&P 500 IR earnings transcripts with Ollama + LangChain.")
-    parser.add_argument("--model", default="llama3.1:8b", help="Ollama model name")
+    parser.add_argument("--model", default=os.getenv("OLLAMA_MODEL", "llama3.1:8b"), help="Ollama model name")
+    parser.add_argument("--ollama-base-url", default=os.getenv("OLLAMA_BASE_URL"), help="Optional Ollama base URL")
     parser.add_argument("--out", type=Path, default=Path("data/transcripts"), help="Output directory")
     parser.add_argument("--limit", type=int, default=None, help="Limit company count for testing")
     parser.add_argument("--symbols", nargs="*", help="Optional ticker symbols to crawl")
     parser.add_argument("--max-pages", type=int, default=40, help="Max pages per company")
     parser.add_argument("--max-depth", type=int, default=3, help="Max crawl depth from IR candidates")
+    parser.add_argument("--user-agent", default=os.getenv("IR_USER_AGENT", DEFAULT_USER_AGENT), help="User agent sent to company websites")
+    parser.add_argument("--delay", type=float, default=float(os.getenv("IR_DELAY_SECONDS", "1.5")), help="Minimum delay between requests to the same host")
+    parser.add_argument("--playwright", action="store_true", help="Render likely JavaScript app-shell pages")
+    parser.add_argument("--review-only", action="store_true", help="Write candidate/failure review files without saving transcript artifacts")
+    parser.add_argument("--no-resume", action="store_true", help="Ignore existing per-company crawl state")
+    parser.add_argument("--metadata-llm", action="store_true", help="Use a second local Ollama pass for confirmed transcript metadata")
+    parser.add_argument("--index-chroma", action="store_true", help="Index collected transcripts into local Chroma")
+    parser.add_argument("--chroma-dir", type=Path, default=Path("data/chroma"), help="Chroma persistence directory")
+    parser.add_argument("--embedding-model", default=os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text"), help="Ollama embedding model for Chroma")
+    parser.add_argument("--ignore-robots", action="store_true", help="Disable robots.txt checks")
+    parser.add_argument(
+        "--robots-fail-open",
+        action="store_true",
+        help="Allow crawling when robots.txt cannot be fetched due to an error",
+    )
     return parser
 
 
 def main() -> None:
+    load_dotenv()
     args = build_parser().parse_args()
     companies = load_sp500()
 
@@ -35,14 +57,27 @@ def main() -> None:
         out_dir=args.out,
         max_pages_per_company=args.max_pages,
         max_depth=args.max_depth,
+        use_playwright=args.playwright,
+        ollama_base_url=args.ollama_base_url,
+        resume=not args.no_resume,
+        review_only=args.review_only,
+        extract_metadata_with_llm=args.metadata_llm,
+        http=HttpClient(
+            user_agent=args.user_agent,
+            delay_seconds=args.delay,
+            respect_robots=not args.ignore_robots,
+            fail_closed_on_robots_error=not args.robots_fail_open,
+        ),
     )
 
     args.out.mkdir(parents=True, exist_ok=True)
     summary_path = args.out / "_summary.jsonl"
 
     with summary_path.open("a", encoding="utf-8") as summary:
+        collected = []
         for company in companies:
             result = crawler.crawl_company(company)
+            collected.extend(result.transcripts)
             summary.write(json.dumps(result.model_dump(mode="json"), ensure_ascii=True) + "\n")
             summary.flush()
             print(
@@ -50,7 +85,15 @@ def main() -> None:
                 f"{result.visited_count} page(s) visited"
             )
 
+    if args.index_chroma:
+        chunks = index_transcripts(
+            collected,
+            persist_dir=args.chroma_dir,
+            embedding_model=args.embedding_model,
+            ollama_base_url=args.ollama_base_url,
+        )
+        print(f"Indexed {chunks} transcript chunk(s) into {args.chroma_dir}")
+
 
 if __name__ == "__main__":
     main()
-
