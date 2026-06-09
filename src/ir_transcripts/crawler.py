@@ -32,9 +32,14 @@ class TranscriptCrawler:
         ollama_base_url: str | None = None,
         resume: bool = True,
         review_only: bool = False,
+        seed_urls: list[str] | None = None,
+        include_discovery_guesses: bool = False,
+        rerank_discovery: bool = False,
         extract_metadata_with_llm: bool = False,
         http: HttpClient | None = None,
     ) -> None:
+        self.model = model
+        self.ollama_base_url = ollama_base_url
         self.agent = IRPageAgent(model, base_url=ollama_base_url)
         self.metadata_agent = TranscriptMetadataAgent(model, base_url=ollama_base_url) if extract_metadata_with_llm else None
         self.out_dir = out_dir
@@ -42,11 +47,19 @@ class TranscriptCrawler:
         self.max_depth = max_depth
         self.resume = resume
         self.review_only = review_only
+        self.seed_urls = seed_urls or []
+        self.include_discovery_guesses = include_discovery_guesses
+        self.rerank_discovery = rerank_discovery
         self.http = http or HttpClient()
         self.renderer = PlaywrightRenderer(self.http) if use_playwright else None
 
     def crawl_company(self, company: Company) -> CrawlResult:
-        seeds = find_ir_candidates(company)
+        seeds = self.seed_urls or find_ir_candidates(
+            company,
+            include_guesses=self.include_discovery_guesses,
+            rerank_model=self.model if self.rerank_discovery else None,
+            ollama_base_url=self.ollama_base_url,
+        )
         if not seeds:
             return CrawlResult(company=company, skipped_reason="No investor-relations candidates found")
 
@@ -75,8 +88,8 @@ class TranscriptCrawler:
             except TimeoutError as exc:
                 result.failures.append(self._failure(company, url, "timeout", exc))
                 continue
-            except Exception:
-                result.failures.append(self._failure(company, url, "http_error"))
+            except Exception as exc:
+                result.failures.append(self._failure(company, url, "http_error", exc))
                 continue
             state.mark_visited(url)
 

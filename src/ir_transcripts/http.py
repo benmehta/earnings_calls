@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
 
 import requests
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 
 DEFAULT_USER_AGENT = "local-ir-transcript-research/0.1 (+mailto:you@example.com)"
@@ -47,7 +47,11 @@ class HttpClient:
 
         return parser.crawl_delay(self.user_agent)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
+    @retry(
+        retry=retry_if_exception_type(requests.RequestException),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=8),
+    )
     def get(self, url: str) -> requests.Response:
         if not self.allowed(url):
             raise PermissionError(f"Blocked by robots.txt: {url}")
@@ -89,3 +93,12 @@ class HttpClient:
     def _origin(self, url: str) -> str:
         parsed = urlparse(url)
         return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def random_browser_user_agent() -> str:
+    try:
+        from fake_useragent import UserAgent
+
+        return UserAgent().random
+    except Exception:
+        return DEFAULT_USER_AGENT

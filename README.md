@@ -72,6 +72,30 @@ To review likely transcript pages before saving transcript artifacts:
 python -m ir_transcripts --symbols AAPL MSFT --review-only --max-pages 10
 ```
 
+To preview discovery without crawling company IR pages:
+
+```bash
+python -m ir_transcripts.discover MSFT --max-results 8
+```
+
+Discovery uses curated known URLs plus search results by default. Deterministic
+URL guesses are disabled unless search/curated discovery finds nothing and you
+explicitly opt in:
+
+```bash
+python -m ir_transcripts.discover MSFT --include-guesses
+python -m ir_transcripts.discover MSFT --rerank-ollama
+```
+
+To skip discovery entirely:
+
+```bash
+python -m ir_transcripts \
+  --symbols MSFT \
+  --seed-url https://www.microsoft.com/en-us/Investor \
+  --review-only
+```
+
 Each company directory gets `_candidates.jsonl`, `_failures.jsonl`,
 `_crawl_state.json`, and `_page_cache/` files so broad crawls can be audited,
 resumed, and reclassified without repeatedly fetching the same pages.
@@ -128,6 +152,13 @@ Use an honest, contactable user agent rather than a fake browser user agent:
 
 ```text
 local-ir-transcript-research/0.1 (+mailto:you@example.com)
+```
+
+If you intentionally need a browser-like user agent for a small diagnostic run,
+use an explicit opt-in:
+
+```bash
+python -m ir_transcripts --symbols AAPL --max-pages 5 --review-only --fake-user-agent
 ```
 
 Defaults are intentionally conservative:

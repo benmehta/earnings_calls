@@ -10,6 +10,7 @@ requires-python = ">=3.11"
 dependencies = [
   "beautifulsoup4>=4.12",
   "duckduckgo-search>=6.2",
+  "fake-useragent>=2.0",
   "langchain>=0.3",
   "langchain-chroma>=0.1",
   "langchain-community>=0.3",
@@ -29,6 +30,7 @@ dependencies = [
 
 [project.scripts]
 ir-transcripts = "ir_transcripts.cli:main"
+ir-discover = "ir_transcripts.discover:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

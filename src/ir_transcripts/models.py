@@ -22,6 +22,25 @@ class CandidateLink(BaseModel):
     reason: str = ""
 
 
+class IRDiscoveryCandidate(BaseModel):
+    url: str
+    title: str = ""
+    snippet: str = ""
+    source: Literal["curated", "search", "deterministic"] = "search"
+    score: int = 0
+    reasons: list[str] = Field(default_factory=list)
+
+
+class IRDiscoverySelection(BaseModel):
+    url: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    reason: str = ""
+
+
+class IRDiscoveryDecision(BaseModel):
+    selections: list[IRDiscoverySelection] = Field(default_factory=list)
+
+
 class PageDecision(BaseModel):
     page_type: Literal[
         "transcript",

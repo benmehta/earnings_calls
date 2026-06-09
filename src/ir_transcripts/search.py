@@ -1,27 +1,203 @@
 from __future__ import annotations
 
+from urllib.parse import urlparse
+
+import requests
+from bs4 import BeautifulSoup
 from duckduckgo_search import DDGS
 
-from .models import Company
+from .agent import IRDiscoveryAgent
+from .models import Company, IRDiscoveryCandidate
+from .urls import normalize_url
 
 
-def find_ir_candidates(company: Company, max_results: int = 6) -> list[str]:
+CURATED_IR_URLS = {
+    "AAPL": ["https://investor.apple.com/investor-relations/default.aspx"],
+    "MSFT": ["https://www.microsoft.com/en-us/Investor"],
+    "NVDA": ["https://investor.nvidia.com"],
+}
+
+
+def find_ir_candidates(
+    company: Company,
+    max_results: int = 6,
+    *,
+    include_guesses: bool = False,
+    rerank_model: str | None = None,
+    ollama_base_url: str | None = None,
+) -> list[str]:
     """Find likely investor-relations pages without needing a paid search API."""
-    query = f"{company.name} {company.symbol} investor relations earnings transcripts"
-    candidates: list[str] = deterministic_ir_candidates(company)
+    discovered = discover_ir_candidates(
+        company,
+        max_results=max_results,
+        include_guesses=include_guesses,
+        rerank_model=rerank_model,
+        ollama_base_url=ollama_base_url,
+    )
+    return [candidate.url for candidate in discovered]
+
+
+def discover_ir_candidates(
+    company: Company,
+    max_results: int = 10,
+    *,
+    include_guesses: bool = False,
+    rerank_model: str | None = None,
+    ollama_base_url: str | None = None,
+) -> list[IRDiscoveryCandidate]:
+    candidates: list[IRDiscoveryCandidate] = []
+
+    for url in CURATED_IR_URLS.get(company.symbol.upper(), []):
+        candidates.append(
+            IRDiscoveryCandidate(
+                url=url,
+                title=f"{company.name} investor relations",
+                source="curated",
+                score=100,
+                reasons=["curated known IR URL"],
+            )
+        )
+
+    candidates.extend(search_ir_candidates(company, max_results=max_results))
+
+    if include_guesses and not candidates:
+        for url in deterministic_ir_candidates(company):
+            candidates.append(
+                score_ir_candidate(
+                    url=url,
+                    title="",
+                    snippet="",
+                    company=company,
+                    source="deterministic",
+                )
+            )
+
+    ranked = dedupe_candidates(sorted(candidates, key=lambda item: item.score, reverse=True))
+    if rerank_model and ranked:
+        ranked = rerank_ir_candidates(
+            company,
+            ranked,
+            model=rerank_model,
+            ollama_base_url=ollama_base_url,
+            limit=max_results,
+        )
+    return ranked
+
+
+def rerank_ir_candidates(
+    company: Company,
+    candidates: list[IRDiscoveryCandidate],
+    *,
+    model: str,
+    ollama_base_url: str | None = None,
+    limit: int = 10,
+) -> list[IRDiscoveryCandidate]:
+    by_url = {normalize_url(candidate.url): candidate for candidate in candidates}
+    try:
+        decision = IRDiscoveryAgent(model, base_url=ollama_base_url).rerank(
+            company_name=company.name,
+            ticker=company.symbol,
+            candidates=candidates,
+            limit=limit,
+        )
+    except Exception:
+        return candidates
+
+    reranked: list[IRDiscoveryCandidate] = []
+    seen: set[str] = set()
+    for selection in decision.selections:
+        normalized = normalize_url(selection.url)
+        candidate = by_url.get(normalized)
+        if not candidate or normalized in seen:
+            continue
+        candidate.score += int(selection.confidence * 25)
+        candidate.reasons = [f"ollama rerank: {selection.reason}"] + candidate.reasons
+        reranked.append(candidate)
+        seen.add(normalized)
+
+    for candidate in candidates:
+        normalized = normalize_url(candidate.url)
+        if normalized not in seen:
+            reranked.append(candidate)
+
+    return reranked
+
+
+def search_ir_candidates(company: Company, max_results: int = 10) -> list[IRDiscoveryCandidate]:
+    candidates: list[IRDiscoveryCandidate] = []
 
     try:
         with DDGS() as ddgs:
-            for result in ddgs.text(query, max_results=max_results):
-                url = result.get("href") or result.get("url")
-                if not url:
-                    continue
-                if any(token in url.lower() for token in ("investor", "/ir", "shareholder", "earnings")):
-                    candidates.append(url)
+            for query in search_queries(company):
+                for result in ddgs.text(query, backend="lite", max_results=max_results):
+                    url = result.get("href") or result.get("url")
+                    if not url:
+                        continue
+                    candidates.append(
+                        score_ir_candidate(
+                            url=url,
+                            title=result.get("title", ""),
+                            snippet=result.get("body", ""),
+                            company=company,
+                            source="search",
+                        )
+                    )
     except Exception:
         pass
 
-    return dedupe(candidates)
+    if not candidates:
+        candidates.extend(search_ir_candidates_lite_html(company, max_results=max_results))
+
+    return dedupe_candidates([candidate for candidate in candidates if candidate.score > 0])
+
+
+def search_ir_candidates_lite_html(company: Company, max_results: int = 10) -> list[IRDiscoveryCandidate]:
+    candidates: list[IRDiscoveryCandidate] = []
+    session = requests.Session()
+    session.headers.update({"User-Agent": "local-ir-discovery/0.1"})
+
+    for query in search_queries(company):
+        try:
+            response = session.post(
+                "https://lite.duckduckgo.com/lite/",
+                data={"q": query},
+                timeout=20,
+            )
+            response.raise_for_status()
+        except Exception:
+            continue
+
+        soup = BeautifulSoup(response.text, "lxml")
+        for anchor in soup.find_all("a", href=True):
+            title = anchor.get_text(" ", strip=True)
+            url = anchor["href"]
+            if not title or not url.startswith("http"):
+                continue
+            snippet = anchor.find_parent("td").get_text(" ", strip=True) if anchor.find_parent("td") else ""
+            candidates.append(
+                score_ir_candidate(
+                    url=url,
+                    title=title,
+                    snippet=snippet,
+                    company=company,
+                    source="search",
+                )
+            )
+            if len(candidates) >= max_results:
+                break
+        if len(candidates) >= max_results:
+            break
+
+    return dedupe_candidates(candidates)
+
+
+def search_queries(company: Company) -> list[str]:
+    return [
+        f"{company.name} investor relations",
+        f"{company.name} earnings results investor relations",
+        f"{company.symbol} investor relations",
+        f"{company.name} earnings call transcript",
+    ]
 
 
 def deterministic_ir_candidates(company: Company) -> list[str]:
@@ -43,6 +219,122 @@ def deterministic_ir_candidates(company: Company) -> list[str]:
             ]
         )
     return dedupe(candidates)
+
+
+def score_ir_candidate(
+    *,
+    url: str,
+    title: str,
+    snippet: str,
+    company: Company,
+    source: IRDiscoveryCandidate.model_fields["source"].annotation,
+) -> IRDiscoveryCandidate:
+    parsed = urlparse(url)
+    haystack = f"{url} {title} {snippet}".lower()
+    domain = parsed.netloc.lower()
+    score = 0
+    reasons: list[str] = []
+
+    company_tokens = company_domain_tokens(company)
+    if any(token in domain for token in company_tokens):
+        score += 25
+        reasons.append("domain matches company")
+    official_domain = company_domain_slug(company.name)
+    if domain == f"www.{official_domain}.com" or domain.endswith(f".{official_domain}.com"):
+        score += 35
+        reasons.append("official company domain")
+    if company.symbol.lower() in haystack:
+        score += 8
+        reasons.append("mentions ticker")
+
+    positive = {
+        "investor relations": 25,
+        "investors": 12,
+        "investor": 12,
+        "earnings": 10,
+        "quarterly results": 10,
+        "financial results": 10,
+        "events": 6,
+        "transcript": 12,
+        "shareholder": 6,
+    }
+    for token, value in positive.items():
+        if token in haystack:
+            score += value
+            reasons.append(f"contains {token}")
+
+    negative = {
+        "careers": 30,
+        "support": 20,
+        "privacy": 20,
+        "terms": 20,
+        "store": 15,
+        "learn": 10,
+        "training": 10,
+        "news.microsoft.com": 8,
+    }
+    for token, value in negative.items():
+        if token in haystack:
+            score -= value
+            reasons.append(f"penalized {token}")
+
+    third_party_domains = (
+        "fool.com",
+        "seekingalpha.com",
+        "finance.yahoo.com",
+        "marketbeat.com",
+        "stockanalysis.com",
+        "morningstar.com",
+        "aol.com",
+        "quartr.com",
+        "valuesense.io",
+        "advfn.com",
+        "finviz.com",
+        "barchart.com",
+        "prnewswire.com",
+        "sec.gov",
+    )
+    if any(domain == third_party or domain.endswith(f".{third_party}") for third_party in third_party_domains):
+        score -= 35
+        reasons.append("penalized third-party domain")
+
+    if source == "curated":
+        score += 50
+    elif source == "search":
+        score += 10
+
+    return IRDiscoveryCandidate(
+        url=url,
+        title=title,
+        snippet=snippet,
+        source=source,
+        score=score,
+        reasons=reasons,
+    )
+
+
+def company_domain_tokens(company: Company) -> list[str]:
+    tokens = [company.symbol.lower()]
+    slug = company_domain_slug(company.name)
+    if slug:
+        tokens.append(slug)
+    for word in company.name.lower().split():
+        cleaned = "".join(char for char in word if char.isalnum())
+        if len(cleaned) > 3:
+            tokens.append(cleaned)
+    return list(dict.fromkeys(tokens))
+
+
+def dedupe_candidates(candidates: list[IRDiscoveryCandidate]) -> list[IRDiscoveryCandidate]:
+    seen: set[str] = set()
+    result: list[IRDiscoveryCandidate] = []
+    for candidate in candidates:
+        normalized = normalize_url(candidate.url)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(candidate)
+    return result
 
 
 def company_domain_slug(name: str) -> str:
