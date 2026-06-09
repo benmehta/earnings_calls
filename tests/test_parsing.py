@@ -2,7 +2,7 @@ from pathlib import Path
 from zipfile import ZipFile
 from io import BytesIO
 
-from ir_transcripts.parsing import docx_text, extract_links, looks_like_js_shell, looks_like_transcript, visible_text
+from ir_transcripts.parsing import classify_transcript, docx_text, extract_links, looks_like_js_shell, looks_like_transcript, visible_text
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -14,6 +14,35 @@ def test_visible_text_and_transcript_detection() -> None:
 
     assert "Operator" in text
     assert looks_like_transcript(text)
+
+
+def test_press_release_webcast_text_is_not_transcript() -> None:
+    text = """
+    Microsoft Cloud and AI Strength Fuels Third Quarter Results.
+    Business Highlights include Microsoft 365 and Azure growth.
+    Webcast Details: Satya Nadella, Amy Hood, and investor relations will host
+    a conference call and webcast to discuss performance. Forward-looking
+    statements and non-GAAP financial measures are included below. Analysts and
+    investors may access the webcast from the investor relations site.
+    """
+
+    detection = classify_transcript(
+        text,
+        title="FY26 Q3 - Press Releases - Investor Relations - Microsoft",
+        url="https://www.microsoft.com/en-us/investor/earnings/fy-2026-q3/press-release-webcast",
+    )
+
+    assert not detection.is_transcript
+    assert detection.reason == "transcript_rejected_press_release_like"
+
+
+def test_ir_index_with_transcript_links_is_not_transcript() -> None:
+    html = (FIXTURES / "ir_index.html").read_text(encoding="utf-8")
+
+    detection = classify_transcript(visible_text(html), title="Example Investor Relations")
+
+    assert not detection.is_transcript
+    assert detection.reason == "transcript_rejected_missing_speaker_structure"
 
 
 def test_extract_links_normalizes_relative_urls() -> None:
@@ -49,6 +78,22 @@ def test_docx_text_extracts_paragraphs() -> None:
         archive.writestr("word/document.xml", document_xml)
 
     assert docx_text(buffer.getvalue()) == "Operator\n\nPrepared remarks"
+
+
+def test_docx_transcript_text_is_detected() -> None:
+    text = "\n\n".join(
+        [
+            "Microsoft Fiscal Year 2026 Third Quarter Earnings Call Transcript",
+            "OPERATOR: Welcome to the Microsoft earnings conference call.",
+            "SATYA NADELLA: Thank you, and welcome everyone.",
+            "AMY HOOD: I will cover our financial results.",
+            "JONATHAN NEILSON: Operator, next question, please.",
+            "QUESTION-AND-ANSWER SESSION",
+            "END",
+        ]
+    )
+
+    assert looks_like_transcript(text, title="TranscriptQandAFY26Q3")
 
 
 def test_js_shell_detection() -> None:

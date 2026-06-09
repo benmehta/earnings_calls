@@ -10,7 +10,7 @@ from .browser import PlaywrightRenderer
 from .http import HttpClient, RobotsDisallowedError, RobotsUnavailableError
 from .metadata import TranscriptMetadataAgent, extract_metadata_heuristic
 from .models import CandidateLink, CandidatePage, Company, CrawlFailure, CrawlResult, FailureType, TranscriptRecord
-from .parsing import docx_text, extract_links, looks_like_js_shell, looks_like_transcript, page_title, pdf_text, visible_text
+from .parsing import classify_transcript, docx_text, extract_links, looks_like_js_shell, looks_like_transcript, page_title, pdf_text, visible_text
 from .search import find_ir_candidates
 from .state import CrawlState
 from .urls import host, normalize_url, resolve_document_url
@@ -120,6 +120,7 @@ class TranscriptCrawler:
                     except Exception as exc:
                         result.failures.append(self._failure(company, url, "parse_error", exc))
                         continue
+                    detection = classify_transcript(text, title=url.rstrip("/").split("/")[-1], url=url)
                     result.candidates.append(
                         CandidatePage(
                             company=company,
@@ -127,9 +128,9 @@ class TranscriptCrawler:
                             title=url.rstrip("/").split("/")[-1] or "transcript.docx",
                             depth=depth,
                             heuristic_score=link_score(CandidateLink(url=url, source_url=url, label="docx transcript")),
-                            llm_page_type="transcript" if looks_like_transcript(text) else "not_relevant",
-                            llm_confidence=1.0 if looks_like_transcript(text) else None,
-                            reason="DOCX document text inspected without saving transcript artifact",
+                            llm_page_type="transcript" if detection.is_transcript else "not_relevant",
+                            llm_confidence=1.0 if detection.is_transcript else None,
+                            reason=detection.reason,
                         )
                     )
                 continue
@@ -150,8 +151,9 @@ class TranscriptCrawler:
                     result.failures.append(self._failure(company, url, "playwright_error", exc))
                     rendered = False
             links = extract_links(html, url)
+            detection = classify_transcript(text, title=title, url=url)
 
-            if looks_like_transcript(text):
+            if detection.is_transcript:
                 if not self.review_only:
                     record = self._record_html(company, url, title, html, text, state, result, rendered=rendered)
                     if record:
@@ -178,17 +180,11 @@ class TranscriptCrawler:
                 heuristic_score=max((link_score(link) for link in links), default=link_score(CandidateLink(url=url, source_url=url))),
                 llm_page_type=decision.page_type if decision else None,
                 llm_confidence=decision.confidence if decision else None,
-                reason=decision.reason if decision else "",
+                reason=candidate_reason(decision.reason if decision else "", detection.reason),
             )
             result.candidates.append(candidate)
 
             if decision:
-                if decision.page_type == "transcript" and not looks_like_transcript(text):
-                    if not self.review_only:
-                        record = self._record_html(company, url, title, html, text, state, result, rendered=rendered)
-                        if record:
-                            result.transcripts.append(record)
-
                 for link in decision.useful_links:
                     if self._should_follow(link, allowed_hosts, current_url=url):
                         allowed_hosts.add(host(link.url))
@@ -260,7 +256,8 @@ class TranscriptCrawler:
         except Exception as exc:
             result.failures.append(self._failure(company, url, "pdf_error", exc))
             return None
-        if not looks_like_transcript(text):
+        title = url.rstrip("/").split("/")[-1] or "transcript.pdf"
+        if not looks_like_transcript(text, title=title, url=url):
             result.failures.append(self._failure(company, url, "not_transcript"))
             return None
         if state.has_transcript_url(url):
@@ -269,7 +266,6 @@ class TranscriptCrawler:
         if state.has_content_hash(digest):
             return None
         company_dir = self._company_dir(company)
-        title = url.rstrip("/").split("/")[-1] or "transcript.pdf"
         raw_path = company_dir / f"{artifact_stem(title, url)}.pdf"
         raw_path.write_bytes(content)
         extracted = self._metadata(title, text, result, url)
@@ -301,7 +297,8 @@ class TranscriptCrawler:
         except Exception as exc:
             result.failures.append(self._failure(company, url, "parse_error", exc))
             return None
-        if not looks_like_transcript(text):
+        title = url.rstrip("/").split("/")[-1] or "transcript.docx"
+        if not looks_like_transcript(text, title=title, url=url):
             result.failures.append(self._failure(company, url, "not_transcript"))
             return None
         if state.has_transcript_url(url):
@@ -310,7 +307,6 @@ class TranscriptCrawler:
         if state.has_content_hash(digest):
             return None
         company_dir = self._company_dir(company)
-        title = url.rstrip("/").split("/")[-1] or "transcript.docx"
         raw_path = company_dir / f"{artifact_stem(title, url)}.docx"
         raw_path.write_bytes(content)
         extracted = self._metadata(title, text, result, url)
@@ -432,6 +428,10 @@ def can_expand_host(link: CandidateLink, current_url: str) -> bool:
         "transcript",
     )
     return any(marker in haystack for marker in vendor_markers) and link_score(link) >= 2
+
+
+def candidate_reason(*parts: str) -> str:
+    return "; ".join(part for part in parts if part)
 
 
 def safe_name(value: str) -> str:
