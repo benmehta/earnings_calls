@@ -55,6 +55,20 @@ class PageDecision(BaseModel):
     reason: str = ""
 
 
+class PageDecisionDraft(BaseModel):
+    page_type: Literal[
+        "transcript",
+        "earnings_event",
+        "press_release",
+        "filings",
+        "ir_index",
+        "not_relevant",
+    ]
+    confidence: float = Field(ge=0.0, le=1.0)
+    useful_urls: list[str] = Field(default_factory=list)
+    reason: str = ""
+
+
 class TranscriptRecord(BaseModel):
     company: Company
     source_url: HttpUrl | str

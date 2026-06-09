@@ -1,18 +1,27 @@
 from __future__ import annotations
 
 import json
+import re
 
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama
 
-from .models import CandidateLink, IRDiscoveryCandidate, IRDiscoveryDecision, PageDecision
+from .models import CandidateLink, IRDiscoveryCandidate, IRDiscoveryDecision, PageDecision, PageDecisionDraft
 
 
-def build_llm(model: str, temperature: float = 0.0, base_url: str | None = None) -> ChatOllama:
+def build_llm(
+    model: str,
+    temperature: float = 0.0,
+    base_url: str | None = None,
+    *,
+    json_mode: bool = False,
+) -> ChatOllama:
     kwargs = {"model": model, "temperature": temperature}
     if base_url:
         kwargs["base_url"] = base_url
+    if json_mode:
+        kwargs["format"] = "json"
     return ChatOllama(**kwargs)
 
 
@@ -20,7 +29,6 @@ class IRPageAgent:
     """Small LangChain/Ollama page classifier used by the crawler."""
 
     def __init__(self, model: str, base_url: str | None = None) -> None:
-        self.parser = PydanticOutputParser(pydantic_object=PageDecision)
         self.chain = (
             ChatPromptTemplate.from_messages(
                 [
@@ -28,8 +36,8 @@ class IRPageAgent:
                         "system",
                         "You classify investor-relations pages for a crawler. "
                         "Prefer high precision. Do not claim a page is a transcript "
-                        "unless the page text or link labels strongly indicate an "
-                        "earnings call transcript or webcast transcript.",
+                        "unless page text strongly indicates an earnings call transcript. "
+                        "Return only one JSON object. Do not return a JSON schema.",
                     ),
                     (
                         "human",
@@ -37,13 +45,15 @@ class IRPageAgent:
                         "URL: {url}\n"
                         "Page title: {title}\n"
                         "Visible text sample:\n{text}\n\n"
-                        "Links as JSON:\n{links_json}\n\n"
-                        "{format_instructions}",
+                        "Candidate links as JSON. If a link is useful, return only its URL string in useful_urls:\n"
+                        "{links_json}\n\n"
+                        "Return exactly this JSON shape:\n"
+                        "{{\"page_type\":\"ir_index\",\"confidence\":0.8,\"useful_urls\":[\"https://example.com/events\"],\"reason\":\"short reason\"}}\n\n"
+                        "Allowed page_type values: transcript, earnings_event, press_release, filings, ir_index, not_relevant.",
                     ),
                 ]
             )
-            | build_llm(model, base_url=base_url)
-            | self.parser
+            | build_llm(model, base_url=base_url, json_mode=True)
         )
 
     def decide(
@@ -58,18 +68,30 @@ class IRPageAgent:
     ) -> PageDecision:
         compact_links = [
             {"url": link.url, "label": link.label, "source_url": link.source_url}
-            for link in links[:80]
+            for link in links[:30]
         ]
-        return self.chain.invoke(
+        message = self.chain.invoke(
             {
                 "company_name": company_name,
                 "ticker": ticker,
                 "url": url,
                 "title": title,
-                "text": text[:9000],
+                "text": text[:3000],
                 "links_json": json.dumps(compact_links, ensure_ascii=True),
-                "format_instructions": self.parser.get_format_instructions(),
             }
+        )
+        draft = PageDecisionDraft.model_validate(extract_json_object(message.content))
+        links_by_url = {link.url: link for link in links}
+        useful_links = [
+            links_by_url[useful_url]
+            for useful_url in draft.useful_urls
+            if useful_url in links_by_url
+        ]
+        return PageDecision(
+            page_type=draft.page_type,
+            confidence=draft.confidence,
+            useful_links=useful_links,
+            reason=draft.reason,
         )
 
 
@@ -129,3 +151,15 @@ class IRDiscoveryAgent:
                 "format_instructions": self.parser.get_format_instructions(),
             }
         )
+
+
+def extract_json_object(content: str) -> dict:
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{.*\}", content, re.DOTALL)
+    if not match:
+        raise ValueError(f"No JSON object found in model output: {content[:200]}")
+    return json.loads(match.group(0))
