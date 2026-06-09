@@ -10,10 +10,10 @@ from .browser import PlaywrightRenderer
 from .http import HttpClient, RobotsDisallowedError, RobotsUnavailableError
 from .metadata import TranscriptMetadataAgent, extract_metadata_heuristic
 from .models import CandidateLink, CandidatePage, Company, CrawlFailure, CrawlResult, FailureType, TranscriptRecord
-from .parsing import extract_links, looks_like_js_shell, looks_like_transcript, page_title, pdf_text, visible_text
+from .parsing import docx_text, extract_links, looks_like_js_shell, looks_like_transcript, page_title, pdf_text, visible_text
 from .search import find_ir_candidates
 from .state import CrawlState
-from .urls import host, normalize_url
+from .urls import host, normalize_url, resolve_document_url
 
 
 TRANSCRIPT_HINTS = ("transcript", "earnings-call", "earnings call", "quarterly-results")
@@ -60,6 +60,7 @@ class TranscriptCrawler:
             rerank_model=self.model if self.rerank_discovery else None,
             ollama_base_url=self.ollama_base_url,
         )
+        seeds = [resolve_document_url(seed) for seed in seeds]
         if not seeds:
             return CrawlResult(company=company, skipped_reason="No investor-relations candidates found")
 
@@ -71,6 +72,7 @@ class TranscriptCrawler:
 
         while queue and len(run_visited) < self.max_pages_per_company:
             url, depth = queue.popleft()
+            url = resolve_document_url(url)
             normalized = normalize_url(url)
             if normalized in run_visited or depth > self.max_depth:
                 continue
@@ -105,6 +107,31 @@ class TranscriptCrawler:
                 record = self._record_pdf(company, url, response.content, state, result)
                 if record:
                     result.transcripts.append(record)
+                continue
+            if is_docx_response(url, content_type, response.content):
+                self._cache_bytes(company, url, response.content, suffix=".docx")
+                if not self.review_only:
+                    record = self._record_docx(company, url, response.content, state, result)
+                    if record:
+                        result.transcripts.append(record)
+                else:
+                    try:
+                        text = docx_text(response.content)
+                    except Exception as exc:
+                        result.failures.append(self._failure(company, url, "parse_error", exc))
+                        continue
+                    result.candidates.append(
+                        CandidatePage(
+                            company=company,
+                            url=url,
+                            title=url.rstrip("/").split("/")[-1] or "transcript.docx",
+                            depth=depth,
+                            heuristic_score=link_score(CandidateLink(url=url, source_url=url, label="docx transcript")),
+                            llm_page_type="transcript" if looks_like_transcript(text) else "not_relevant",
+                            llm_confidence=1.0 if looks_like_transcript(text) else None,
+                            reason="DOCX document text inspected without saving transcript artifact",
+                        )
+                    )
                 continue
 
             html = response.text
@@ -261,6 +288,47 @@ class TranscriptCrawler:
         state.mark_content_hash(digest)
         return record
 
+    def _record_docx(
+        self,
+        company: Company,
+        url: str,
+        content: bytes,
+        state: CrawlState,
+        result: CrawlResult,
+    ) -> TranscriptRecord | None:
+        try:
+            text = docx_text(content)
+        except Exception as exc:
+            result.failures.append(self._failure(company, url, "parse_error", exc))
+            return None
+        if not looks_like_transcript(text):
+            result.failures.append(self._failure(company, url, "not_transcript"))
+            return None
+        if state.has_transcript_url(url):
+            return None
+        digest = content_hash(text)
+        if state.has_content_hash(digest):
+            return None
+        company_dir = self._company_dir(company)
+        title = url.rstrip("/").split("/")[-1] or "transcript.docx"
+        raw_path = company_dir / f"{artifact_stem(title, url)}.docx"
+        raw_path.write_bytes(content)
+        extracted = self._metadata(title, text, result, url)
+        record = TranscriptRecord(
+            company=company,
+            source_url=url,
+            fiscal_period=extracted.fiscal_period,
+            call_date=extracted.call_date,
+            title=title,
+            text=text,
+            raw_path=raw_path,
+            metadata={"format": "docx", "content_hash": digest},
+        )
+        self._write_record(company, record)
+        state.mark_transcript_url(url)
+        state.mark_content_hash(digest)
+        return record
+
     def _company_dir(self, company: Company) -> Path:
         path = self.out_dir / company.symbol
         path.mkdir(parents=True, exist_ok=True)
@@ -309,6 +377,7 @@ class TranscriptCrawler:
         return [link for link in links if link_score(link) >= 2][:30]
 
     def _should_follow(self, link: CandidateLink, allowed_hosts: set[str], *, current_url: str) -> bool:
+        link.url = resolve_document_url(link.url)
         parsed = urlparse(link.url)
         if parsed.scheme not in {"http", "https"}:
             return False
@@ -350,7 +419,18 @@ def can_expand_host(link: CandidateLink, current_url: str) -> bool:
     if host(link.url) == host(current_url):
         return True
     haystack = f"{link.url} {link.label}".lower()
-    vendor_markers = ("investor", "ir.", "q4cdn", "events", "earnings", "webcast", "quarter")
+    vendor_markers = (
+        "investor",
+        "ir.",
+        "q4cdn",
+        "cdn-dynmedia",
+        "microsoftcorp",
+        "events",
+        "earnings",
+        "webcast",
+        "quarter",
+        "transcript",
+    )
     return any(marker in haystack for marker in vendor_markers) and link_score(link) >= 2
 
 
@@ -367,3 +447,11 @@ def artifact_stem(title: str, url: str) -> str:
 def content_hash(text: str) -> str:
     normalized = " ".join(text.split()).lower()
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def is_docx_response(url: str, content_type: str, content: bytes) -> bool:
+    return (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" in content_type
+        or url.lower().endswith(".docx")
+        or content.startswith(b"PK\x03\x04")
+    )

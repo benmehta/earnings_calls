@@ -1,13 +1,27 @@
 from pathlib import Path
 
 from ir_transcripts.state import CrawlState
-from ir_transcripts.urls import normalize_url
+from ir_transcripts.urls import normalize_url, resolve_document_url
 
 
 def test_normalize_url_removes_tracking_and_trailing_slash() -> None:
     assert (
         normalize_url("HTTPS://Investors.Example.com/events/?utm_source=x&b=2&a=1")
         == "https://investors.example.com/events?a=1&b=2"
+    )
+
+
+def test_resolve_document_url_extracts_office_viewer_source() -> None:
+    assert resolve_document_url(
+        "https://view.officeapps.live.com/op/view.aspx?"
+        "src=https://cdn.example.com/transcript.docx"
+    ) == "https://cdn.example.com/transcript.docx"
+
+
+def test_resolve_document_url_uses_curated_document_redirect() -> None:
+    assert (
+        resolve_document_url("https://aka.ms/transcriptfy26q3")
+        == "https://cdn-dynmedia-1.microsoft.com/is/content/microsoftcorp/TranscriptQandAFY26Q3"
     )
 
 
@@ -23,4 +37,3 @@ def test_crawl_state_round_trip(tmp_path: Path) -> None:
     assert loaded.has_visited("https://example.com/a")
     assert loaded.has_transcript_url("https://example.com/t")
     assert loaded.has_content_hash("abc")
-

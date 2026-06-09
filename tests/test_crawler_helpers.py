@@ -1,4 +1,4 @@
-from ir_transcripts.crawler import TranscriptCrawler, artifact_stem, content_hash, link_score
+from ir_transcripts.crawler import TranscriptCrawler, artifact_stem, content_hash, is_docx_response, link_score
 from ir_transcripts.http import RobotsDisallowedError, RobotsUnavailableError
 from ir_transcripts.models import CandidateLink, Company
 
@@ -23,6 +23,14 @@ def test_artifact_stem_and_content_hash_are_stable() -> None:
         "Q1 Transcript", "https://example.com/a"
     )
     assert content_hash("hello   world") == content_hash("hello world")
+
+
+def test_is_docx_response_detects_word_content_type_without_extension() -> None:
+    assert is_docx_response(
+        "https://cdn.example.com/is/content/example/Transcript",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        b"",
+    )
 
 
 def test_crawler_records_robots_unavailable(tmp_path) -> None:

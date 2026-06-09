@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from io import BytesIO
 from urllib.parse import urljoin, urlparse
+from zipfile import ZipFile
+import xml.etree.ElementTree as ET
 
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
 
 from .models import CandidateLink
+from .urls import resolve_document_url
 
 
 def visible_text(html: str) -> str:
@@ -43,7 +46,7 @@ def extract_links(html: str, source_url: str) -> list[CandidateLink]:
 
 
 def _candidate_from_tag(tag, attribute: str, source_url: str) -> CandidateLink | None:
-    absolute = urljoin(source_url, tag.get(attribute, ""))
+    absolute = resolve_document_url(urljoin(source_url, tag.get(attribute, "")))
     parsed = urlparse(absolute)
     if parsed.scheme not in {"http", "https"}:
         return None
@@ -60,6 +63,24 @@ def pdf_text(content: bytes) -> str:
     for page in reader.pages:
         parts.append(page.extract_text() or "")
     return "\n\n".join(part for part in parts if part.strip())
+
+
+def docx_text(content: bytes) -> str:
+    with ZipFile(BytesIO(content)) as archive:
+        document = archive.read("word/document.xml")
+
+    root = ET.fromstring(document)
+    namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    paragraphs: list[str] = []
+    for paragraph in root.findall(".//w:p", namespace):
+        parts = [
+            node.text or ""
+            for node in paragraph.findall(".//w:t", namespace)
+        ]
+        text = "".join(parts).strip()
+        if text:
+            paragraphs.append(text)
+    return "\n\n".join(paragraphs)
 
 
 def looks_like_transcript(text: str) -> bool:
