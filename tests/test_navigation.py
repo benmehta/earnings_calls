@@ -5,6 +5,7 @@ from ir_transcripts.models import Company, NavigationDecision
 from ir_transcripts.navigation import (
     discover_navigation_seeds,
     is_company_host,
+    navigation_link_score,
     navigation_start_urls,
     rank_discovered_urls,
     navigation_candidate_links,
@@ -129,6 +130,17 @@ def test_navigation_start_urls_use_alphabet_homepage_for_goog(monkeypatch) -> No
     assert is_company_host("https://abc.xyz/investor/", Company(symbol="GOOG", name="Alphabet Google"))
 
 
+def test_navigation_start_urls_can_disable_alphabet_homepage_override(monkeypatch) -> None:
+    monkeypatch.setattr("ir_transcripts.navigation.discover_ir_candidates", lambda *args, **kwargs: [])
+
+    starts = navigation_start_urls(
+        Company(symbol="GOOG", name="Alphabet Google"),
+        disable_official_homepage_overrides=True,
+    )
+
+    assert "https://abc.xyz/" not in starts
+
+
 def test_discovered_urls_prioritize_financial_reports() -> None:
     ranked = rank_discovered_urls(
         [
@@ -149,3 +161,71 @@ def test_fixture_relative_financial_info_link_resolves() -> None:
         "https://investor.nvidia.com/home/default.aspx",
         "/financial-info/financial-reports/default.aspx",
     ) in [link.url for link in links]
+
+
+def test_event_detail_links_outrank_page_chrome() -> None:
+    company = Company(symbol="GOOG", name="Alphabet Google")
+    current_url = "https://abc.xyz/investor/events/default.aspx"
+    event = extract_links(
+        '<a href="/investor/events/event-details/2026/2026-Q1-Earnings-Call/default.aspx">2026 Q1 Earnings Call</a>',
+        current_url,
+    )[0]
+    investors = extract_links('<a href="/investor/default.aspx">Investors</a>', current_url)[0]
+    skip = extract_links('<a href="#maincontent">Skip to main content</a>', current_url)[0]
+
+    assert navigation_link_score(event, current_url=current_url, allowed_hosts={"abc.xyz"}, company=company) > navigation_link_score(
+        investors,
+        current_url=current_url,
+        allowed_hosts={"abc.xyz"},
+        company=company,
+    )
+    assert navigation_link_score(skip, current_url=current_url, allowed_hosts={"abc.xyz"}, company=company) <= 0
+
+
+def test_navigation_auto_renders_q4_event_listing(monkeypatch) -> None:
+    static_events = """
+    <html><head><title>Alphabet Investor Relations - Investors - Events</title></head>
+    <body>
+      <h1>Events & Presentations</h1>
+      <div class="evergreen evergreen-event"></div>
+      <a href="/investor/default.aspx">Investors</a>
+    </body></html>
+    """
+    rendered_events = """
+    <html><head><title>Alphabet Investor Relations - Investors - Events</title></head>
+    <body>
+      <a href="/investor/events/event-details/2026/2026-Q1-Earnings-Call/default.aspx">2026 Q1 Earnings Call</a>
+      <a href="/investor/default.aspx">Investors</a>
+    </body></html>
+    """
+    homepage = """
+    <html><head><title>Alphabet</title></head>
+    <body><a href="/investor/events/default.aspx">Events</a></body></html>
+    """
+
+    class FakeRenderer:
+        def __init__(self, http) -> None:
+            self.http = http
+
+        def render_html(self, url: str) -> str:
+            assert url == "https://abc.xyz/investor/events/default.aspx"
+            return rendered_events
+
+    monkeypatch.setattr("ir_transcripts.navigation.IRNavigationAgent", FakeNavigationAgent)
+    monkeypatch.setattr("ir_transcripts.navigation.PlaywrightRenderer", FakeRenderer)
+    monkeypatch.setattr("ir_transcripts.navigation.discover_ir_candidates", lambda *args, **kwargs: [])
+
+    result = discover_navigation_seeds(
+        Company(symbol="GOOG", name="Alphabet Google"),
+        http=FakeHttp(
+            {
+                "https://abc.xyz/": homepage,
+                "https://abc.xyz/investor/events/default.aspx": static_events,
+            }
+        ),  # type: ignore[arg-type]
+        model="test-model",
+        max_steps=2,
+        playwright_mode="auto",
+    )
+
+    assert "https://abc.xyz/investor/events/event-details/2026/2026-Q1-Earnings-Call/default.aspx" in result.seeds

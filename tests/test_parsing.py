@@ -64,6 +64,18 @@ def test_extract_links_reads_custom_link_attributes() -> None:
     assert links[0].label == "Earnings Call Transcript"
 
 
+def test_extract_links_preserves_context_for_generic_transcript_links() -> None:
+    html = """
+    <html><body>
+      <p>For a PDF version of the transcript, please <a href="/investor/static-files/q1-transcript.pdf">click here</a>.</p>
+    </body></html>
+    """
+    links = extract_links(html, "https://abc.xyz/investor/events/event-details/q1")
+
+    assert links[0].url == "https://abc.xyz/investor/static-files/q1-transcript.pdf"
+    assert "PDF version of the transcript" in links[0].label
+
+
 def test_docx_text_extracts_paragraphs() -> None:
     buffer = BytesIO()
     document_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -109,5 +121,19 @@ def test_q4_financial_widget_triggers_browser_render() -> None:
     </body></html>
     """
     text = " ".join(["static investor relations text"] * 200)
+
+    assert looks_like_js_shell(html, text)
+
+
+def test_q4_evergreen_event_widget_triggers_browser_render() -> None:
+    html = """
+    <html><body>
+      <h1>Events & Presentations</h1>
+      <div class="evergreen evergreen-event">
+        <script id="tplEvergreenEventList" type="text/template"></script>
+      </div>
+    </body></html>
+    """
+    text = " ".join(["static investor relations events text"] * 200)
 
     assert looks_like_js_shell(html, text)

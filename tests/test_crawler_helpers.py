@@ -1,9 +1,17 @@
 from io import BytesIO
 from zipfile import ZipFile
 
-from ir_transcripts.crawler import TranscriptCrawler, artifact_stem, content_hash, is_docx_response, link_score
+from ir_transcripts.crawler import (
+    TranscriptCrawler,
+    artifact_stem,
+    content_hash,
+    fiscal_period_key,
+    is_docx_response,
+    keep_latest_transcripts,
+    link_score,
+)
 from ir_transcripts.http import RobotsDisallowedError, RobotsUnavailableError
-from ir_transcripts.models import CandidateLink, Company, NavigationTrace, PageDecision
+from ir_transcripts.models import CandidateLink, Company, NavigationTrace, PageDecision, TranscriptRecord
 from ir_transcripts.navigation import NavigationDiscoveryResult
 
 
@@ -49,6 +57,31 @@ def test_artifact_stem_and_content_hash_are_stable() -> None:
         "Q1 Transcript", "https://example.com/a"
     )
     assert content_hash("hello   world") == content_hash("hello world")
+
+
+def test_fiscal_period_key_handles_common_quarter_shapes() -> None:
+    assert fiscal_period_key("2026 Q1 Earnings Call") == (2026, 1)
+    assert fiscal_period_key("Q4 FY2025 transcript") == (2025, 4)
+    assert fiscal_period_key("first quarter 2026 earnings") == (2026, 1)
+
+
+def test_keep_latest_transcripts_prefers_newest_fiscal_period() -> None:
+    old = TranscriptRecord(
+        company=Company(symbol="EX", name="Example"),
+        source_url="https://example.com/2025",
+        fiscal_period="Q1 2025",
+        title="Example Q1 2025 Earnings Call",
+        text="OPERATOR: Welcome.",
+    )
+    latest = TranscriptRecord(
+        company=Company(symbol="EX", name="Example"),
+        source_url="https://example.com/2026",
+        fiscal_period="Q1 2026",
+        title="Example Q1 2026 Earnings Call",
+        text="OPERATOR: Welcome.",
+    )
+
+    assert keep_latest_transcripts([old, latest]) == [latest]
 
 
 def test_is_docx_response_detects_word_content_type_without_extension() -> None:
@@ -130,6 +163,56 @@ def test_crawler_does_not_save_press_release_like_html(tmp_path) -> None:
     assert not [path for path in (tmp_path / "EX").glob("*.json") if not path.name.startswith("_")]
 
 
+def test_crawler_always_playwright_mode_renders_plain_html(monkeypatch, tmp_path) -> None:
+    class FakeResponse:
+        headers = {"content-type": "text/html"}
+        content = b""
+        text = """
+        <html><head><title>Example Events</title></head>
+        <body><p>This static page has enough text that auto mode would not need rendering.</p></body></html>
+        """
+
+    class FakeHttp:
+        def get(self, url: str):
+            return FakeResponse()
+
+    class FakeRenderer:
+        def __init__(self, http) -> None:
+            self.http = http
+
+        def render_html(self, url: str) -> str:
+            return """
+            <html><head><title>Example Q1 Earnings Call Transcript</title></head>
+            <body>
+            <p>OPERATOR: Welcome to the call.</p>
+            <p>JANE DOE: Thank you.</p>
+            <p>JOHN SMITH: Prepared remarks.</p>
+            <p>ANALYST: My question is about margins.</p>
+            <p>QUESTION-AND-ANSWER SESSION</p>
+            <p>END</p>
+            </body></html>
+            """
+
+    class FakeAgent:
+        def decide(self, **kwargs):
+            return PageDecision(page_type="transcript", confidence=1.0, reason="rendered transcript")
+
+    monkeypatch.setattr("ir_transcripts.crawler.PlaywrightRenderer", FakeRenderer)
+    crawler = TranscriptCrawler(
+        model="test-model",
+        out_dir=tmp_path,
+        seed_urls=["https://investor.example.com/events/q1"],
+        http=FakeHttp(),  # type: ignore[arg-type]
+        playwright_mode="always",
+    )
+    crawler.agent = FakeAgent()  # type: ignore[assignment]
+
+    result = crawler.crawl_company(Company(symbol="EX", name="Example"))
+
+    assert len(result.transcripts) == 1
+    assert result.transcripts[0].metadata["rendered_with_playwright"] == "true"
+
+
 def test_crawler_saves_docx_transcript(tmp_path) -> None:
     class FakeResponse:
         headers = {"content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
@@ -168,6 +251,53 @@ def test_crawler_saves_docx_transcript(tmp_path) -> None:
     assert len(result.transcripts) == 1
     assert result.transcripts[0].metadata["format"] == "docx"
     assert list((tmp_path / "EX").glob("*.docx"))
+
+
+def test_crawler_latest_only_keeps_newest_transcript_artifacts(tmp_path) -> None:
+    class FakeResponse:
+        headers = {"content-type": "text/html"}
+        content = b""
+
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+    class FakeHttp:
+        def get(self, url: str):
+            year = "2026" if "2026" in url else "2025"
+            return FakeResponse(
+                f"""
+                <html><head><title>Example Q1 {year} Earnings Call Transcript</title></head>
+                <body>
+                  <p>OPERATOR: Welcome everyone.</p>
+                  <p>JANE DOE: Thank you.</p>
+                  <p>JOHN SMITH: Prepared remarks.</p>
+                  <p>ANALYST: My question is about margins.</p>
+                  <p>QUESTION-AND-ANSWER SESSION</p>
+                  <p>END</p>
+                </body></html>
+                """
+            )
+
+    class FakeAgent:
+        def decide(self, **kwargs):
+            return PageDecision(page_type="transcript", confidence=1.0, reason="transcript", useful_links=[])
+
+    crawler = TranscriptCrawler(
+        model="test-model",
+        out_dir=tmp_path,
+        seed_urls=["https://example.com/q1-2025", "https://example.com/q1-2026"],
+        http=FakeHttp(),  # type: ignore[arg-type]
+        latest_only=True,
+    )
+    crawler.agent = FakeAgent()  # type: ignore[assignment]
+
+    result = crawler.crawl_company(Company(symbol="EX", name="Example"))
+
+    assert len(result.transcripts) == 1
+    assert result.transcripts[0].fiscal_period == "Q1 2026"
+    remaining = [path.name for path in (tmp_path / "EX").glob("Example_Q1_*") if not path.name.startswith("_")]
+    assert any("2026" in name for name in remaining)
+    assert not any("2025" in name for name in remaining)
 
 
 def test_nav_first_uses_navigation_before_search(monkeypatch, tmp_path) -> None:
