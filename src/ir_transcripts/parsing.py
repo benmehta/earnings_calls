@@ -14,6 +14,9 @@ from .models import CandidateLink
 from .urls import resolve_document_url
 
 
+GENERIC_LINK_LABELS = {"click here", "here", "pdf", "download", "view", "listen", "webcast"}
+
+
 @dataclass(frozen=True)
 class TranscriptDetection:
     is_transcript: bool
@@ -62,7 +65,20 @@ def _candidate_from_tag(tag, attribute: str, source_url: str) -> CandidateLink |
     label = " ".join(tag.get_text(" ").split())
     if not label:
         label = tag.get("arialabel") or tag.get("aria-label") or tag.get("title") or ""
+    context = nearby_link_text(tag)
+    if context and (label.lower() in GENERIC_LINK_LABELS or "transcript" in context.lower()):
+        label = f"{label} {context}".strip()
     return CandidateLink(url=absolute, label=label[:250], source_url=source_url, reason=link_context(tag))
+
+
+def nearby_link_text(tag) -> str:
+    for parent in tag.parents:
+        name = getattr(parent, "name", "") or ""
+        if name in {"p", "li", "td", "th", "div"}:
+            text = " ".join(parent.get_text(" ").split())
+            if text:
+                return text[:300]
+    return ""
 
 
 def link_context(tag) -> str:
@@ -180,7 +196,18 @@ def transcript_speakers(text: str) -> set[str]:
 
 def looks_like_js_shell(html: str, text: str) -> bool:
     lower = html.lower()
-    widget_markers = ("financialtable({", "apimashup({", "q4.financialtable", "q4.apimashup")
+    widget_markers = (
+        "financialtable({",
+        "apimashup({",
+        "q4.financialtable",
+        "q4.apimashup",
+        "evergreen-event",
+        "evergreen-financial",
+        "module-past-events",
+        "evergreen-financial--accordion",
+        "tplevergreen",
+        "q4.api",
+    )
     if any(marker in lower for marker in widget_markers):
         return True
     if len(text) < 500 and len(html) > 5000:

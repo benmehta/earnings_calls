@@ -17,6 +17,7 @@ dependencies = [
   "langchain-core>=0.3",
   "langchain-ollama>=0.2",
   "langchain-text-splitters>=0.3",
+  "langgraph>=0.6.6",
   "lxml>=5.2",
   "pandas>=2.2",
   "playwright>=1.48",

@@ -50,12 +50,23 @@ python -m ir_transcripts \
   --limit 5
 ```
 
-For a JavaScript-heavy IR site, enable Playwright rendering:
+The crawler defaults to auto Playwright rendering for pages that look like
+JavaScript-driven IR widgets, such as Q4/Evergreen events and financial tables.
+Install the browser binary once:
 
 ```bash
 playwright install chromium
-python -m ir_transcripts --symbols AAPL --max-pages 5 --playwright
 ```
+
+You can force a rendering policy when debugging:
+
+```bash
+python -m ir_transcripts --symbols AAPL --max-pages 5 --playwright-mode off
+python -m ir_transcripts --symbols AAPL --max-pages 5 --playwright-mode always
+```
+
+The older `--playwright` flag is still accepted and maps to
+`--playwright-mode auto`.
 
 To build a local Chroma index from collected transcripts:
 

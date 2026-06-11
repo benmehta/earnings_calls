@@ -143,3 +143,86 @@ class CrawlResult(BaseModel):
     failures: list[CrawlFailure] = Field(default_factory=list)
     skipped_reason: str | None = None
     visited_count: int = 0
+
+
+class CrawlAttemptConfig(BaseModel):
+    attempt: int = 1
+    max_pages_per_company: int = 40
+    max_depth: int = 3
+    use_playwright: bool = False
+    playwright_mode: Literal["off", "auto", "always"] = "off"
+    resume: bool = True
+    review_only: bool = False
+    seed_urls: list[str] = Field(default_factory=list)
+    discovery_mode: Literal["nav-first", "search-first"] = "nav-first"
+    include_discovery_guesses: bool = False
+    disable_official_homepage_overrides: bool = False
+    rerank_discovery: bool = False
+    extract_metadata_with_llm: bool = False
+    latest_only: bool = False
+    search_timeout_seconds: float = 30.0
+    llm_timeout_seconds: float = 45.0
+    navigation_llm_max_links: int = 12
+    page_llm_max_links: int = 12
+    llm_text_chars: int = 900
+    reason: str = "initial"
+
+
+FailureCategory = Literal[
+    "success",
+    "wrong_identity",
+    "robots_unavailable",
+    "render_needed",
+    "needs_deeper_crawl",
+    "no_useful_links",
+    "not_transcript",
+    "no_transcript_found",
+]
+
+
+class FailureAnalysis(BaseModel):
+    category: FailureCategory
+    summary: str
+    retryable: bool = False
+    evidence_urls: list[str] = Field(default_factory=list)
+    manual_recommendations: list[str] = Field(default_factory=list)
+
+
+SupervisorActionType = Literal[
+    "finish",
+    "identity_correction",
+    "search_first",
+    "playwright_retry",
+    "deeper_crawl",
+    "manual_review",
+]
+
+
+class SupervisorAction(BaseModel):
+    action_type: SupervisorActionType
+    reason: str
+    next_company: Company | None = None
+    next_config: CrawlAttemptConfig | None = None
+    manual_recommendations: list[str] = Field(default_factory=list)
+
+
+class CompanyMemory(BaseModel):
+    company: Company
+    official_hosts: list[str] = Field(default_factory=list)
+    known_ir_urls: list[str] = Field(default_factory=list)
+    attempted_configs: list[CrawlAttemptConfig] = Field(default_factory=list)
+    failure_summaries: list[FailureAnalysis] = Field(default_factory=list)
+    rejected_urls: list[str] = Field(default_factory=list)
+    recommended_manual_actions: list[str] = Field(default_factory=list)
+    successful_transcript_urls: list[str] = Field(default_factory=list)
+
+
+class SupervisorRunResult(BaseModel):
+    company: Company
+    final_company: Company
+    attempts: list[CrawlAttemptConfig] = Field(default_factory=list)
+    analyses: list[FailureAnalysis] = Field(default_factory=list)
+    actions: list[SupervisorAction] = Field(default_factory=list)
+    result: CrawlResult | None = None
+    memory_path: Path | None = None
+    status: Literal["success", "partial", "manual_review", "failed"] = "failed"

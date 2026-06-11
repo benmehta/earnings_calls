@@ -8,6 +8,7 @@ from duckduckgo_search import DDGS
 
 from .agent import IRDiscoveryAgent
 from .models import Company, IRDiscoveryCandidate
+from .runtime import ProgressReporter, timeout_after
 from .urls import normalize_url
 
 
@@ -25,6 +26,9 @@ def find_ir_candidates(
     include_guesses: bool = False,
     rerank_model: str | None = None,
     ollama_base_url: str | None = None,
+    search_timeout_seconds: float = 30.0,
+    llm_timeout_seconds: float = 45.0,
+    progress: ProgressReporter | None = None,
 ) -> list[str]:
     """Find likely investor-relations pages without needing a paid search API."""
     discovered = discover_ir_candidates(
@@ -33,6 +37,9 @@ def find_ir_candidates(
         include_guesses=include_guesses,
         rerank_model=rerank_model,
         ollama_base_url=ollama_base_url,
+        search_timeout_seconds=search_timeout_seconds,
+        llm_timeout_seconds=llm_timeout_seconds,
+        progress=progress,
     )
     return [candidate.url for candidate in discovered]
 
@@ -44,8 +51,12 @@ def discover_ir_candidates(
     include_guesses: bool = False,
     rerank_model: str | None = None,
     ollama_base_url: str | None = None,
+    search_timeout_seconds: float = 30.0,
+    llm_timeout_seconds: float = 45.0,
+    progress: ProgressReporter | None = None,
 ) -> list[IRDiscoveryCandidate]:
     candidates: list[IRDiscoveryCandidate] = []
+    progress = progress or ProgressReporter(enabled=False)
 
     for url in CURATED_IR_URLS.get(company.symbol.upper(), []):
         candidates.append(
@@ -58,7 +69,16 @@ def discover_ir_candidates(
             )
         )
 
-    candidates.extend(search_ir_candidates(company, max_results=max_results))
+    progress.log(f"{company.symbol}: search discovery starting")
+    candidates.extend(
+        search_ir_candidates(
+            company,
+            max_results=max_results,
+            timeout_seconds=search_timeout_seconds,
+            progress=progress,
+        )
+    )
+    progress.log(f"{company.symbol}: search discovery found {len(candidates)} candidate(s)")
 
     if include_guesses and not candidates:
         for url in deterministic_ir_candidates(company):
@@ -80,6 +100,8 @@ def discover_ir_candidates(
             model=rerank_model,
             ollama_base_url=ollama_base_url,
             limit=max_results,
+            timeout_seconds=llm_timeout_seconds,
+            progress=progress,
         )
     return ranked
 
@@ -91,16 +113,22 @@ def rerank_ir_candidates(
     model: str,
     ollama_base_url: str | None = None,
     limit: int = 10,
+    timeout_seconds: float = 45.0,
+    progress: ProgressReporter | None = None,
 ) -> list[IRDiscoveryCandidate]:
+    progress = progress or ProgressReporter(enabled=False)
     by_url = {normalize_url(candidate.url): candidate for candidate in candidates}
     try:
-        decision = IRDiscoveryAgent(model, base_url=ollama_base_url).rerank(
-            company_name=company.name,
-            ticker=company.symbol,
-            candidates=candidates,
-            limit=limit,
-        )
-    except Exception:
+        progress.log(f"{company.symbol}: Ollama reranking {len(candidates)} discovery candidate(s)")
+        with timeout_after(timeout_seconds, f"reranking {company.symbol} discovery candidates"):
+            decision = IRDiscoveryAgent(model, base_url=ollama_base_url).rerank(
+                company_name=company.name,
+                ticker=company.symbol,
+                candidates=candidates,
+                limit=limit,
+            )
+    except Exception as exc:
+        progress.log(f"{company.symbol}: Ollama rerank skipped ({type(exc).__name__}: {exc})")
         return candidates
 
     reranked: list[IRDiscoveryCandidate] = []
@@ -123,48 +151,82 @@ def rerank_ir_candidates(
     return reranked
 
 
-def search_ir_candidates(company: Company, max_results: int = 10) -> list[IRDiscoveryCandidate]:
+def search_ir_candidates(
+    company: Company,
+    max_results: int = 10,
+    *,
+    timeout_seconds: float = 30.0,
+    progress: ProgressReporter | None = None,
+) -> list[IRDiscoveryCandidate]:
     candidates: list[IRDiscoveryCandidate] = []
+    progress = progress or ProgressReporter(enabled=False)
 
     try:
         with DDGS() as ddgs:
             for query in search_queries(company):
-                for result in ddgs.text(query, backend="lite", max_results=max_results):
-                    url = result.get("href") or result.get("url")
-                    if not url:
-                        continue
-                    candidates.append(
-                        score_ir_candidate(
-                            url=url,
-                            title=result.get("title", ""),
-                            snippet=result.get("body", ""),
-                            company=company,
-                            source="search",
-                        )
-                    )
-    except Exception:
-        pass
+                progress.log(f"{company.symbol}: DuckDuckGo query: {query}")
+                try:
+                    with timeout_after(timeout_seconds, f"searching DuckDuckGo for {query}"):
+                        for result in ddgs.text(query, backend="lite", max_results=max_results):
+                            url = result.get("href") or result.get("url")
+                            if not url:
+                                continue
+                            candidates.append(
+                                score_ir_candidate(
+                                    url=url,
+                                    title=result.get("title", ""),
+                                    snippet=result.get("body", ""),
+                                    company=company,
+                                    source="search",
+                                )
+                            )
+                except Exception as exc:
+                    progress.log(f"{company.symbol}: DuckDuckGo query skipped ({type(exc).__name__}: {exc})")
+                    continue
+                if len(candidates) >= max_results:
+                    break
+    except Exception as exc:
+        progress.log(f"{company.symbol}: DuckDuckGo discovery unavailable ({type(exc).__name__}: {exc})")
 
     if not candidates:
-        candidates.extend(search_ir_candidates_lite_html(company, max_results=max_results))
+        progress.log(f"{company.symbol}: trying DuckDuckGo lite HTML fallback")
+        candidates.extend(
+            search_ir_candidates_lite_html(
+                company,
+                max_results=max_results,
+                timeout_seconds=timeout_seconds,
+                progress=progress,
+            )
+        )
 
     return dedupe_candidates([candidate for candidate in candidates if candidate.score > 0])
 
 
-def search_ir_candidates_lite_html(company: Company, max_results: int = 10) -> list[IRDiscoveryCandidate]:
+def search_ir_candidates_lite_html(
+    company: Company,
+    max_results: int = 10,
+    *,
+    timeout_seconds: float = 30.0,
+    progress: ProgressReporter | None = None,
+) -> list[IRDiscoveryCandidate]:
     candidates: list[IRDiscoveryCandidate] = []
+    progress = progress or ProgressReporter(enabled=False)
     session = requests.Session()
     session.headers.update({"User-Agent": "local-ir-discovery/0.1"})
 
     for query in search_queries(company):
+        progress.log(f"{company.symbol}: lite HTML query: {query}")
         try:
-            response = session.post(
-                "https://lite.duckduckgo.com/lite/",
-                data={"q": query},
-                timeout=20,
-            )
-            response.raise_for_status()
-        except Exception:
+            request_timeout = min(timeout_seconds, 20) if timeout_seconds > 0 else 20
+            with timeout_after(timeout_seconds, f"searching DuckDuckGo lite HTML for {query}"):
+                response = session.post(
+                    "https://lite.duckduckgo.com/lite/",
+                    data={"q": query},
+                    timeout=request_timeout,
+                )
+                response.raise_for_status()
+        except Exception as exc:
+            progress.log(f"{company.symbol}: lite HTML query skipped ({type(exc).__name__}: {exc})")
             continue
 
         soup = BeautifulSoup(response.text, "lxml")

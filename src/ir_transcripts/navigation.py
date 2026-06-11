@@ -5,9 +5,11 @@ from dataclasses import dataclass
 from urllib.parse import urlparse
 
 from .agent import IRNavigationAgent
+from .browser import PlaywrightRenderer
 from .http import HttpClient
 from .models import CandidateLink, Company, NavigationStep, NavigationTrace
-from .parsing import extract_links, page_title, visible_text
+from .parsing import extract_links, looks_like_js_shell, page_title, visible_text
+from .runtime import ProgressReporter, timeout_after
 from .search import company_domain_tokens, company_domain_slug, discover_ir_candidates
 from .urls import host, normalize_url, resolve_document_url
 
@@ -27,17 +29,40 @@ def discover_navigation_seeds(
     max_steps: int = 4,
     max_links: int = 40,
     include_guesses: bool = False,
+    playwright_mode: str = "off",
+    disable_official_homepage_overrides: bool = False,
+    search_timeout_seconds: float = 30.0,
+    llm_timeout_seconds: float = 45.0,
+    navigation_llm_max_links: int = 12,
+    llm_text_chars: int = 900,
+    progress: ProgressReporter | None = None,
 ) -> NavigationDiscoveryResult:
-    starts = navigation_start_urls(company, include_guesses=include_guesses)
+    progress = progress or ProgressReporter(enabled=False)
+    progress.log(f"{company.symbol}: navigation discovery starting")
+    starts = navigation_start_urls(
+        company,
+        include_guesses=include_guesses,
+        disable_official_homepage_overrides=disable_official_homepage_overrides,
+        search_timeout_seconds=search_timeout_seconds,
+        progress=progress,
+    )
     trace = NavigationTrace(company=company)
     if not starts:
+        progress.log(f"{company.symbol}: navigation discovery has no start URLs")
         return NavigationDiscoveryResult(seeds=[], trace=trace)
+    progress.log(f"{company.symbol}: navigation start URL(s): {', '.join(starts[:5])}")
 
-    agent = IRNavigationAgent(model, base_url=ollama_base_url)
+    agent = IRNavigationAgent(
+        model,
+        base_url=ollama_base_url,
+        max_links=navigation_llm_max_links,
+        text_chars=llm_text_chars,
+    )
     queue: deque[str] = deque(starts)
     visited: set[str] = set()
     allowed_hosts = {host(url) for url in starts}
     discovered: list[str] = []
+    renderer = PlaywrightRenderer(http) if playwright_mode != "off" else None
 
     while queue and len(trace.steps) < max_steps:
         current_url = resolve_document_url(queue.popleft())
@@ -47,13 +72,24 @@ def discover_navigation_seeds(
         visited.add(normalized)
 
         try:
+            progress.log(f"{company.symbol}: fetching navigation page {current_url}")
             response = http.get(current_url)
-        except Exception:
+        except Exception as exc:
+            progress.log(f"{company.symbol}: navigation fetch skipped ({type(exc).__name__}: {current_url})")
             continue
 
         html = response.text
         title = page_title(html)
         text = visible_text(html)
+        if renderer and should_render_navigation_page(playwright_mode, html, text):
+            try:
+                progress.log(f"{company.symbol}: rendering navigation page {current_url}")
+                html = renderer.render_html(current_url)
+                title = page_title(html)
+                text = visible_text(html)
+            except Exception as exc:
+                progress.log(f"{company.symbol}: render skipped ({type(exc).__name__}: {current_url})")
+                pass
         page_context = navigation_page_context(current_url, title, text)
         links = navigation_candidate_links(
             extract_links(html, current_url),
@@ -73,16 +109,28 @@ def discover_navigation_seeds(
             continue
 
         try:
-            decision = agent.decide(
-                company_name=company.name,
-                ticker=company.symbol,
+            agent_kind = agent.select_agent_kind(
                 url=current_url,
                 title=title,
                 text=text,
                 links=links,
                 page_context=page_context,
             )
-        except Exception:
+            progress.log(
+                f"{company.symbol}: asking {agent_kind} agent to choose from {len(links)} navigation link(s)"
+            )
+            with timeout_after(llm_timeout_seconds, f"choosing navigation links for {current_url}"):
+                decision = agent.decide(
+                    company_name=company.name,
+                    ticker=company.symbol,
+                    url=current_url,
+                    title=title,
+                    text=text,
+                    links=links,
+                    page_context=page_context,
+                )
+        except Exception as exc:
+            progress.log(f"{company.symbol}: navigation LLM fallback ({type(exc).__name__}: {exc})")
             chosen_urls = [link.url for link in links[:2]]
             confidence = 0.0
             reason = "heuristic fallback"
@@ -119,18 +167,34 @@ def discover_navigation_seeds(
                 discovered.append(chosen_url)
             queue.append(chosen_url)
 
-    return NavigationDiscoveryResult(seeds=rank_discovered_urls(discovered, company), trace=trace)
+    seeds = rank_discovered_urls(discovered, company)
+    progress.log(f"{company.symbol}: navigation discovery found {len(seeds)} seed URL(s)")
+    return NavigationDiscoveryResult(seeds=seeds, trace=trace)
 
 
-def navigation_start_urls(company: Company, *, include_guesses: bool = False) -> list[str]:
+def navigation_start_urls(
+    company: Company,
+    *,
+    include_guesses: bool = False,
+    disable_official_homepage_overrides: bool = False,
+    search_timeout_seconds: float = 30.0,
+    progress: ProgressReporter | None = None,
+) -> list[str]:
     starts: list[str] = []
-    starts.extend(official_company_homepages(company))
+    if not disable_official_homepage_overrides:
+        starts.extend(official_company_homepages(company))
     slug = company_domain_slug(company.name)
     if slug:
         starts.append(f"https://www.{slug}.com")
     starts.extend(
         candidate.url
-        for candidate in discover_ir_candidates(company, max_results=6, include_guesses=include_guesses)
+        for candidate in discover_ir_candidates(
+            company,
+            max_results=6,
+            include_guesses=include_guesses,
+            search_timeout_seconds=search_timeout_seconds,
+            progress=progress,
+        )
         if candidate.score > 0 and is_company_host(candidate.url, company)
     )
     return dedupe(starts)
@@ -197,6 +261,10 @@ def navigation_link_score(
 def navigation_seed_score(url: str, label: str, context: str, company: Company) -> int:
     haystack = f"{url} {label} {context}".lower()
     positive = {
+        "events/event-details": 60,
+        "event-details": 55,
+        "earnings call": 45,
+        "quarterly earnings call": 45,
         "investor relations": 40,
         "investors": 35,
         "investor": 30,
@@ -220,6 +288,12 @@ def navigation_seed_score(url: str, label: str, context: str, company: Company) 
         "email alerts": 25,
         "stock quote": 25,
         "governance": 20,
+        "skip to main content": 50,
+        "#maincontent": 50,
+        "#main-content": 50,
+        "additional information": 20,
+        "faqs": 15,
+        "home page": 15,
     }
     score -= sum(value for token, value in negative.items() if token in haystack)
     if is_company_host(url, company):
@@ -288,3 +362,11 @@ def rank_discovered_urls(urls: list[str], company: Company) -> list[str]:
         key=lambda url: navigation_seed_score(url, "", "", company),
         reverse=True,
     )
+
+
+def should_render_navigation_page(playwright_mode: str, html: str, text: str) -> bool:
+    if playwright_mode == "always":
+        return True
+    if playwright_mode == "auto":
+        return looks_like_js_shell(html, text)
+    return False

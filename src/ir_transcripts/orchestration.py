@@ -1,0 +1,429 @@
+from __future__ import annotations
+
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any, TypedDict
+
+from langgraph.graph import END, START, StateGraph
+
+from .crawler import TranscriptCrawler
+from .http import HttpClient
+from .memory import load_company_memory, memory_path, remember_crawl_result, save_company_memory
+from .models import (
+    CandidatePage,
+    Company,
+    CompanyMemory,
+    CrawlAttemptConfig,
+    CrawlFailure,
+    CrawlResult,
+    FailureAnalysis,
+    SupervisorAction,
+    SupervisorRunResult,
+)
+from .runtime import ProgressReporter
+
+
+AttemptRunner = Callable[[Company, CrawlAttemptConfig], CrawlResult]
+
+
+class SupervisorState(TypedDict, total=False):
+    original_company: Company
+    current_company: Company
+    current_config: CrawlAttemptConfig
+    memory: CompanyMemory
+    result: CrawlResult
+    attempts: list[CrawlAttemptConfig]
+    analyses: list[FailureAnalysis]
+    actions: list[SupervisorAction]
+    max_attempts: int
+    out_dir: Path
+    should_retry: bool
+
+
+class SupervisedCrawler:
+    """AutoData-inspired supervisor around the existing transcript crawler."""
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        out_dir: Path,
+        http: HttpClient,
+        ollama_base_url: str | None = None,
+        base_config: CrawlAttemptConfig | None = None,
+        max_attempts: int = 2,
+        attempt_runner: AttemptRunner | None = None,
+        progress: ProgressReporter | None = None,
+    ) -> None:
+        self.model = model
+        self.out_dir = out_dir
+        self.http = http
+        self.ollama_base_url = ollama_base_url
+        self.base_config = base_config or CrawlAttemptConfig()
+        self.max_attempts = max_attempts
+        self.attempt_runner = attempt_runner or self._run_crawler_attempt
+        self.progress = progress or ProgressReporter(enabled=False)
+        self.graph = self._build_graph()
+
+    def run_company(self, company: Company) -> SupervisorRunResult:
+        self.progress.log(f"{company.symbol}: supervised run starting")
+        initial_state: SupervisorState = {
+            "original_company": company,
+            "current_company": company,
+            "current_config": self.base_config.model_copy(update={"attempt": 1, "reason": "initial"}),
+            "memory": load_company_memory(self.out_dir, company),
+            "attempts": [],
+            "analyses": [],
+            "actions": [],
+            "max_attempts": self.max_attempts,
+            "out_dir": self.out_dir,
+            "should_retry": False,
+        }
+        final_state = self.graph.invoke(initial_state)
+        result = final_state.get("result")
+        analyses = final_state.get("analyses", [])
+        actions = final_state.get("actions", [])
+        memory = final_state.get("memory") or CompanyMemory(company=company)
+        path = save_company_memory(self.out_dir, memory)
+        self.progress.log(f"{company.symbol}: supervised run finished with status={supervisor_status(result, actions)}")
+        return SupervisorRunResult(
+            company=company,
+            final_company=final_state.get("current_company", company),
+            attempts=final_state.get("attempts", []),
+            analyses=analyses,
+            actions=actions,
+            result=result,
+            memory_path=path,
+            status=supervisor_status(result, actions),
+        )
+
+    def _build_graph(self):
+        graph = StateGraph(SupervisorState)
+        graph.add_node("identity", self._identity_node)
+        graph.add_node("crawl", self._crawl_node)
+        graph.add_node("analyze", self._analyze_node)
+        graph.add_node("plan", self._plan_node)
+        graph.add_node("retry", self._retry_node)
+        graph.add_node("validate", self._validate_node)
+        graph.add_edge(START, "identity")
+        graph.add_edge("identity", "crawl")
+        graph.add_edge("crawl", "analyze")
+        graph.add_edge("analyze", "plan")
+        graph.add_conditional_edges(
+            "plan",
+            lambda state: "retry" if state.get("should_retry") else "validate",
+            {"retry": "retry", "validate": "validate"},
+        )
+        graph.add_edge("retry", "crawl")
+        graph.add_edge("validate", END)
+        return graph.compile()
+
+    def _identity_node(self, state: SupervisorState) -> SupervisorState:
+        company = state["current_company"]
+        resolved = resolve_company_identity(company)
+        if resolved != company:
+            self.progress.log(f"{company.symbol}: identity resolved to {resolved.name}")
+            action = SupervisorAction(
+                action_type="identity_correction",
+                reason=f"Resolved {company.symbol} from {company.name} to {resolved.name}",
+                next_company=resolved,
+            )
+            state["current_company"] = resolved
+            state["actions"] = [*state.get("actions", []), action]
+            state["memory"] = state["memory"].model_copy(update={"company": resolved})
+        return state
+
+    def _crawl_node(self, state: SupervisorState) -> SupervisorState:
+        company = state["current_company"]
+        config = state["current_config"]
+        self.progress.log(
+            f"{company.symbol}: attempt {config.attempt} starting "
+            f"(mode={config.discovery_mode}, depth={config.max_depth}, pages={config.max_pages_per_company})"
+        )
+        result = self.attempt_runner(company, config)
+        self.progress.log(
+            f"{company.symbol}: attempt {config.attempt} finished "
+            f"({len(result.transcripts)} transcript(s), {result.visited_count} page(s))"
+        )
+        state["result"] = result
+        state["attempts"] = [*state.get("attempts", []), config]
+        memory = state["memory"]
+        memory.attempted_configs.append(config)
+        state["memory"] = memory
+        return state
+
+    def _analyze_node(self, state: SupervisorState) -> SupervisorState:
+        result = state["result"]
+        config = state["current_config"]
+        analysis = analyze_crawl_result(result, config)
+        self.progress.log(f"{result.company.symbol}: analysis={analysis.category}: {analysis.summary}")
+        memory = remember_crawl_result(state["memory"], result, analysis)
+        state["memory"] = memory
+        state["analyses"] = [*state.get("analyses", []), analysis]
+        save_company_memory(self.out_dir, memory)
+        return state
+
+    def _plan_node(self, state: SupervisorState) -> SupervisorState:
+        analysis = state["analyses"][-1]
+        attempts = state.get("attempts", [])
+        action = plan_next_action(
+            analysis,
+            company=state["current_company"],
+            config=state["current_config"],
+            attempt_count=len(attempts),
+            max_attempts=state.get("max_attempts", self.max_attempts),
+        )
+        self.progress.log(f"{state['current_company'].symbol}: supervisor action={action.action_type}: {action.reason}")
+        state["actions"] = [*state.get("actions", []), action]
+        state["should_retry"] = action.next_config is not None and action.action_type not in {"finish", "manual_review"}
+        return state
+
+    def _retry_node(self, state: SupervisorState) -> SupervisorState:
+        action = state["actions"][-1]
+        if action.next_company:
+            state["current_company"] = action.next_company
+            state["memory"] = state["memory"].model_copy(update={"company": action.next_company})
+        if action.next_config:
+            state["current_config"] = action.next_config
+        state["should_retry"] = False
+        return state
+
+    def _validate_node(self, state: SupervisorState) -> SupervisorState:
+        save_company_memory(self.out_dir, state["memory"])
+        return state
+
+    def _run_crawler_attempt(self, company: Company, config: CrawlAttemptConfig) -> CrawlResult:
+        crawler = TranscriptCrawler(
+            model=self.model,
+            out_dir=self.out_dir,
+            max_pages_per_company=config.max_pages_per_company,
+            max_depth=config.max_depth,
+            use_playwright=config.use_playwright,
+            playwright_mode=config.playwright_mode,
+            ollama_base_url=self.ollama_base_url,
+            resume=config.resume,
+            review_only=config.review_only,
+            seed_urls=config.seed_urls,
+            discovery_mode=config.discovery_mode,
+            include_discovery_guesses=config.include_discovery_guesses,
+            disable_official_homepage_overrides=config.disable_official_homepage_overrides,
+            rerank_discovery=config.rerank_discovery,
+            extract_metadata_with_llm=config.extract_metadata_with_llm,
+            latest_only=config.latest_only,
+            search_timeout_seconds=config.search_timeout_seconds,
+            llm_timeout_seconds=config.llm_timeout_seconds,
+            navigation_llm_max_links=config.navigation_llm_max_links,
+            page_llm_max_links=config.page_llm_max_links,
+            llm_text_chars=config.llm_text_chars,
+            progress=self.progress,
+            http=self.http,
+        )
+        return crawler.crawl_company(company)
+
+
+def resolve_company_identity(company: Company) -> Company:
+    if company.symbol.upper() in {"GOOG", "GOOGL"} and company.name.upper() in {"GOOG", "GOOGL", "GOOGLE"}:
+        return company.model_copy(update={"name": "Alphabet Google"})
+    return company
+
+
+def analyze_crawl_result(result: CrawlResult, config: CrawlAttemptConfig) -> FailureAnalysis:
+    if result.transcripts:
+        return FailureAnalysis(
+            category="success",
+            summary=f"Saved {len(result.transcripts)} transcript(s).",
+            retryable=False,
+            evidence_urls=[str(record.source_url) for record in result.transcripts],
+        )
+
+    robots_unavailable = [failure for failure in result.failures if failure.failure_type == "robots_unavailable"]
+    if robots_unavailable:
+        manual = [
+            "At least one URL could not verify robots.txt. Review before rerunning with --robots-fail-open."
+        ]
+        for failure in robots_unavailable:
+            if looks_like_transcript_document(failure.url):
+                manual.append(
+                    f"Officially linked transcript document could not verify robots.txt: {failure.url}. "
+                    "Review before rerunning with --robots-fail-open."
+                )
+        return FailureAnalysis(
+            category="robots_unavailable",
+            summary="robots.txt could not be verified for one or more URLs.",
+            retryable=False,
+            evidence_urls=[failure.url for failure in robots_unavailable],
+            manual_recommendations=manual,
+        )
+
+    if needs_playwright_retry(result, config):
+        return FailureAnalysis(
+            category="render_needed",
+            summary="IR or earnings pages appear likely to need browser rendering.",
+            retryable=True,
+            evidence_urls=[candidate.url for candidate in result.candidates],
+        )
+
+    if needs_deeper_crawl(result, config):
+        return FailureAnalysis(
+            category="needs_deeper_crawl",
+            summary="Crawl reached promising IR pages but may need more depth or page budget.",
+            retryable=True,
+            evidence_urls=[candidate.url for candidate in result.candidates],
+        )
+
+    if not result.candidates and not result.failures:
+        return FailureAnalysis(
+            category="no_useful_links",
+            summary=result.skipped_reason or "No useful IR candidates were found.",
+            retryable=True,
+        )
+
+    not_transcript = [failure for failure in result.failures if failure.failure_type == "not_transcript"]
+    if not_transcript and len(not_transcript) == len(result.failures):
+        return FailureAnalysis(
+            category="not_transcript",
+            summary="Fetched document candidates were rejected by strict transcript detection.",
+            retryable=False,
+            evidence_urls=[failure.url for failure in not_transcript],
+        )
+
+    return FailureAnalysis(
+        category="no_transcript_found",
+        summary="No transcript artifact was saved.",
+        retryable=config.discovery_mode == "nav-first",
+        evidence_urls=[candidate.url for candidate in result.candidates],
+    )
+
+
+def plan_next_action(
+    analysis: FailureAnalysis,
+    *,
+    company: Company,
+    config: CrawlAttemptConfig,
+    attempt_count: int,
+    max_attempts: int,
+) -> SupervisorAction:
+    if analysis.category == "success":
+        return SupervisorAction(action_type="finish", reason=analysis.summary)
+
+    if analysis.manual_recommendations:
+        return SupervisorAction(
+            action_type="manual_review",
+            reason=analysis.summary,
+            manual_recommendations=analysis.manual_recommendations,
+        )
+
+    if attempt_count >= max_attempts:
+        return SupervisorAction(action_type="finish", reason=f"Reached supervisor max attempts ({max_attempts}).")
+
+    next_attempt = attempt_count + 1
+    if analysis.category == "render_needed" and config.playwright_mode == "off" and not config.use_playwright:
+        return SupervisorAction(
+            action_type="playwright_retry",
+            reason=analysis.summary,
+            next_config=config.model_copy(
+                update={
+                    "attempt": next_attempt,
+                    "use_playwright": True,
+                    "playwright_mode": "auto",
+                    "reason": "playwright_retry",
+                }
+            ),
+        )
+
+    if analysis.category in {"no_useful_links", "no_transcript_found"} and config.discovery_mode == "nav-first":
+        return SupervisorAction(
+            action_type="search_first",
+            reason=analysis.summary,
+            next_config=config.model_copy(
+                update={"attempt": next_attempt, "discovery_mode": "search-first", "reason": "search_first_retry"}
+            ),
+        )
+
+    if analysis.category == "needs_deeper_crawl":
+        return SupervisorAction(
+            action_type="deeper_crawl",
+            reason=analysis.summary,
+            next_config=config.model_copy(
+                update={
+                    "attempt": next_attempt,
+                    "max_depth": min(config.max_depth + 1, 6),
+                    "max_pages_per_company": min(max(config.max_pages_per_company + 5, 10), 80),
+                    "reason": "deeper_crawl_retry",
+                }
+            ),
+        )
+
+    resolved = resolve_company_identity(company)
+    if resolved != company:
+        return SupervisorAction(
+            action_type="identity_correction",
+            reason=f"Resolved company identity to {resolved.name}.",
+            next_company=resolved,
+            next_config=config.model_copy(update={"attempt": next_attempt, "reason": "identity_correction_retry"}),
+        )
+
+    return SupervisorAction(action_type="finish", reason=analysis.summary)
+
+
+def needs_playwright_retry(result: CrawlResult, config: CrawlAttemptConfig) -> bool:
+    if config.use_playwright or config.playwright_mode != "off":
+        return False
+    haystack = " ".join(page_haystack(candidate) for candidate in result.candidates).lower()
+    js_markers = ("q4web", "q4cdn", "q4app", "financial reports", "earnings", "events")
+    return bool(result.candidates) and any(marker in haystack for marker in js_markers)
+
+
+def needs_deeper_crawl(result: CrawlResult, config: CrawlAttemptConfig) -> bool:
+    if not result.candidates:
+        return False
+    if result.visited_count >= config.max_pages_per_company:
+        return True
+    return any(candidate.depth >= config.max_depth and promising_candidate(candidate) for candidate in result.candidates)
+
+
+def promising_candidate(candidate: CandidatePage) -> bool:
+    haystack = page_haystack(candidate).lower()
+    return any(token in haystack for token in ("investor", "earnings", "financial", "events", "webcast"))
+
+
+def page_haystack(candidate: CandidatePage) -> str:
+    return f"{candidate.url} {candidate.title} {candidate.llm_page_type or ''} {candidate.reason}"
+
+
+def looks_like_transcript_document(url: str) -> bool:
+    lowered = url.lower()
+    has_transcript_hint = any(token in lowered for token in ("transcript", "earnings-call", "earnings_call", "earnings"))
+    return has_transcript_hint and (lowered.endswith((".pdf", ".docx")) or "is/content" in lowered)
+
+
+def supervisor_status(result: CrawlResult | None, actions: list[SupervisorAction]) -> str:
+    if result and result.transcripts:
+        return "success"
+    if actions and actions[-1].action_type == "manual_review":
+        return "manual_review"
+    if result and (result.candidates or result.failures):
+        return "partial"
+    return "failed"
+
+
+def run_supervised_company(
+    company: Company,
+    *,
+    model: str,
+    out_dir: Path,
+    http: HttpClient,
+    ollama_base_url: str | None = None,
+    base_config: CrawlAttemptConfig | None = None,
+    max_attempts: int = 2,
+    progress: ProgressReporter | None = None,
+) -> SupervisorRunResult:
+    return SupervisedCrawler(
+        model=model,
+        out_dir=out_dir,
+        http=http,
+        ollama_base_url=ollama_base_url,
+        base_config=base_config,
+        max_attempts=max_attempts,
+        progress=progress,
+    ).run_company(company)

@@ -10,8 +10,8 @@ class PlaywrightRenderer:
     """Render JavaScript-heavy IR pages after robots.txt has allowed the URL."""
 
     http: HttpClient
-    wait_until: str = "networkidle"
-    timeout_ms: int = 30_000
+    wait_until: str = "domcontentloaded"
+    timeout_ms: int = 15_000
 
     def render_html(self, url: str) -> str:
         self.http.check_robots(url)
