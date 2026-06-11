@@ -8,6 +8,7 @@ langchain-community==0.4.2
 langchain-core==1.4.2
 langchain-ollama==1.1.0
 langchain-text-splitters==1.1.2
+langgraph==0.6.6
 lxml==6.1.1
 pandas==3.0.3
 playwright==1.60.0
