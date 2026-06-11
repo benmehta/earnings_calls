@@ -3,7 +3,8 @@ from zipfile import ZipFile
 
 from ir_transcripts.crawler import TranscriptCrawler, artifact_stem, content_hash, is_docx_response, link_score
 from ir_transcripts.http import RobotsDisallowedError, RobotsUnavailableError
-from ir_transcripts.models import CandidateLink, Company, PageDecision
+from ir_transcripts.models import CandidateLink, Company, NavigationTrace, PageDecision
+from ir_transcripts.navigation import NavigationDiscoveryResult
 
 
 def test_link_score_prefers_transcripts() -> None:
@@ -19,6 +20,28 @@ def test_link_score_prefers_transcripts() -> None:
     )
 
     assert link_score(transcript) > link_score(careers)
+
+
+def test_heuristic_links_prioritize_transcript_document_after_page_chrome(tmp_path) -> None:
+    chrome_links = [
+        CandidateLink(
+            url=f"https://investor.example.com/financial-info/archive-{index}",
+            label=f"Financial archive {index}",
+            source_url="https://investor.example.com/financial-reports",
+        )
+        for index in range(40)
+    ]
+    transcript = CandidateLink(
+        url="https://cdn.example.com/files/doc_financials/2027/q1/EX-Q1-2027-Earnings-Call.pdf",
+        label="Q1 Transcript 2027 (opens in new window)",
+        source_url="https://investor.example.com/financial-reports",
+    )
+    crawler = TranscriptCrawler(model="test-model", out_dir=tmp_path, seed_urls=["https://investor.example.com"])
+
+    prioritized = crawler._heuristic_links([*chrome_links, transcript])
+
+    assert prioritized[0] == transcript
+    assert transcript in prioritized
 
 
 def test_artifact_stem_and_content_hash_are_stable() -> None:
@@ -145,6 +168,44 @@ def test_crawler_saves_docx_transcript(tmp_path) -> None:
     assert len(result.transcripts) == 1
     assert result.transcripts[0].metadata["format"] == "docx"
     assert list((tmp_path / "EX").glob("*.docx"))
+
+
+def test_nav_first_uses_navigation_before_search(monkeypatch, tmp_path) -> None:
+    company = Company(symbol="EX", name="Example")
+    monkeypatch.setattr(
+        "ir_transcripts.crawler.discover_navigation_seeds",
+        lambda *args, **kwargs: NavigationDiscoveryResult(
+            seeds=["https://example.com/investors"],
+            trace=NavigationTrace(company=company),
+        ),
+    )
+    monkeypatch.setattr("ir_transcripts.crawler.find_ir_candidates", lambda *args, **kwargs: ["https://search.example.com"])
+    crawler = TranscriptCrawler(model="test-model", out_dir=tmp_path, discovery_mode="nav-first")
+
+    assert crawler._discover_seeds(company) == ["https://example.com/investors"]
+
+
+def test_search_first_preserves_search_discovery(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("ir_transcripts.crawler.find_ir_candidates", lambda *args, **kwargs: ["https://search.example.com"])
+    crawler = TranscriptCrawler(model="test-model", out_dir=tmp_path, discovery_mode="search-first")
+
+    assert crawler._discover_seeds(Company(symbol="EX", name="Example")) == ["https://search.example.com"]
+
+
+def test_seed_url_bypasses_discovery(monkeypatch, tmp_path) -> None:
+    def fail_discovery(*args, **kwargs):
+        raise AssertionError("discovery should not run")
+
+    monkeypatch.setattr("ir_transcripts.crawler.discover_navigation_seeds", fail_discovery)
+    monkeypatch.setattr("ir_transcripts.crawler.find_ir_candidates", fail_discovery)
+    crawler = TranscriptCrawler(
+        model="test-model",
+        out_dir=tmp_path,
+        seed_urls=["https://seed.example.com"],
+        discovery_mode="nav-first",
+    )
+
+    assert crawler._discover_seeds(Company(symbol="EX", name="Example")) == ["https://seed.example.com"]
 
 
 def docx_fixture(paragraphs: list[str]) -> bytes:

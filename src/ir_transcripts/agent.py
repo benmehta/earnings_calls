@@ -7,7 +7,7 @@ from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama
 
-from .models import CandidateLink, IRDiscoveryCandidate, IRDiscoveryDecision, PageDecision, PageDecisionDraft
+from .models import CandidateLink, IRDiscoveryCandidate, IRDiscoveryDecision, NavigationDecision, PageDecision, PageDecisionDraft
 
 
 def build_llm(
@@ -150,6 +150,101 @@ class IRDiscoveryAgent:
                 "limit": limit,
                 "format_instructions": self.parser.get_format_instructions(),
             }
+        )
+
+
+class IRNavigationAgent:
+    """Local Ollama link selector for navigation-first IR discovery."""
+
+    HOMEPAGE_SYSTEM_PROMPT = (
+        "You are guiding a polite crawler from an official company homepage toward "
+        "the company's investor-relations materials.\n\n"
+        "Choose only provided candidate links. Do not invent URLs.\n\n"
+        "Prefer links labeled Investors, Investor Relations, Shareholders, Financial Info, "
+        "Financial Reports, Quarterly Results, Earnings, Events, Presentations, Webcast, "
+        "Transcript, or Results.\n\n"
+        "Footer links are important. Many companies put Investors or Investor Relations "
+        "in the footer rather than the main navigation.\n\n"
+        "Avoid careers, products, support, privacy, legal, store, unrelated blogs/news, "
+        "marketing pages, and third-party finance/transcript websites.\n\n"
+        "Return only one JSON object."
+    )
+    IR_SYSTEM_PROMPT = (
+        "You are already inside an investor-relations site. Choose links most likely to "
+        "lead to earnings call transcript materials or earnings materials.\n\n"
+        "Choose only provided candidate links. Do not invent URLs.\n\n"
+        "Prefer Financial Info, Financial Reports, Quarterly Results, Earnings Releases, "
+        "Events, Presentations, Webcast, Transcript, Results, and News Releases when they "
+        "are part of investor relations.\n\n"
+        "Avoid governance, stock quote, email alerts, SEC-only pages, annual meeting, "
+        "privacy/legal pages, careers, product pages, and unrelated company news unless "
+        "there are no better investor-relations materials links.\n\n"
+        "Return only one JSON object."
+    )
+    HUMAN_PROMPT = (
+        "Company: {company_name} ({ticker})\n"
+        "Current URL: {url}\n"
+        "Page title: {title}\n"
+        "Visible text sample:\n{text}\n\n"
+        "Candidate links as JSON:\n{links_json}\n\n"
+        "Return exactly:\n"
+        "{{\n"
+        "  \"chosen_urls\": [\"https://example.com/investor\"],\n"
+        "  \"confidence\": 0.8,\n"
+        "  \"reason\": \"short reason\",\n"
+        "  \"stop_reason\": null\n"
+        "}}"
+    )
+
+    def __init__(self, model: str, base_url: str | None = None) -> None:
+        self.homepage_chain = self._chain(self.HOMEPAGE_SYSTEM_PROMPT, model, base_url)
+        self.ir_chain = self._chain(self.IR_SYSTEM_PROMPT, model, base_url)
+
+    def decide(
+        self,
+        *,
+        company_name: str,
+        ticker: str,
+        url: str,
+        title: str,
+        text: str,
+        links: list[CandidateLink],
+        page_context: str,
+    ) -> NavigationDecision:
+        compact_links = [
+            {
+                "url": link.url,
+                "label": link.label,
+                "source_url": link.source_url,
+                "context": link.reason,
+            }
+            for link in links[:40]
+        ]
+        chain = self.ir_chain if page_context == "ir" else self.homepage_chain
+        message = chain.invoke(
+            {
+                "company_name": company_name,
+                "ticker": ticker,
+                "url": url,
+                "title": title,
+                "text": text[:2500],
+                "links_json": json.dumps(compact_links, ensure_ascii=True),
+            }
+        )
+        draft = NavigationDecision.model_validate(extract_json_object(message.content))
+        urls_by_candidate = {link.url for link in links}
+        draft.chosen_urls = [url for url in draft.chosen_urls if url in urls_by_candidate]
+        return draft
+
+    def _chain(self, system_prompt: str, model: str, base_url: str | None):
+        return (
+            ChatPromptTemplate.from_messages(
+                [
+                    ("system", system_prompt),
+                    ("human", self.HUMAN_PROMPT),
+                ]
+            )
+            | build_llm(model, base_url=base_url, json_mode=True)
         )
 
 

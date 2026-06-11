@@ -78,9 +78,19 @@ To preview discovery without crawling company IR pages:
 python -m ir_transcripts.discover MSFT --max-results 8
 ```
 
-Discovery uses curated known URLs plus search results by default. Deterministic
-URL guesses are disabled unless search/curated discovery finds nothing and you
-explicitly opt in:
+Discovery uses official-site navigation first by default. The local Ollama
+navigation agent chooses from extracted homepage/IR links while the crawler keeps
+control of robots.txt, rate limits, and host expansion. Search remains the
+fallback when navigation does not find usable seeds.
+
+To compare with the older search-first behavior:
+
+```bash
+python -m ir_transcripts --symbols NVDA --discovery-mode search-first --review-only
+```
+
+Deterministic URL guesses are disabled unless search/curated discovery finds
+nothing and you explicitly opt in:
 
 ```bash
 python -m ir_transcripts.discover MSFT --include-guesses
@@ -113,12 +123,13 @@ will take time and should respect each site's robots.txt, terms, and rate limits
 
 1. Loads the current S&P 500 constituent table from Wikipedia.
 2. Locates a likely investor-relations site for each company.
-3. Crawls only that IR domain/path, politely and with robots.txt checks.
-4. Uses a local Ollama-backed LangChain agent to classify pages and links.
-5. Downloads likely transcript pages or PDFs.
-6. Optionally renders JavaScript-heavy pages with Playwright.
-7. Saves normalized transcript JSON plus raw artifacts.
-8. Optionally indexes transcripts into local Chroma using Ollama embeddings.
+3. Navigates official company and IR pages toward earnings materials.
+4. Crawls only that official IR path, politely and with robots.txt checks.
+5. Uses local Ollama-backed LangChain agents to choose navigation links and classify pages.
+6. Downloads likely transcript pages, PDFs, or DOCX files.
+7. Optionally renders JavaScript-heavy pages with Playwright.
+8. Saves normalized transcript JSON plus raw artifacts.
+9. Optionally indexes transcripts into local Chroma using Ollama embeddings.
 
 ## No-Network Verification
 

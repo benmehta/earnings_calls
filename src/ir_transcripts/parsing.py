@@ -62,7 +62,25 @@ def _candidate_from_tag(tag, attribute: str, source_url: str) -> CandidateLink |
     label = " ".join(tag.get_text(" ").split())
     if not label:
         label = tag.get("arialabel") or tag.get("aria-label") or tag.get("title") or ""
-    return CandidateLink(url=absolute, label=label[:250], source_url=source_url)
+    return CandidateLink(url=absolute, label=label[:250], source_url=source_url, reason=link_context(tag))
+
+
+def link_context(tag) -> str:
+    for parent in [tag, *tag.parents]:
+        name = getattr(parent, "name", "") or ""
+        if name in {"footer", "nav", "header"}:
+            return name
+        role = (parent.get("role") or "").lower() if hasattr(parent, "get") else ""
+        if role in {"navigation", "contentinfo"}:
+            return "nav" if role == "navigation" else "footer"
+        class_text = " ".join(parent.get("class") or []).lower() if hasattr(parent, "get") else ""
+        if "footer" in class_text:
+            return "footer"
+        if "nav" in class_text or "menu" in class_text:
+            return "nav"
+        if "header" in class_text:
+            return "header"
+    return "body"
 
 
 def pdf_text(content: bytes) -> str:
@@ -162,7 +180,16 @@ def transcript_speakers(text: str) -> set[str]:
 
 def looks_like_js_shell(html: str, text: str) -> bool:
     lower = html.lower()
+    widget_markers = ("financialtable({", "apimashup({", "q4.financialtable", "q4.apimashup")
+    if any(marker in lower for marker in widget_markers):
+        return True
     if len(text) < 500 and len(html) > 5000:
         return True
-    markers = ("__next_data__", "data-reactroot", "id=\"root\"", "id=\"app\"", "window.__")
+    markers = (
+        "__next_data__",
+        "data-reactroot",
+        "id=\"root\"",
+        "id=\"app\"",
+        "window.__",
+    )
     return len(text) < 1500 and any(marker in lower for marker in markers)

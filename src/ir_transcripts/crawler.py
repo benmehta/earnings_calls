@@ -10,6 +10,7 @@ from .browser import PlaywrightRenderer
 from .http import HttpClient, RobotsDisallowedError, RobotsUnavailableError
 from .metadata import TranscriptMetadataAgent, extract_metadata_heuristic
 from .models import CandidateLink, CandidatePage, Company, CrawlFailure, CrawlResult, FailureType, TranscriptRecord
+from .navigation import discover_navigation_seeds
 from .parsing import classify_transcript, docx_text, extract_links, looks_like_js_shell, looks_like_transcript, page_title, pdf_text, visible_text
 from .search import find_ir_candidates
 from .state import CrawlState
@@ -18,6 +19,7 @@ from .urls import host, normalize_url, resolve_document_url
 
 TRANSCRIPT_HINTS = ("transcript", "earnings-call", "earnings call", "quarterly-results")
 IR_HINTS = ("investor", "/ir", "shareholder", "financial", "events", "earnings", "quarter")
+TRANSCRIPT_DOCUMENT_EXTENSIONS = (".pdf", ".docx")
 
 
 class TranscriptCrawler:
@@ -33,6 +35,7 @@ class TranscriptCrawler:
         resume: bool = True,
         review_only: bool = False,
         seed_urls: list[str] | None = None,
+        discovery_mode: str = "nav-first",
         include_discovery_guesses: bool = False,
         rerank_discovery: bool = False,
         extract_metadata_with_llm: bool = False,
@@ -48,18 +51,14 @@ class TranscriptCrawler:
         self.resume = resume
         self.review_only = review_only
         self.seed_urls = seed_urls or []
+        self.discovery_mode = discovery_mode
         self.include_discovery_guesses = include_discovery_guesses
         self.rerank_discovery = rerank_discovery
         self.http = http or HttpClient()
         self.renderer = PlaywrightRenderer(self.http) if use_playwright else None
 
     def crawl_company(self, company: Company) -> CrawlResult:
-        seeds = self.seed_urls or find_ir_candidates(
-            company,
-            include_guesses=self.include_discovery_guesses,
-            rerank_model=self.model if self.rerank_discovery else None,
-            ollama_base_url=self.ollama_base_url,
-        )
+        seeds = self._discover_seeds(company)
         seeds = [resolve_document_url(seed) for seed in seeds]
         if not seeds:
             return CrawlResult(company=company, skipped_reason="No investor-relations candidates found")
@@ -201,6 +200,32 @@ class TranscriptCrawler:
         self._write_candidates(result)
         state.save()
         return result
+
+    def _discover_seeds(self, company: Company) -> list[str]:
+        if self.seed_urls:
+            return self.seed_urls
+        if self.discovery_mode == "search-first":
+            return self._search_seeds(company)
+
+        navigation = discover_navigation_seeds(
+            company,
+            http=self.http,
+            model=self.model,
+            ollama_base_url=self.ollama_base_url,
+            include_guesses=self.include_discovery_guesses,
+        )
+        self._write_navigation_trace(navigation.trace)
+        if navigation.seeds:
+            return navigation.seeds
+        return self._search_seeds(company)
+
+    def _search_seeds(self, company: Company) -> list[str]:
+        return find_ir_candidates(
+            company,
+            include_guesses=self.include_discovery_guesses,
+            rerank_model=self.model if self.rerank_discovery else None,
+            ollama_base_url=self.ollama_base_url,
+        )
 
     def _record_html(
         self,
@@ -366,11 +391,16 @@ class TranscriptCrawler:
             for candidate in result.candidates:
                 handle.write(candidate.model_dump_json() + "\n")
 
+    def _write_navigation_trace(self, trace) -> None:
+        path = self._company_dir(trace.company) / "_navigation_trace.json"
+        path.write_text(trace.model_dump_json(indent=2), encoding="utf-8")
+
     def _prioritize_links(self, links: list[CandidateLink]) -> list[CandidateLink]:
         return sorted(links, key=lambda link: link_score(link), reverse=True)[:80]
 
     def _heuristic_links(self, links: list[CandidateLink]) -> list[CandidateLink]:
-        return [link for link in links if link_score(link) >= 2][:30]
+        scored_links = [link for link in links if link_score(link) >= 2]
+        return sorted(scored_links, key=lambda link: link_score(link), reverse=True)[:30]
 
     def _should_follow(self, link: CandidateLink, allowed_hosts: set[str], *, current_url: str) -> bool:
         link.url = resolve_document_url(link.url)
@@ -408,6 +438,10 @@ def link_score(link: CandidateLink) -> int:
     score = 0
     score += sum(3 for hint in TRANSCRIPT_HINTS if hint in haystack)
     score += sum(1 for hint in IR_HINTS if hint in haystack)
+    if "transcript" in haystack and urlparse(link.url.lower()).path.endswith(TRANSCRIPT_DOCUMENT_EXTENSIONS):
+        score += 12
+    if "earnings-call" in haystack or "earnings call" in haystack:
+        score += 4
     return score
 
 

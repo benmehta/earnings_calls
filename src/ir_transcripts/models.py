@@ -41,6 +41,28 @@ class IRDiscoveryDecision(BaseModel):
     selections: list[IRDiscoverySelection] = Field(default_factory=list)
 
 
+class NavigationDecision(BaseModel):
+    chosen_urls: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    reason: str = ""
+    stop_reason: str | None = None
+
+
+class NavigationStep(BaseModel):
+    current_url: str
+    title: str = ""
+    chosen_urls: list[str] = Field(default_factory=list)
+    rejected_urls: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    reason: str = ""
+    stop_reason: str | None = None
+
+
+class NavigationTrace(BaseModel):
+    company: Company
+    steps: list[NavigationStep] = Field(default_factory=list)
+
+
 class PageDecision(BaseModel):
     page_type: Literal[
         "transcript",

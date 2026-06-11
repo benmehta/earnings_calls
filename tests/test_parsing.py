@@ -99,3 +99,15 @@ def test_docx_transcript_text_is_detected() -> None:
 def test_js_shell_detection() -> None:
     html = (FIXTURES / "js_shell.html").read_text(encoding="utf-8")
     assert looks_like_js_shell(html, visible_text(html))
+
+
+def test_q4_financial_widget_triggers_browser_render() -> None:
+    html = """
+    <html><body>
+      <p>Investor relations page with enough static text that it is not an app shell.</p>
+      <script>$(".module-financial-table").financialTable({ categories: [] });</script>
+    </body></html>
+    """
+    text = " ".join(["static investor relations text"] * 200)
+
+    assert looks_like_js_shell(html, text)

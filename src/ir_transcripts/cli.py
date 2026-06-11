@@ -16,6 +16,8 @@ from .sp500 import load_sp500
 
 COMMON_COMPANY_NAMES = {
     "AAPL": "Apple",
+    "GOOG": "Alphabet Google",
+    "GOOGL": "Alphabet Google",
     "MSFT": "Microsoft",
     "NVDA": "NVIDIA",
 }
@@ -41,6 +43,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--playwright", action="store_true", help="Render likely JavaScript app-shell pages")
     parser.add_argument("--review-only", action="store_true", help="Write candidate/failure review files without saving transcript artifacts")
     parser.add_argument("--no-resume", action="store_true", help="Ignore existing per-company crawl state")
+    parser.add_argument(
+        "--discovery-mode",
+        choices=("nav-first", "search-first"),
+        default=os.getenv("IR_DISCOVERY_MODE", "nav-first"),
+        help="Use official-site navigation before search, or preserve search-first discovery",
+    )
     parser.add_argument("--include-discovery-guesses", action="store_true", help="Use deterministic IR URL guesses only if search/curated discovery finds nothing")
     parser.add_argument("--rerank-discovery", action="store_true", help="Use local Ollama to rerank discovery search results")
     parser.add_argument("--metadata-llm", action="store_true", help="Use a second local Ollama pass for confirmed transcript metadata")
@@ -91,6 +99,7 @@ def main() -> None:
         resume=not args.no_resume,
         review_only=args.review_only,
         seed_urls=args.seed_url,
+        discovery_mode=args.discovery_mode,
         include_discovery_guesses=args.include_discovery_guesses,
         rerank_discovery=args.rerank_discovery,
         extract_metadata_with_llm=args.metadata_llm,
