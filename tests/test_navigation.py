@@ -1,13 +1,15 @@
 from pathlib import Path
 from urllib.parse import urljoin
 
-from ir_transcripts.models import Company, NavigationDecision
+from ir_transcripts.models import Company, CompanyNavigationMemory, NavigationDecision
 from ir_transcripts.navigation import (
     discover_navigation_seeds,
     is_company_host,
     navigation_link_score,
+    navigation_start_score,
     navigation_start_urls,
     rank_discovered_urls,
+    rank_navigation_starts,
     navigation_candidate_links,
 )
 from ir_transcripts.models import IRDiscoveryCandidate
@@ -139,6 +141,46 @@ def test_navigation_start_urls_can_disable_alphabet_homepage_override(monkeypatc
     )
 
     assert "https://abc.xyz/" not in starts
+
+
+def test_navigation_start_ranking_prefers_broad_ir_home_over_deep_or_blog_urls() -> None:
+    company = Company(symbol="GOOG", name="Alphabet Google")
+    ranked = rank_navigation_starts(
+        [
+            "https://www.alphabetgoogle.com",
+            "https://alphabet2025ir.q4web.com/default.aspx",
+            "https://abc.xyz/investor/sec-filings/default.aspx",
+            "https://blog.google/alphabet/investor-presentation-june-2026/",
+            "https://abc.xyz/investor/",
+        ],
+        company,
+    )
+
+    assert ranked[0] == "https://abc.xyz/investor/"
+    assert navigation_start_score("https://abc.xyz/investor/", company) > navigation_start_score(
+        "https://abc.xyz/investor/sec-filings/default.aspx",
+        company,
+    )
+
+
+def test_navigation_start_ranking_uses_structured_memory_generically() -> None:
+    company = Company(symbol="EX", name="Example")
+    memory = CompanyNavigationMemory(
+        preferred_hosts=["ir.example.com"],
+        known_ir_home_urls=["https://ir.example.com/investors"],
+        low_value_hosts=["blog.example.com"],
+    )
+    ranked = rank_navigation_starts(
+        [
+            "https://blog.example.com/earnings-q1",
+            "https://ir.example.com/investors/sec-filings",
+            "https://ir.example.com/investors",
+        ],
+        company,
+        navigation_memory=memory,
+    )
+
+    assert ranked[0] == "https://ir.example.com/investors"
 
 
 def test_discovered_urls_prioritize_financial_reports() -> None:

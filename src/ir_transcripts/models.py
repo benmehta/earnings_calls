@@ -48,6 +48,14 @@ class NavigationDecision(BaseModel):
     stop_reason: str | None = None
 
 
+class NavigationValidationResult(BaseModel):
+    is_valid: bool = False
+    accepted_urls: list[str] = Field(default_factory=list)
+    rejected_urls: list[str] = Field(default_factory=list)
+    reason: str = ""
+    repair_guidance: str | None = None
+
+
 class NavigationStep(BaseModel):
     current_url: str
     title: str = ""
@@ -61,6 +69,14 @@ class NavigationStep(BaseModel):
 class NavigationTrace(BaseModel):
     company: Company
     steps: list[NavigationStep] = Field(default_factory=list)
+
+
+class PromptGuidance(BaseModel):
+    priority_terms: list[str] = Field(default_factory=list)
+    avoid_terms: list[str] = Field(default_factory=list)
+    navigation_guidance: str = ""
+    transcript_guidance: str = ""
+    risk_notes: list[str] = Field(default_factory=list)
 
 
 class PageDecision(BaseModel):
@@ -145,6 +161,18 @@ class CrawlResult(BaseModel):
     visited_count: int = 0
 
 
+class CompanyNavigationMemory(BaseModel):
+    successful_hosts: list[str] = Field(default_factory=list)
+    successful_paths: list[str] = Field(default_factory=list)
+    preferred_hosts: list[str] = Field(default_factory=list)
+    low_value_hosts: list[str] = Field(default_factory=list)
+    low_value_path_terms: list[str] = Field(default_factory=list)
+    known_ir_home_urls: list[str] = Field(default_factory=list)
+    known_event_listing_urls: list[str] = Field(default_factory=list)
+    known_transcript_urls: list[str] = Field(default_factory=list)
+    robots_blocked_hosts: list[str] = Field(default_factory=list)
+
+
 class CrawlAttemptConfig(BaseModel):
     attempt: int = 1
     max_pages_per_company: int = 40
@@ -160,6 +188,10 @@ class CrawlAttemptConfig(BaseModel):
     rerank_discovery: bool = False
     extract_metadata_with_llm: bool = False
     latest_only: bool = False
+    allow_official_linked_documents_on_robots_unavailable: bool = False
+    use_prompt_planner: bool = False
+    prompt_guidance: PromptGuidance | None = None
+    navigation_memory: CompanyNavigationMemory | None = None
     search_timeout_seconds: float = 30.0
     llm_timeout_seconds: float = 45.0
     navigation_llm_max_links: int = 12
@@ -215,6 +247,8 @@ class CompanyMemory(BaseModel):
     rejected_urls: list[str] = Field(default_factory=list)
     recommended_manual_actions: list[str] = Field(default_factory=list)
     successful_transcript_urls: list[str] = Field(default_factory=list)
+    prompt_guidance: PromptGuidance | None = None
+    navigation_memory: CompanyNavigationMemory = Field(default_factory=CompanyNavigationMemory)
 
 
 class SupervisorRunResult(BaseModel):

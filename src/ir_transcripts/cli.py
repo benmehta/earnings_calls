@@ -96,7 +96,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--rerank-discovery", action="store_true", help="Use local Ollama to rerank discovery search results")
     parser.add_argument("--metadata-llm", action="store_true", help="Use a second local Ollama pass for confirmed transcript metadata")
+    parser.add_argument("--prompt-planner", action="store_true", help="Use a local Ollama planner to create advisory prompts from company memory in supervised mode")
     parser.add_argument("--latest-only", action="store_true", help="Keep only the latest detected transcript per company")
+    parser.add_argument(
+        "--allow-official-linked-documents-on-robots-unavailable",
+        action="store_true",
+        help=(
+            "When an allowed official IR page links directly to a transcript document, "
+            "allow fetching that document if the document host's robots.txt is unavailable."
+        ),
+    )
     parser.add_argument("--index-chroma", action="store_true", help="Index collected transcripts into local Chroma")
     parser.add_argument("--chroma-dir", type=Path, default=Path("data/chroma"), help="Chroma persistence directory")
     parser.add_argument("--embedding-model", default=os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text"), help="Ollama embedding model for Chroma")
@@ -172,6 +181,7 @@ def main() -> None:
         rerank_discovery=args.rerank_discovery,
         extract_metadata_with_llm=args.metadata_llm,
         latest_only=args.latest_only,
+        allow_official_linked_documents_on_robots_unavailable=args.allow_official_linked_documents_on_robots_unavailable,
         search_timeout_seconds=args.search_timeout,
         llm_timeout_seconds=args.llm_timeout,
         navigation_llm_max_links=args.navigation_llm_max_links,
@@ -194,6 +204,8 @@ def main() -> None:
         rerank_discovery=args.rerank_discovery,
         extract_metadata_with_llm=args.metadata_llm,
         latest_only=args.latest_only,
+        allow_official_linked_documents_on_robots_unavailable=args.allow_official_linked_documents_on_robots_unavailable,
+        use_prompt_planner=args.prompt_planner,
         search_timeout_seconds=args.search_timeout,
         llm_timeout_seconds=args.llm_timeout,
         navigation_llm_max_links=args.navigation_llm_max_links,

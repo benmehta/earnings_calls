@@ -189,6 +189,11 @@ Defaults are intentionally conservative:
 - If `robots.txt` cannot be fetched because of a server/network error, the
   crawler fails closed and skips that host.
 - A missing `robots.txt` file (`404`) is treated as no published robots policy.
+- Officially linked transcript documents on CDN/vendor hosts can be fetched
+  when that document host's `robots.txt` is unavailable only with the explicit
+  `--allow-official-linked-documents-on-robots-unavailable` opt-in. The source
+  page must already be an allowed official IR page, and the target must look
+  transcript-document-like.
 
 Useful options:
 
@@ -196,6 +201,7 @@ Useful options:
 python -m ir_transcripts --symbols AAPL --user-agent "your-project/0.1 (+mailto:you@example.com)"
 python -m ir_transcripts --symbols AAPL --delay 5
 python -m ir_transcripts --symbols AAPL --robots-fail-open
+python -m ir_transcripts --symbols AAPL --allow-official-linked-documents-on-robots-unavailable
 python -m ir_transcripts --symbols AAPL --ignore-robots
 ```
 

@@ -10,7 +10,7 @@ from .agent import IRPageAgent
 from .browser import PlaywrightRenderer
 from .http import HttpClient, RobotsDisallowedError, RobotsUnavailableError
 from .metadata import TranscriptMetadataAgent, extract_metadata_heuristic
-from .models import CandidateLink, CandidatePage, Company, CrawlFailure, CrawlResult, FailureType, TranscriptRecord
+from .models import CandidateLink, CandidatePage, Company, CompanyNavigationMemory, CrawlFailure, CrawlResult, FailureType, PromptGuidance, TranscriptRecord
 from .navigation import discover_navigation_seeds
 from .parsing import classify_transcript, docx_text, extract_links, looks_like_js_shell, looks_like_transcript, page_title, pdf_text, visible_text
 from .runtime import ProgressReporter, timeout_after
@@ -49,6 +49,9 @@ class TranscriptCrawler:
         navigation_llm_max_links: int = 12,
         page_llm_max_links: int = 12,
         llm_text_chars: int = 900,
+        prompt_guidance: PromptGuidance | None = None,
+        navigation_memory: CompanyNavigationMemory | None = None,
+        allow_official_linked_documents_on_robots_unavailable: bool = False,
         progress: ProgressReporter | None = None,
         http: HttpClient | None = None,
     ) -> None:
@@ -59,6 +62,7 @@ class TranscriptCrawler:
             base_url=ollama_base_url,
             max_links=page_llm_max_links,
             text_chars=llm_text_chars,
+            guidance=prompt_guidance,
         )
         self.metadata_agent = TranscriptMetadataAgent(model, base_url=ollama_base_url) if extract_metadata_with_llm else None
         self.out_dir = out_dir
@@ -78,6 +82,9 @@ class TranscriptCrawler:
         self.navigation_llm_max_links = navigation_llm_max_links
         self.page_llm_max_links = page_llm_max_links
         self.llm_text_chars = llm_text_chars
+        self.prompt_guidance = prompt_guidance
+        self.navigation_memory = navigation_memory
+        self.allow_official_linked_documents_on_robots_unavailable = allow_official_linked_documents_on_robots_unavailable
         self.progress = progress or ProgressReporter(enabled=False)
         self.http = http or HttpClient()
         self.renderer = PlaywrightRenderer(self.http) if self.playwright_mode != "off" else None
@@ -92,13 +99,14 @@ class TranscriptCrawler:
 
         result = CrawlResult(company=company, ir_url=seeds[0])
         self.progress.log(f"{company.symbol}: crawling {len(seeds)} seed URL(s)")
-        queue: deque[tuple[str, int]] = deque((seed, 0) for seed in seeds)
+        queue: deque[tuple[str, int, CandidateLink | None]] = deque((seed, 0, None) for seed in seeds)
         run_visited: set[str] = set()
+        allowed_official_pages: set[str] = set()
         allowed_hosts = {host(seed) for seed in seeds}
         state = CrawlState.load(self._state_path(company)) if self.resume else CrawlState(path=self._state_path(company))
 
         while queue and len(run_visited) < self.max_pages_per_company:
-            url, depth = queue.popleft()
+            url, depth, source_link = queue.popleft()
             url = resolve_document_url(url)
             normalized = normalize_url(url)
             if normalized in run_visited or depth > self.max_depth:
@@ -111,7 +119,7 @@ class TranscriptCrawler:
             run_visited.add(normalized)
             try:
                 self.progress.log(f"{company.symbol}: fetching depth={depth} {url}")
-                response = self.http.get(url)
+                response = self._fetch_url(company, url, source_link, allowed_official_pages, result)
             except RobotsDisallowedError as exc:
                 result.failures.append(self._failure(company, url, "robots_disallowed", exc))
                 continue
@@ -165,6 +173,7 @@ class TranscriptCrawler:
 
             html = response.text
             self._cache_text(company, url, html, suffix=".html")
+            allowed_official_pages.add(normalized)
             title = page_title(html)
             text = visible_text(html)
             rendered = False
@@ -220,12 +229,12 @@ class TranscriptCrawler:
                 for link in decision.useful_links:
                     if self._should_follow(link, allowed_hosts, current_url=url):
                         allowed_hosts.add(host(link.url))
-                        queue.append((link.url, depth + 1))
+                        queue.append((link.url, depth + 1, link))
 
             for link in self._heuristic_links(links):
                 if self._should_follow(link, allowed_hosts, current_url=url):
                     allowed_hosts.add(host(link.url))
-                    queue.append((link.url, depth + 1))
+                    queue.append((link.url, depth + 1, link))
 
         result.visited_count = len(run_visited)
         if self.latest_only and len(result.transcripts) > 1:
@@ -242,6 +251,50 @@ class TranscriptCrawler:
             f"{result.visited_count} page(s) visited"
         )
         return result
+
+    def _fetch_url(
+        self,
+        company: Company,
+        url: str,
+        source_link: CandidateLink | None,
+        allowed_official_pages: set[str],
+        result: CrawlResult,
+    ):
+        try:
+            return self.http.get(url)
+        except RobotsUnavailableError:
+            if not self._can_fetch_official_linked_document(url, source_link, allowed_official_pages):
+                raise
+            result.candidates.append(
+                CandidatePage(
+                    company=company,
+                    url=url,
+                    title=url.rstrip("/").split("/")[-1],
+                    reason="robots_unavailable_allowed_official_linked_document",
+                )
+            )
+            self.progress.log(f"{company.symbol}: fetching official linked document despite unavailable robots.txt {url}")
+            return self.http.get_without_robots_check(url)
+
+    def _can_fetch_official_linked_document(
+        self,
+        url: str,
+        source_link: CandidateLink | None,
+        allowed_official_pages: set[str],
+    ) -> bool:
+        if not self.allow_official_linked_documents_on_robots_unavailable:
+            return False
+        if not source_link:
+            return False
+        if normalize_url(source_link.source_url) not in allowed_official_pages:
+            return False
+        if not looks_like_transcript_document(url):
+            return False
+        if not transcript_document_link_score(source_link):
+            return False
+        if not self.http.robots_unavailable(url):
+            return False
+        return True
 
     def _discover_seeds(self, company: Company) -> list[str]:
         if self.seed_urls:
@@ -263,6 +316,8 @@ class TranscriptCrawler:
             llm_timeout_seconds=self.llm_timeout_seconds,
             navigation_llm_max_links=self.navigation_llm_max_links,
             llm_text_chars=self.llm_text_chars,
+            prompt_guidance=self.prompt_guidance,
+            navigation_memory=self.navigation_memory,
             progress=self.progress,
         )
         self._write_navigation_trace(navigation.trace)
@@ -566,6 +621,17 @@ def is_docx_response(url: str, content_type: str, content: bytes) -> bool:
         or url.lower().endswith(".docx")
         or content.startswith(b"PK\x03\x04")
     )
+
+
+def looks_like_transcript_document(url: str) -> bool:
+    lowered = url.lower()
+    has_transcript_hint = any(token in lowered for token in ("transcript", "earnings-call", "earnings_call", "earnings"))
+    return has_transcript_hint and (lowered.endswith(TRANSCRIPT_DOCUMENT_EXTENSIONS) or "is/content" in lowered)
+
+
+def transcript_document_link_score(link: CandidateLink) -> bool:
+    haystack = f"{link.url} {link.label}".lower()
+    return "transcript" in haystack or "earnings-call" in haystack or "earnings call" in haystack
 
 
 def keep_latest_transcripts(records: list[TranscriptRecord]) -> list[TranscriptRecord]:

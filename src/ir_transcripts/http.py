@@ -59,6 +59,11 @@ class HttpClient:
         if not parser.can_fetch(self.user_agent, url):
             raise RobotsDisallowedError(f"Disallowed by robots.txt: {url}")
 
+    def robots_unavailable(self, url: str) -> bool:
+        if not self.respect_robots:
+            return False
+        return self._robots_for(self._origin(url)) is None
+
     def crawl_delay(self, url: str) -> float | None:
         if not self.respect_robots:
             return None
@@ -77,6 +82,17 @@ class HttpClient:
     def get(self, url: str) -> requests.Response:
         self.check_robots(url)
 
+        self.wait_for_host(url)
+        response = self.session.get(url, timeout=self.timeout_seconds)
+        response.raise_for_status()
+        return response
+
+    @retry(
+        retry=retry_if_exception_type(requests.RequestException),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=8),
+    )
+    def get_without_robots_check(self, url: str) -> requests.Response:
         self.wait_for_host(url)
         response = self.session.get(url, timeout=self.timeout_seconds)
         response.raise_for_status()

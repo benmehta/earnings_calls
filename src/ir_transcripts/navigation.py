@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 from .agent import IRNavigationAgent
 from .browser import PlaywrightRenderer
 from .http import HttpClient
-from .models import CandidateLink, Company, NavigationStep, NavigationTrace
+from .models import CandidateLink, Company, CompanyNavigationMemory, NavigationStep, NavigationTrace, PromptGuidance
 from .parsing import extract_links, looks_like_js_shell, page_title, visible_text
 from .runtime import ProgressReporter, timeout_after
 from .search import company_domain_tokens, company_domain_slug, discover_ir_candidates
@@ -35,6 +35,8 @@ def discover_navigation_seeds(
     llm_timeout_seconds: float = 45.0,
     navigation_llm_max_links: int = 12,
     llm_text_chars: int = 900,
+    prompt_guidance: PromptGuidance | None = None,
+    navigation_memory: CompanyNavigationMemory | None = None,
     progress: ProgressReporter | None = None,
 ) -> NavigationDiscoveryResult:
     progress = progress or ProgressReporter(enabled=False)
@@ -44,6 +46,7 @@ def discover_navigation_seeds(
         include_guesses=include_guesses,
         disable_official_homepage_overrides=disable_official_homepage_overrides,
         search_timeout_seconds=search_timeout_seconds,
+        navigation_memory=navigation_memory,
         progress=progress,
     )
     trace = NavigationTrace(company=company)
@@ -57,6 +60,7 @@ def discover_navigation_seeds(
         base_url=ollama_base_url,
         max_links=navigation_llm_max_links,
         text_chars=llm_text_chars,
+        guidance=prompt_guidance,
     )
     queue: deque[str] = deque(starts)
     visited: set[str] = set()
@@ -178,6 +182,7 @@ def navigation_start_urls(
     include_guesses: bool = False,
     disable_official_homepage_overrides: bool = False,
     search_timeout_seconds: float = 30.0,
+    navigation_memory: CompanyNavigationMemory | None = None,
     progress: ProgressReporter | None = None,
 ) -> list[str]:
     starts: list[str] = []
@@ -197,7 +202,70 @@ def navigation_start_urls(
         )
         if candidate.score > 0 and is_company_host(candidate.url, company)
     )
-    return dedupe(starts)
+    return rank_navigation_starts(dedupe(starts), company, navigation_memory=navigation_memory)
+
+
+def rank_navigation_starts(
+    urls: list[str],
+    company: Company,
+    *,
+    navigation_memory: CompanyNavigationMemory | None = None,
+) -> list[str]:
+    return sorted(
+        urls,
+        key=lambda url: navigation_start_score(url, company, navigation_memory=navigation_memory),
+        reverse=True,
+    )
+
+
+def navigation_start_score(
+    url: str,
+    company: Company,
+    *,
+    navigation_memory: CompanyNavigationMemory | None = None,
+) -> int:
+    parsed = urlparse(url)
+    destination = host(url)
+    path = parsed.path.lower().rstrip("/")
+    haystack = f"{destination} {path}".lower()
+    score = 0
+
+    if url in official_company_homepages(company):
+        score += 100
+    if navigation_memory:
+        if url in navigation_memory.known_ir_home_urls:
+            score += 90
+        if url in navigation_memory.known_event_listing_urls:
+            score += 45
+        if destination in navigation_memory.preferred_hosts:
+            score += 35
+        if destination in navigation_memory.successful_hosts:
+            score += 30
+        if destination in navigation_memory.low_value_hosts:
+            score -= 45
+        if any(term in path for term in navigation_memory.low_value_path_terms):
+            score -= 25
+        if destination in navigation_memory.robots_blocked_hosts:
+            score -= 20
+    if is_company_host(url, company):
+        score += 20
+    if path in {"", "/", "/investor", "/investors", "/investor/default.aspx", "/home/default.aspx"}:
+        score += 45
+    elif any(token in path for token in ("/investor", "/investors")):
+        score += 20
+    if any(token in path for token in ("/earnings", "/events", "/financial-reports", "/financial-info")):
+        score += 10
+
+    slug = company_domain_slug(company.name)
+    if slug and destination == f"www.{slug}.com":
+        score -= 35
+    if "q4web.com" in destination:
+        score -= 8
+    if any(token in haystack for token in ("blog.", "youtube.com", "presentation", "press-release")):
+        score -= 35
+    if any(token in path for token in ("event-details", "news-details")):
+        score -= 15
+    return score
 
 
 def navigation_candidate_links(

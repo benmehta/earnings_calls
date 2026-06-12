@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .models import Company, CompanyMemory, CrawlResult, FailureAnalysis
 from .urls import host
@@ -28,18 +29,37 @@ def save_company_memory(out_dir: Path, memory: CompanyMemory) -> Path:
 
 
 def remember_crawl_result(memory: CompanyMemory, result: CrawlResult, analysis: FailureAnalysis) -> CompanyMemory:
+    navigation_memory = memory.navigation_memory
     for url in [result.ir_url, *(candidate.url for candidate in result.candidates)]:
         if url:
             memory.known_ir_urls = append_unique(memory.known_ir_urls, url)
             url_host = host(url)
-            if url_host:
+            if url_host and not low_value_memory_host(url_host):
                 memory.official_hosts = append_unique(memory.official_hosts, url_host)
+            if is_ir_home_url(url):
+                navigation_memory.known_ir_home_urls = append_unique(navigation_memory.known_ir_home_urls, url)
+            if is_event_listing_url(url):
+                navigation_memory.known_event_listing_urls = append_unique(navigation_memory.known_event_listing_urls, url)
+            remember_low_value_url(navigation_memory.low_value_hosts, navigation_memory.low_value_path_terms, url)
 
     for failure in result.failures:
         memory.rejected_urls = append_unique(memory.rejected_urls, failure.url)
+        failure_host = host(failure.url)
+        if failure_host and failure.failure_type in {"robots_blocked", "robots_disallowed", "robots_unavailable"}:
+            navigation_memory.robots_blocked_hosts = append_unique(navigation_memory.robots_blocked_hosts, failure_host)
+        remember_low_value_url(navigation_memory.low_value_hosts, navigation_memory.low_value_path_terms, failure.url)
 
     for record in result.transcripts:
-        memory.successful_transcript_urls = append_unique(memory.successful_transcript_urls, str(record.source_url))
+        source_url = str(record.source_url)
+        memory.successful_transcript_urls = append_unique(memory.successful_transcript_urls, source_url)
+        navigation_memory.known_transcript_urls = append_unique(navigation_memory.known_transcript_urls, source_url)
+        transcript_host = host(source_url)
+        if transcript_host:
+            navigation_memory.successful_hosts = append_unique(navigation_memory.successful_hosts, transcript_host)
+            navigation_memory.preferred_hosts = append_unique(navigation_memory.preferred_hosts, transcript_host)
+        path = urlparse(source_url).path
+        if path:
+            navigation_memory.successful_paths = append_unique(navigation_memory.successful_paths, path)
 
     memory.failure_summaries.append(analysis)
     for recommendation in analysis.manual_recommendations:
@@ -51,3 +71,27 @@ def append_unique(values: list[str], value: str) -> list[str]:
     if value not in values:
         values.append(value)
     return values
+
+
+def low_value_memory_host(value: str) -> bool:
+    return any(token in value.lower() for token in ("blog.", "youtube.com", "youtu.be"))
+
+
+def is_ir_home_url(url: str) -> bool:
+    path = urlparse(url).path.lower().rstrip("/")
+    return path in {"", "/", "/investor", "/investors", "/ir", "/investor/default.aspx", "/home/default.aspx"}
+
+
+def is_event_listing_url(url: str) -> bool:
+    path = urlparse(url).path.lower()
+    return any(token in path for token in ("/events", "/earnings", "/financial-results", "/financial-reports")) and "event-details" not in path
+
+
+def remember_low_value_url(low_value_hosts: list[str], low_value_path_terms: list[str], url: str) -> None:
+    url_host = host(url)
+    path = urlparse(url).path.lower()
+    if url_host and low_value_memory_host(url_host):
+        append_unique(low_value_hosts, url_host)
+    for token in ("blog", "youtube", "presentation", "webcast", "press-release"):
+        if token in f"{url_host or ''} {path}":
+            append_unique(low_value_path_terms, token)

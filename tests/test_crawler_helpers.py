@@ -253,6 +253,106 @@ def test_crawler_saves_docx_transcript(tmp_path) -> None:
     assert list((tmp_path / "EX").glob("*.docx"))
 
 
+def test_official_linked_docx_can_fetch_when_document_robots_unavailable_with_flag(tmp_path) -> None:
+    docx_content = docx_fixture(
+        [
+            "Example Co Q1 Earnings Call Transcript",
+            "OPERATOR: Welcome to the call.",
+            "JANE DOE: Thank you.",
+            "JOHN SMITH: I will discuss results.",
+            "ANALYST: My question is about margins.",
+            "QUESTION-AND-ANSWER SESSION",
+            "END",
+        ]
+    )
+
+    class FakeResponse:
+        def __init__(self, text: str = "", content: bytes = b"", content_type: str = "text/html") -> None:
+            self.text = text
+            self.content = content
+            self.headers = {"content-type": content_type}
+
+    class FakeHttp:
+        def get(self, url: str):
+            if url == "https://investor.example.com/events/q1":
+                return FakeResponse(
+                    """
+                    <html><head><title>Example Q1 Earnings</title></head>
+                    <body>
+                      <a href="https://cdn.example.com/Example-Q1-Earnings-Call-Transcript.docx">
+                        Q1 Earnings Call Transcript
+                      </a>
+                    </body></html>
+                    """
+                )
+            raise RobotsUnavailableError(f"Could not verify robots.txt for {url}")
+
+        def robots_unavailable(self, url: str) -> bool:
+            return url == "https://cdn.example.com/Example-Q1-Earnings-Call-Transcript.docx"
+
+        def get_without_robots_check(self, url: str):
+            return FakeResponse(
+                content=docx_content,
+                content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+
+    class FakeAgent:
+        def decide(self, **kwargs):
+            return PageDecision(page_type="earnings_event", confidence=0.7, reason="earnings page", useful_links=[])
+
+    crawler = TranscriptCrawler(
+        model="test-model",
+        out_dir=tmp_path,
+        seed_urls=["https://investor.example.com/events/q1"],
+        http=FakeHttp(),  # type: ignore[arg-type]
+        allow_official_linked_documents_on_robots_unavailable=True,
+    )
+    crawler.agent = FakeAgent()  # type: ignore[assignment]
+
+    result = crawler.crawl_company(Company(symbol="EX", name="Example"))
+
+    assert len(result.transcripts) == 1
+    assert result.transcripts[0].source_url == "https://cdn.example.com/Example-Q1-Earnings-Call-Transcript.docx"
+    assert any(candidate.reason == "robots_unavailable_allowed_official_linked_document" for candidate in result.candidates)
+
+
+def test_official_linked_docx_still_blocks_when_delegated_policy_disabled(tmp_path) -> None:
+    class FakeResponse:
+        headers = {"content-type": "text/html"}
+        content = b""
+        text = """
+        <html><head><title>Example Q1 Earnings</title></head>
+        <body>
+          <a href="https://cdn.example.com/Example-Q1-Earnings-Call-Transcript.docx">
+            Q1 Earnings Call Transcript
+          </a>
+        </body></html>
+        """
+
+    class FakeHttp:
+        def get(self, url: str):
+            if url == "https://investor.example.com/events/q1":
+                return FakeResponse()
+            raise RobotsUnavailableError(f"Could not verify robots.txt for {url}")
+
+    class FakeAgent:
+        def decide(self, **kwargs):
+            return PageDecision(page_type="earnings_event", confidence=0.7, reason="earnings page", useful_links=[])
+
+    crawler = TranscriptCrawler(
+        model="test-model",
+        out_dir=tmp_path,
+        seed_urls=["https://investor.example.com/events/q1"],
+        http=FakeHttp(),  # type: ignore[arg-type]
+    )
+    crawler.agent = FakeAgent()  # type: ignore[assignment]
+
+    result = crawler.crawl_company(Company(symbol="EX", name="Example"))
+
+    assert result.transcripts == []
+    assert [failure.failure_type for failure in result.failures] == ["robots_unavailable"]
+
+
 def test_crawler_latest_only_keeps_newest_transcript_artifacts(tmp_path) -> None:
     class FakeResponse:
         headers = {"content-type": "text/html"}

@@ -2,13 +2,25 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Literal
+from typing import Literal, TypedDict
 
+from langgraph.graph import END, START, StateGraph
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama
 
-from .models import CandidateLink, IRDiscoveryCandidate, IRDiscoveryDecision, NavigationDecision, PageDecision, PageDecisionDraft
+from .models import (
+    CandidateLink,
+    Company,
+    CompanyMemory,
+    IRDiscoveryCandidate,
+    IRDiscoveryDecision,
+    NavigationDecision,
+    NavigationValidationResult,
+    PageDecision,
+    PageDecisionDraft,
+    PromptGuidance,
+)
 
 
 NavigationAgentKind = Literal["homepage", "ir_section", "event_listing", "transcript_link"]
@@ -39,9 +51,11 @@ class IRPageAgent:
         *,
         max_links: int = 12,
         text_chars: int = 900,
+        guidance: PromptGuidance | None = None,
     ) -> None:
         self.max_links = max_links
         self.text_chars = text_chars
+        self.guidance = guidance
         self.chain = (
             ChatPromptTemplate.from_messages(
                 [
@@ -53,6 +67,7 @@ class IRPageAgent:
                     (
                         "human",
                         "{company_name} ({ticker})\n{url}\nTitle: {title}\n"
+                        "Run guidance:\n{guidance}\n\n"
                         "Text:\n{text}\n\n"
                         "Links JSON. Put useful URL strings in useful_urls:\n"
                         "{links_json}\n\n"
@@ -85,6 +100,7 @@ class IRPageAgent:
                 "ticker": ticker,
                 "url": url,
                 "title": title,
+                "guidance": guidance_for_agent(getattr(self, "guidance", None), "page"),
                 "text": compact_text(text, self.text_chars),
                 "links_json": json.dumps(compact_links, ensure_ascii=True),
             }
@@ -162,11 +178,56 @@ class IRDiscoveryAgent:
         )
 
 
+class PromptPlannerAgent:
+    """Produces non-authoritative prompt guidance from company memory."""
+
+    def __init__(self, model: str, base_url: str | None = None, *, text_chars: int = 1200) -> None:
+        self.text_chars = text_chars
+        self.chain = (
+            ChatPromptTemplate.from_messages(
+                [
+                    (
+                        "system",
+                        "Create brief advisory guidance for IR crawler agents. "
+                        "Do not grant permissions. Do not suggest ignoring robots.txt. "
+                        "Return JSON only.",
+                    ),
+                    (
+                        "human",
+                        "Company: {company}\n"
+                        "Memory JSON:\n{memory_json}\n\n"
+                        "Return exactly:\n"
+                        "{{\"priority_terms\":[\"term\"],\"avoid_terms\":[\"term\"],"
+                        "\"navigation_guidance\":\"short guidance\","
+                        "\"transcript_guidance\":\"short guidance\","
+                        "\"risk_notes\":[\"short note\"]}}",
+                    ),
+                ]
+            )
+            | build_llm(model, base_url=base_url, json_mode=True)
+        )
+
+    def plan(self, *, company: Company, memory: CompanyMemory) -> PromptGuidance:
+        memory_json = compact_text(
+            json.dumps(memory.model_dump(mode="json"), ensure_ascii=True),
+            self.text_chars,
+        )
+        message = self.chain.invoke(
+            {
+                "company": f"{company.name} ({company.symbol})",
+                "memory_json": memory_json,
+            }
+        )
+        model_guidance = sanitize_prompt_guidance(PromptGuidance.model_validate(extract_json_object(message.content)))
+        return merge_prompt_guidance(model_guidance, guidance_from_memory(memory))
+
+
 class LinkSelectionAgent:
     """Small specialist agent that chooses links for one navigation task."""
 
     HUMAN_PROMPT = (
         "{company_name} ({ticker})\n{url}\nTitle: {title}\n"
+        "Run guidance:\n{guidance}\n\n"
         "Text:\n{text}\n\n"
         "Links JSON:\n{links_json}\n\n"
         "Return exactly: "
@@ -182,9 +243,11 @@ class LinkSelectionAgent:
         base_url: str | None = None,
         max_links: int = 12,
         text_chars: int = 800,
+        guidance: PromptGuidance | None = None,
     ) -> None:
         self.max_links = max_links
         self.text_chars = text_chars
+        self.guidance = guidance
         self.chain = (
             ChatPromptTemplate.from_messages(
                 [
@@ -204,6 +267,7 @@ class LinkSelectionAgent:
         title: str,
         text: str,
         links: list[CandidateLink],
+        repair_guidance: str | None = None,
     ) -> NavigationDecision:
         compact_links = [
             {
@@ -219,6 +283,10 @@ class LinkSelectionAgent:
                 "ticker": ticker,
                 "url": url,
                 "title": title,
+                "guidance": combine_guidance(
+                    guidance_for_agent(getattr(self, "guidance", None), "navigation"),
+                    repair_guidance,
+                ),
                 "text": compact_text(text, self.text_chars),
                 "links_json": json.dumps(compact_links, ensure_ascii=True),
             }
@@ -229,6 +297,89 @@ class LinkSelectionAgent:
         return draft
 
 
+class NavigationValidationAgent:
+    """Soft semantic validator for specialist navigation choices."""
+
+    SYSTEM_PROMPT = (
+        "Validate a specialist IR navigation choice. Hard policy already removed "
+        "invented URLs and disallowed hosts. Decide if the remaining URLs fit the "
+        "specialist task. Return JSON only."
+    )
+    HUMAN_PROMPT = (
+        "Specialist: {kind}\n"
+        "Company: {company_name} ({ticker})\n"
+        "Current URL: {url}\n"
+        "Title: {title}\n"
+        "Guidance: {guidance}\n"
+        "Chosen URLs: {chosen_urls_json}\n"
+        "Candidate links JSON:\n{links_json}\n\n"
+        "Return exactly: "
+        "{{\"is_valid\":true,\"accepted_urls\":[\"https://example.com\"],"
+        "\"rejected_urls\":[],\"reason\":\"short reason\","
+        "\"repair_guidance\":null}}"
+    )
+
+    def __init__(
+        self,
+        model: str,
+        base_url: str | None = None,
+        *,
+        max_links: int = 12,
+        guidance: PromptGuidance | None = None,
+    ) -> None:
+        self.max_links = max_links
+        self.guidance = guidance
+        self.chain = (
+            ChatPromptTemplate.from_messages(
+                [
+                    ("system", self.SYSTEM_PROMPT),
+                    ("human", self.HUMAN_PROMPT),
+                ]
+            )
+            | build_llm(model, base_url=base_url, json_mode=True)
+        )
+
+    def validate(
+        self,
+        *,
+        kind: NavigationAgentKind,
+        company_name: str,
+        ticker: str,
+        url: str,
+        title: str,
+        links: list[CandidateLink],
+        decision: NavigationDecision,
+    ) -> NavigationValidationResult:
+        compact_links = [
+            {
+                "url": link.url,
+                "label": compact_text(link.label, 80),
+                "context": compact_text(link.reason, 80),
+            }
+            for link in links[: self.max_links]
+        ]
+        message = self.chain.invoke(
+            {
+                "kind": kind,
+                "company_name": company_name,
+                "ticker": ticker,
+                "url": url,
+                "title": title,
+                "guidance": guidance_for_agent(getattr(self, "guidance", None), "navigation"),
+                "chosen_urls_json": json.dumps(decision.chosen_urls, ensure_ascii=True),
+                "links_json": json.dumps(compact_links, ensure_ascii=True),
+            }
+        )
+        result = NavigationValidationResult.model_validate(extract_json_object(message.content))
+        candidate_urls = {link.url for link in links}
+        result.accepted_urls = [url for url in result.accepted_urls if url in candidate_urls]
+        result.rejected_urls = [url for url in result.rejected_urls if url in candidate_urls]
+        if result.is_valid and not result.accepted_urls:
+            result.accepted_urls = [url for url in decision.chosen_urls if url in candidate_urls]
+        result.is_valid = bool(result.is_valid and result.accepted_urls)
+        return result
+
+
 class HomepageNavAgent(LinkSelectionAgent):
     SYSTEM_PROMPT = (
         "Pick links from an official company homepage toward investor relations. "
@@ -237,8 +388,23 @@ class HomepageNavAgent(LinkSelectionAgent):
         "products, legal, privacy, blogs/news, third-party finance. Return JSON only."
     )
 
-    def __init__(self, model: str, base_url: str | None = None, *, max_links: int = 12, text_chars: int = 800) -> None:
-        super().__init__(model=model, system_prompt=self.SYSTEM_PROMPT, base_url=base_url, max_links=max_links, text_chars=text_chars)
+    def __init__(
+        self,
+        model: str,
+        base_url: str | None = None,
+        *,
+        max_links: int = 12,
+        text_chars: int = 800,
+        guidance: PromptGuidance | None = None,
+    ) -> None:
+        super().__init__(
+            model=model,
+            system_prompt=self.SYSTEM_PROMPT,
+            base_url=base_url,
+            max_links=max_links,
+            text_chars=text_chars,
+            guidance=guidance,
+        )
 
 
 class IRSectionAgent(LinkSelectionAgent):
@@ -250,8 +416,23 @@ class IRSectionAgent(LinkSelectionAgent):
         "careers, blogs/news unless no better IR links exist. Return JSON only."
     )
 
-    def __init__(self, model: str, base_url: str | None = None, *, max_links: int = 12, text_chars: int = 800) -> None:
-        super().__init__(model=model, system_prompt=self.SYSTEM_PROMPT, base_url=base_url, max_links=max_links, text_chars=text_chars)
+    def __init__(
+        self,
+        model: str,
+        base_url: str | None = None,
+        *,
+        max_links: int = 12,
+        text_chars: int = 800,
+        guidance: PromptGuidance | None = None,
+    ) -> None:
+        super().__init__(
+            model=model,
+            system_prompt=self.SYSTEM_PROMPT,
+            base_url=base_url,
+            max_links=max_links,
+            text_chars=text_chars,
+            guidance=guidance,
+        )
 
 
 class EventListingAgent(LinkSelectionAgent):
@@ -263,8 +444,23 @@ class EventListingAgent(LinkSelectionAgent):
         "blog posts, YouTube/webcast-only links unless no event page exists. Return JSON only."
     )
 
-    def __init__(self, model: str, base_url: str | None = None, *, max_links: int = 12, text_chars: int = 800) -> None:
-        super().__init__(model=model, system_prompt=self.SYSTEM_PROMPT, base_url=base_url, max_links=max_links, text_chars=text_chars)
+    def __init__(
+        self,
+        model: str,
+        base_url: str | None = None,
+        *,
+        max_links: int = 12,
+        text_chars: int = 800,
+        guidance: PromptGuidance | None = None,
+    ) -> None:
+        super().__init__(
+            model=model,
+            system_prompt=self.SYSTEM_PROMPT,
+            base_url=base_url,
+            max_links=max_links,
+            text_chars=text_chars,
+            guidance=guidance,
+        )
 
 
 class TranscriptLinkAgent(LinkSelectionAgent):
@@ -276,8 +472,23 @@ class TranscriptLinkAgent(LinkSelectionAgent):
         "privacy/legal. Return JSON only."
     )
 
-    def __init__(self, model: str, base_url: str | None = None, *, max_links: int = 12, text_chars: int = 800) -> None:
-        super().__init__(model=model, system_prompt=self.SYSTEM_PROMPT, base_url=base_url, max_links=max_links, text_chars=text_chars)
+    def __init__(
+        self,
+        model: str,
+        base_url: str | None = None,
+        *,
+        max_links: int = 12,
+        text_chars: int = 800,
+        guidance: PromptGuidance | None = None,
+    ) -> None:
+        super().__init__(
+            model=model,
+            system_prompt=self.SYSTEM_PROMPT,
+            base_url=base_url,
+            max_links=max_links,
+            text_chars=text_chars,
+            guidance=guidance,
+        )
 
 
 class IRNavigationAgent:
@@ -290,13 +501,24 @@ class IRNavigationAgent:
         *,
         max_links: int = 12,
         text_chars: int = 800,
+        guidance: PromptGuidance | None = None,
+        confidence_floor: float = 0.55,
     ) -> None:
+        self.guidance = guidance
+        self.confidence_floor = confidence_floor
         self.agents: dict[NavigationAgentKind, LinkSelectionAgent] = {
-            "homepage": HomepageNavAgent(model, base_url=base_url, max_links=max_links, text_chars=text_chars),
-            "ir_section": IRSectionAgent(model, base_url=base_url, max_links=max_links, text_chars=text_chars),
-            "event_listing": EventListingAgent(model, base_url=base_url, max_links=max_links, text_chars=text_chars),
-            "transcript_link": TranscriptLinkAgent(model, base_url=base_url, max_links=max_links, text_chars=text_chars),
+            "homepage": HomepageNavAgent(model, base_url=base_url, max_links=max_links, text_chars=text_chars, guidance=guidance),
+            "ir_section": IRSectionAgent(model, base_url=base_url, max_links=max_links, text_chars=text_chars, guidance=guidance),
+            "event_listing": EventListingAgent(model, base_url=base_url, max_links=max_links, text_chars=text_chars, guidance=guidance),
+            "transcript_link": TranscriptLinkAgent(model, base_url=base_url, max_links=max_links, text_chars=text_chars, guidance=guidance),
         }
+        self.validator = NavigationValidationAgent(
+            model,
+            base_url=base_url,
+            max_links=max_links,
+            guidance=guidance,
+        )
+        self.graph = self._build_graph()
 
     def decide(
         self,
@@ -310,16 +532,149 @@ class IRNavigationAgent:
         page_context: str,
     ) -> NavigationDecision:
         kind = self.select_agent_kind(url=url, title=title, text=text, links=links, page_context=page_context)
-        decision = self.agents[kind].decide(
-            company_name=company_name,
-            ticker=ticker,
-            url=url,
-            title=title,
-            text=text,
-            links=links,
+        if not hasattr(self, "graph"):
+            decision = self.agents[kind].decide(
+                company_name=company_name,
+                ticker=ticker,
+                url=url,
+                title=title,
+                text=text,
+                links=links,
+            )
+            decision.reason = f"{kind}: {decision.reason}" if decision.reason else kind
+            return decision
+        state: NavigationDecisionState = {
+            "kind": kind,
+            "company_name": company_name,
+            "ticker": ticker,
+            "url": url,
+            "title": title,
+            "text": text,
+            "links": links,
+            "page_context": page_context,
+            "repair_used": False,
+        }
+        final_state = self.graph.invoke(state)
+        decision = final_state.get("final_decision") or NavigationDecision(
+            chosen_urls=[],
+            confidence=0.0,
+            reason=f"{kind}: navigation_decision_failed",
+            stop_reason="navigation_decision_failed",
         )
-        decision.reason = f"{kind}: {decision.reason}" if decision.reason else kind
+        decision.reason = f"{kind}: {decision.reason}" if not decision.reason.startswith(f"{kind}:") else decision.reason
         return decision
+
+    def _build_graph(self):
+        graph = StateGraph(NavigationDecisionState)
+        graph.add_node("call_specialist", self._call_specialist_node)
+        graph.add_node("hard_validate", self._hard_validate_node)
+        graph.add_node("semantic_validate", self._semantic_validate_node)
+        graph.add_node("repair", self._repair_node)
+        graph.add_node("fallback", self._fallback_node)
+        graph.add_edge(START, "call_specialist")
+        graph.add_edge("call_specialist", "hard_validate")
+        graph.add_conditional_edges(
+            "hard_validate",
+            self._after_hard_validate,
+            {"semantic": "semantic_validate", "repair": "repair", "fallback": "fallback"},
+        )
+        graph.add_conditional_edges(
+            "semantic_validate",
+            self._after_semantic_validate,
+            {"accept": END, "repair": "repair", "fallback": "fallback"},
+        )
+        graph.add_edge("repair", "call_specialist")
+        graph.add_edge("fallback", END)
+        return graph.compile()
+
+    def _call_specialist_node(self, state: "NavigationDecisionState") -> "NavigationDecisionState":
+        kind = state["kind"]
+        decision = self.agents[kind].decide(
+            company_name=state["company_name"],
+            ticker=state["ticker"],
+            url=state["url"],
+            title=state["title"],
+            text=state["text"],
+            links=state["links"],
+            repair_guidance=state.get("repair_guidance"),
+        )
+        state["decision"] = decision
+        return state
+
+    def _hard_validate_node(self, state: "NavigationDecisionState") -> "NavigationDecisionState":
+        result = hard_validate_navigation_decision(
+            kind=state["kind"],
+            decision=state["decision"],
+            links=state["links"],
+            guidance=self.guidance,
+            confidence_floor=self.confidence_floor,
+        )
+        state["hard_validation"] = result
+        return state
+
+    def _semantic_validate_node(self, state: "NavigationDecisionState") -> "NavigationDecisionState":
+        try:
+            result = self.validator.validate(
+                kind=state["kind"],
+                company_name=state["company_name"],
+                ticker=state["ticker"],
+                url=state["url"],
+                title=state["title"],
+                links=state["links"],
+                decision=state["decision"],
+            )
+        except Exception:
+            result = state["hard_validation"]
+        state["semantic_validation"] = result
+        if result.is_valid:
+            state["final_decision"] = decision_from_validation(
+                state["decision"],
+                result,
+                reason_prefix="agent_validated",
+            )
+        return state
+
+    def _repair_node(self, state: "NavigationDecisionState") -> "NavigationDecisionState":
+        validation = state.get("semantic_validation") or state.get("hard_validation")
+        state["repair_guidance"] = compact_text(
+            validation.repair_guidance if validation and validation.repair_guidance else (
+                f"Previous decision rejected: {validation.reason if validation else 'invalid choice'}. "
+                "Choose only links that fit the specialist task and run guidance."
+            ),
+            300,
+        )
+        state["repair_used"] = True
+        state.pop("decision", None)
+        state.pop("hard_validation", None)
+        state.pop("semantic_validation", None)
+        return state
+
+    def _fallback_node(self, state: "NavigationDecisionState") -> "NavigationDecisionState":
+        links = fallback_links_for_kind(state["kind"], state["links"], self.guidance)
+        reason = "heuristic_repair_after_agent" if links else "agent_repair_failed"
+        state["final_decision"] = NavigationDecision(
+            chosen_urls=[link.url for link in links],
+            confidence=0.0,
+            reason=reason,
+            stop_reason=None if links else "agent_repair_failed",
+        )
+        return state
+
+    def _after_hard_validate(self, state: "NavigationDecisionState") -> str:
+        validation = state["hard_validation"]
+        if validation.is_valid:
+            return "semantic"
+        if not state.get("repair_used"):
+            return "repair"
+        return "fallback"
+
+    def _after_semantic_validate(self, state: "NavigationDecisionState") -> str:
+        validation = state["semantic_validation"]
+        if validation.is_valid:
+            return "accept"
+        if not state.get("repair_used"):
+            return "repair"
+        return "fallback"
 
     def select_agent_kind(
         self,
@@ -354,6 +709,148 @@ def navigation_agent_kind(
     return "ir_section"
 
 
+class NavigationDecisionState(TypedDict, total=False):
+    kind: NavigationAgentKind
+    company_name: str
+    ticker: str
+    url: str
+    title: str
+    text: str
+    links: list[CandidateLink]
+    page_context: str
+    decision: NavigationDecision
+    hard_validation: NavigationValidationResult
+    semantic_validation: NavigationValidationResult
+    repair_guidance: str
+    repair_used: bool
+    final_decision: NavigationDecision
+
+
+def hard_validate_navigation_decision(
+    *,
+    kind: NavigationAgentKind,
+    decision: NavigationDecision,
+    links: list[CandidateLink],
+    guidance: PromptGuidance | None,
+    confidence_floor: float = 0.55,
+) -> NavigationValidationResult:
+    candidate_by_url = {link.url: link for link in links}
+    accepted: list[str] = []
+    rejected: list[str] = []
+    for chosen_url in decision.chosen_urls[:3]:
+        link = candidate_by_url.get(chosen_url)
+        if not link:
+            rejected.append(chosen_url)
+            continue
+        if link_matches_avoid_terms(link, guidance) and better_non_avoided_links(kind, links, guidance):
+            rejected.append(chosen_url)
+            continue
+        if not link_fits_navigation_task(kind, link) and better_task_links(kind, links):
+            rejected.append(chosen_url)
+            continue
+        accepted.append(chosen_url)
+
+    if decision.confidence < confidence_floor and not accepted:
+        return NavigationValidationResult(
+            is_valid=False,
+            rejected_urls=rejected,
+            reason="agent_rejected_low_confidence",
+            repair_guidance=f"Previous decision confidence {decision.confidence:.2f} was below {confidence_floor:.2f}. Choose a stronger task-fitting link.",
+        )
+    if accepted:
+        reason = "agent_partially_validated" if rejected else "agent_hard_validated"
+        return NavigationValidationResult(
+            is_valid=True,
+            accepted_urls=accepted,
+            rejected_urls=rejected,
+            reason=reason,
+        )
+    reason = "agent_rejected_wrong_task" if rejected else "agent_rejected_empty"
+    return NavigationValidationResult(
+        is_valid=False,
+        rejected_urls=rejected,
+        reason=reason,
+        repair_guidance=f"Previous decision rejected: {reason}. Choose links that match the {kind} task.",
+    )
+
+
+def decision_from_validation(
+    decision: NavigationDecision,
+    validation: NavigationValidationResult,
+    *,
+    reason_prefix: str,
+) -> NavigationDecision:
+    return NavigationDecision(
+        chosen_urls=validation.accepted_urls,
+        confidence=decision.confidence,
+        reason=f"{reason_prefix}: {validation.reason}",
+        stop_reason=decision.stop_reason,
+    )
+
+
+def link_matches_avoid_terms(link: CandidateLink, guidance: PromptGuidance | None) -> bool:
+    haystack = f"{link.url} {link.label} {link.reason}".lower()
+    if link_matches_intrinsic_avoid_terms(link):
+        return True
+    if not guidance:
+        return False
+    return any(term.lower() in haystack for term in guidance.avoid_terms)
+
+
+def link_matches_intrinsic_avoid_terms(link: CandidateLink) -> bool:
+    haystack = f"{link.url} {link.label} {link.reason}".lower()
+    return any(
+        token in haystack
+        for token in (
+            "blog.",
+            "blog/",
+            "youtube.com",
+            "youtu.be",
+            "presentation",
+            "webcast-only",
+        )
+    )
+
+
+def better_non_avoided_links(
+    kind: NavigationAgentKind,
+    links: list[CandidateLink],
+    guidance: PromptGuidance | None,
+) -> list[CandidateLink]:
+    return [link for link in links if not link_matches_avoid_terms(link, guidance) and link_fits_navigation_task(kind, link)]
+
+
+def better_task_links(kind: NavigationAgentKind, links: list[CandidateLink]) -> list[CandidateLink]:
+    return [link for link in links if link_fits_navigation_task(kind, link)]
+
+
+def link_fits_navigation_task(kind: NavigationAgentKind, link: CandidateLink) -> bool:
+    haystack = f"{link.url} {link.label} {link.reason}".lower()
+    task_terms: dict[NavigationAgentKind, tuple[str, ...]] = {
+        "homepage": ("investor", "ir", "shareholder"),
+        "ir_section": ("earnings", "events", "financial reports", "quarterly results", "results"),
+        "event_listing": ("event-details", "earnings-call", "earnings call", "quarterly earnings"),
+        "transcript_link": ("transcript", ".pdf", ".docx", "q&a", "prepared remarks"),
+    }
+    return any(term in haystack for term in task_terms[kind])
+
+
+def fallback_links_for_kind(
+    kind: NavigationAgentKind,
+    links: list[CandidateLink],
+    guidance: PromptGuidance | None,
+    *,
+    limit: int = 2,
+) -> list[CandidateLink]:
+    candidates = [
+        link for link in links
+        if link_fits_navigation_task(kind, link) and not link_matches_avoid_terms(link, guidance)
+    ]
+    if not candidates:
+        return []
+    return candidates[:limit]
+
+
 def extract_json_object(content: str) -> dict:
     try:
         return json.loads(content)
@@ -368,3 +865,132 @@ def extract_json_object(content: str) -> dict:
 
 def compact_text(value: str, limit: int) -> str:
     return " ".join(value.split())[:limit]
+
+
+def guidance_for_agent(guidance: PromptGuidance | None, mode: Literal["navigation", "page"]) -> str:
+    if not guidance:
+        return "None."
+    parts = []
+    if guidance.priority_terms:
+        parts.append(f"Prefer: {', '.join(guidance.priority_terms[:8])}.")
+    if guidance.avoid_terms:
+        parts.append(f"Avoid: {', '.join(guidance.avoid_terms[:8])}.")
+    text = guidance.transcript_guidance if mode == "page" else guidance.navigation_guidance
+    if text:
+        parts.append(text)
+    if guidance.risk_notes:
+        parts.append(f"Risks: {'; '.join(guidance.risk_notes[:3])}.")
+    return compact_text(" ".join(parts), 500) or "None."
+
+
+def combine_guidance(base_guidance: str, repair_guidance: str | None) -> str:
+    if not repair_guidance:
+        return base_guidance
+    if base_guidance == "None.":
+        return compact_text(repair_guidance, 500)
+    return compact_text(f"{base_guidance} Repair: {repair_guidance}", 500)
+
+
+def sanitize_prompt_guidance(guidance: PromptGuidance) -> PromptGuidance:
+    banned = ("ignore robots", "disable robots", "fail open", "third-party transcript")
+    risk_notes = [
+        note for note in guidance.risk_notes[:5]
+        if not any(token in note.lower() for token in banned)
+    ]
+    return PromptGuidance(
+        priority_terms=[compact_text(term, 80) for term in guidance.priority_terms[:10]],
+        avoid_terms=[compact_text(term, 80) for term in guidance.avoid_terms[:10]],
+        navigation_guidance=compact_text(guidance.navigation_guidance, 280),
+        transcript_guidance=compact_text(guidance.transcript_guidance, 280),
+        risk_notes=risk_notes,
+    )
+
+
+def guidance_from_memory(memory: CompanyMemory) -> PromptGuidance:
+    priority_terms: list[str] = []
+    avoid_terms: list[str] = []
+    risk_notes: list[str] = []
+    navigation_memory = memory.navigation_memory
+
+    if navigation_memory.preferred_hosts:
+        append_unique_text(priority_terms, "preferred host from company memory")
+    if navigation_memory.known_ir_home_urls:
+        append_unique_text(priority_terms, "known IR home URL")
+    if navigation_memory.known_event_listing_urls:
+        append_unique_text(priority_terms, "known event listing URL")
+    if navigation_memory.low_value_hosts:
+        append_unique_text(avoid_terms, "previously low-value host")
+    for term in navigation_memory.low_value_path_terms:
+        append_unique_text(avoid_terms, term)
+    if navigation_memory.robots_blocked_hosts:
+        append_unique_text(risk_notes, "Do not fetch documents from hosts whose robots.txt could not be verified.")
+
+    for url in [*memory.successful_transcript_urls, *navigation_memory.known_transcript_urls]:
+        lowered = url.lower()
+        append_unique_text(priority_terms, "successful transcript host")
+        append_unique_text(priority_terms, "same host as prior successful transcript")
+        for token in ("event-details", "earnings-call", "transcript", "investor/events"):
+            if token in lowered:
+                append_unique_text(priority_terms, token)
+
+    for url in [*memory.rejected_urls, *memory.known_ir_urls]:
+        lowered = url.lower()
+        if "blog." in lowered or "blog.google" in lowered:
+            append_unique_text(avoid_terms, "blog")
+            append_unique_text(avoid_terms, "blog.google")
+        if "youtube.com" in lowered or "youtu.be" in lowered:
+            append_unique_text(avoid_terms, "youtube")
+        if "webcast" in lowered:
+            append_unique_text(avoid_terms, "webcast-only")
+        if "presentation" in lowered:
+            append_unique_text(avoid_terms, "presentation")
+        if "robots_unavailable" in lowered:
+            append_unique_text(risk_notes, "Do not fetch transcript documents when robots.txt cannot be verified.")
+
+    if memory.successful_transcript_urls:
+        append_unique_text(priority_terms, "official investor event-detail pages")
+        append_unique_text(priority_terms, "latest earnings-call transcript")
+
+    return PromptGuidance(
+        priority_terms=priority_terms[:10],
+        avoid_terms=avoid_terms[:10],
+        navigation_guidance=(
+            "Prefer broad official investor home pages first, then official earnings/events "
+            "or event-detail pages. Avoid blog/news or webcast-only paths when official IR "
+            "event pages exist."
+        ),
+        transcript_guidance=(
+            "Prefer pages or documents with transcript wording, speaker turns, Q&A, "
+            "or earnings-call transcript text."
+        ),
+        risk_notes=risk_notes[:5],
+    )
+
+
+def merge_prompt_guidance(primary: PromptGuidance, memory_guidance: PromptGuidance) -> PromptGuidance:
+    return PromptGuidance(
+        priority_terms=merge_unique(primary.priority_terms, memory_guidance.priority_terms, limit=10),
+        avoid_terms=merge_unique(primary.avoid_terms, memory_guidance.avoid_terms, limit=10),
+        navigation_guidance=compact_text(
+            memory_guidance.navigation_guidance or primary.navigation_guidance,
+            280,
+        ),
+        transcript_guidance=compact_text(
+            memory_guidance.transcript_guidance or primary.transcript_guidance,
+            280,
+        ),
+        risk_notes=merge_unique(primary.risk_notes, memory_guidance.risk_notes, limit=5),
+    )
+
+
+def merge_unique(first: list[str], second: list[str], *, limit: int) -> list[str]:
+    values: list[str] = []
+    for value in [*first, *second]:
+        append_unique_text(values, value)
+    return values[:limit]
+
+
+def append_unique_text(values: list[str], value: str) -> None:
+    cleaned = compact_text(value, 80)
+    if cleaned and cleaned not in values:
+        values.append(cleaned)

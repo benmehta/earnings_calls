@@ -6,6 +6,7 @@ from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from .agent import PromptPlannerAgent
 from .crawler import TranscriptCrawler
 from .http import HttpClient
 from .memory import load_company_memory, memory_path, remember_crawl_result, save_company_memory
@@ -20,7 +21,7 @@ from .models import (
     SupervisorAction,
     SupervisorRunResult,
 )
-from .runtime import ProgressReporter
+from .runtime import ProgressReporter, timeout_after
 
 
 AttemptRunner = Callable[[Company, CrawlAttemptConfig], CrawlResult]
@@ -100,13 +101,15 @@ class SupervisedCrawler:
     def _build_graph(self):
         graph = StateGraph(SupervisorState)
         graph.add_node("identity", self._identity_node)
+        graph.add_node("prompt", self._prompt_node)
         graph.add_node("crawl", self._crawl_node)
         graph.add_node("analyze", self._analyze_node)
         graph.add_node("plan", self._plan_node)
         graph.add_node("retry", self._retry_node)
         graph.add_node("validate", self._validate_node)
         graph.add_edge(START, "identity")
-        graph.add_edge("identity", "crawl")
+        graph.add_edge("identity", "prompt")
+        graph.add_edge("prompt", "crawl")
         graph.add_edge("crawl", "analyze")
         graph.add_edge("analyze", "plan")
         graph.add_conditional_edges(
@@ -114,7 +117,7 @@ class SupervisedCrawler:
             lambda state: "retry" if state.get("should_retry") else "validate",
             {"retry": "retry", "validate": "validate"},
         )
-        graph.add_edge("retry", "crawl")
+        graph.add_edge("retry", "prompt")
         graph.add_edge("validate", END)
         return graph.compile()
 
@@ -131,6 +134,44 @@ class SupervisedCrawler:
             state["current_company"] = resolved
             state["actions"] = [*state.get("actions", []), action]
             state["memory"] = state["memory"].model_copy(update={"company": resolved})
+        return state
+
+    def _prompt_node(self, state: SupervisorState) -> SupervisorState:
+        config = state["current_config"]
+        memory = state["memory"]
+        if not config.use_prompt_planner:
+            updates = {"navigation_memory": memory.navigation_memory}
+            if memory.prompt_guidance:
+                updates["prompt_guidance"] = memory.prompt_guidance
+            state["current_config"] = config.model_copy(update=updates)
+            return state
+
+        company = state["current_company"]
+        try:
+            self.progress.log(f"{company.symbol}: prompt planner starting")
+            with timeout_after(config.llm_timeout_seconds, f"planning prompts for {company.symbol}"):
+                guidance = PromptPlannerAgent(
+                    self.model,
+                    base_url=self.ollama_base_url,
+                    text_chars=config.llm_text_chars * 2,
+                ).plan(company=company, memory=memory)
+        except Exception as exc:
+            self.progress.log(f"{company.symbol}: prompt planner skipped ({type(exc).__name__}: {exc})")
+            guidance = memory.prompt_guidance
+
+        if guidance:
+            self.progress.log(f"{company.symbol}: prompt planner guidance active")
+            memory.prompt_guidance = guidance
+            state["memory"] = memory
+            state["current_config"] = config.model_copy(
+                update={
+                    "prompt_guidance": guidance,
+                    "navigation_memory": memory.navigation_memory,
+                }
+            )
+            save_company_memory(self.out_dir, memory)
+        else:
+            state["current_config"] = config.model_copy(update={"navigation_memory": memory.navigation_memory})
         return state
 
     def _crawl_node(self, state: SupervisorState) -> SupervisorState:
@@ -210,6 +251,9 @@ class SupervisedCrawler:
             rerank_discovery=config.rerank_discovery,
             extract_metadata_with_llm=config.extract_metadata_with_llm,
             latest_only=config.latest_only,
+            allow_official_linked_documents_on_robots_unavailable=config.allow_official_linked_documents_on_robots_unavailable,
+            prompt_guidance=config.prompt_guidance,
+            navigation_memory=config.navigation_memory,
             search_timeout_seconds=config.search_timeout_seconds,
             llm_timeout_seconds=config.llm_timeout_seconds,
             navigation_llm_max_links=config.navigation_llm_max_links,
