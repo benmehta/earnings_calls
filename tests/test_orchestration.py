@@ -159,6 +159,74 @@ def test_successful_transcript_stops_graph_and_updates_memory(tmp_path: Path) ->
     assert memory.navigation_memory.known_transcript_urls == ["https://investor.example.com/q1-transcript.pdf"]
 
 
+def test_save_company_memory_merges_existing_file_instead_of_overwriting(tmp_path: Path) -> None:
+    company = Company(symbol="EX", name="Example")
+    first_pass = CompanyMemory(company=company)
+    first_pass.known_ir_urls = ["https://investor.example.com/events"]
+    first_pass.successful_transcript_urls = ["https://investor.example.com/q1-transcript.pdf"]
+    first_pass.attempted_configs = [CrawlAttemptConfig(attempt=1)]
+    first_pass.prompt_guidance = PromptGuidance(priority_terms=["earnings transcript"])
+    first_pass.navigation_memory.preferred_hosts = ["investor.example.com"]
+    first_pass.navigation_memory.low_value_hosts = ["investor.example.com", "blog.example.com"]
+    first_pass.navigation_memory.robots_blocked_hosts = ["investor.example.com", "cdn.example.com"]
+    first_pass.navigation_memory.known_event_listing_urls = ["https://investor.example.com/events"]
+
+    save_company_memory(tmp_path, first_pass)
+
+    second_pass = CompanyMemory(company=Company(symbol="EX", name="EX"))
+    second_pass.known_ir_urls = [
+        "https://investor.example.com/events",
+        "https://investor.example.com/results",
+    ]
+    second_pass.rejected_urls = ["https://blog.example.com/results"]
+    second_pass.attempted_configs = [CrawlAttemptConfig(attempt=1), CrawlAttemptConfig(attempt=2)]
+    second_pass.prompt_guidance = PromptGuidance(
+        priority_terms=["quarterly results"],
+        avoid_terms=["blog"],
+    )
+    second_pass.navigation_memory.preferred_hosts = ["investor.example.com"]
+    second_pass.navigation_memory.successful_hosts = ["cdn.example.com"]
+    second_pass.navigation_memory.low_value_hosts = ["blog.example.com", "cdn.example.com"]
+    second_pass.navigation_memory.known_event_listing_urls = ["https://investor.example.com/results"]
+
+    save_company_memory(tmp_path, second_pass)
+
+    memory = load_company_memory(tmp_path, company)
+    assert memory.company.name == "Example"
+    assert memory.known_ir_urls == [
+        "https://investor.example.com/events",
+        "https://investor.example.com/results",
+    ]
+    assert memory.successful_transcript_urls == ["https://investor.example.com/q1-transcript.pdf"]
+    assert memory.rejected_urls == ["https://blog.example.com/results"]
+    assert [config.attempt for config in memory.attempted_configs] == [1, 2]
+    assert memory.prompt_guidance
+    assert memory.prompt_guidance.priority_terms == ["quarterly results", "earnings transcript"]
+    assert memory.prompt_guidance.avoid_terms == ["blog"]
+    assert memory.navigation_memory.preferred_hosts == ["investor.example.com"]
+    assert memory.navigation_memory.successful_hosts == ["cdn.example.com"]
+    assert memory.navigation_memory.low_value_hosts == ["blog.example.com"]
+    assert memory.navigation_memory.robots_blocked_hosts == []
+    assert memory.navigation_memory.known_event_listing_urls == [
+        "https://investor.example.com/events",
+        "https://investor.example.com/results",
+    ]
+
+
+def test_save_company_memory_can_replace_existing_file(tmp_path: Path) -> None:
+    company = Company(symbol="EX", name="Example")
+    existing = CompanyMemory(company=company)
+    existing.known_ir_urls = ["https://investor.example.com/events"]
+    save_company_memory(tmp_path, existing)
+
+    replacement = CompanyMemory(company=company)
+    replacement.known_ir_urls = ["https://investor.example.com/latest"]
+    save_company_memory(tmp_path, replacement, merge=False)
+
+    memory = load_company_memory(tmp_path, company)
+    assert memory.known_ir_urls == ["https://investor.example.com/latest"]
+
+
 def test_memory_does_not_mark_blog_or_youtube_as_official_hosts() -> None:
     company = Company(symbol="GOOG", name="Alphabet Google")
     memory = remember_crawl_result(

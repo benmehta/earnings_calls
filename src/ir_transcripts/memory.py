@@ -1,13 +1,27 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import TypeVar
 from urllib.parse import urlparse
 
-from .models import Company, CompanyMemory, CrawlReflection, CrawlResult, FailureAnalysis, PromptGuidance
+from pydantic import BaseModel
+
+from .identity import is_weak_identity
+from .models import (
+    Company,
+    CompanyMemory,
+    CompanyNavigationMemory,
+    CrawlReflection,
+    CrawlResult,
+    FailureAnalysis,
+    PromptGuidance,
+)
 from .urls import host
 
 
 MEMORY_FILENAME = "_company_memory.json"
+ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
 def memory_path(out_dir: Path, company: Company) -> Path:
@@ -21,11 +35,117 @@ def load_company_memory(out_dir: Path, company: Company) -> CompanyMemory:
     return CompanyMemory(company=company)
 
 
-def save_company_memory(out_dir: Path, memory: CompanyMemory) -> Path:
+def save_company_memory(out_dir: Path, memory: CompanyMemory, *, merge: bool = True) -> Path:
     path = memory_path(out_dir, memory.company)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(memory.model_dump_json(indent=2), encoding="utf-8")
+    persisted = load_company_memory(out_dir, memory.company) if merge and path.exists() else None
+    saved_memory = merge_company_memory(persisted, memory) if persisted else memory
+    path.write_text(saved_memory.model_dump_json(indent=2), encoding="utf-8")
     return path
+
+
+def merge_company_memory(existing: CompanyMemory, incoming: CompanyMemory) -> CompanyMemory:
+    merged = existing.model_copy(deep=True)
+    merged.company = merge_company(existing.company, incoming.company)
+    merged.official_hosts = merge_unique_strings(existing.official_hosts, incoming.official_hosts)
+    merged.known_ir_urls = merge_unique_strings(existing.known_ir_urls, incoming.known_ir_urls)
+    merged.attempted_configs = merge_unique_models(existing.attempted_configs, incoming.attempted_configs)
+    merged.failure_summaries = merge_unique_models(existing.failure_summaries, incoming.failure_summaries)
+    merged.rejected_urls = merge_unique_strings(existing.rejected_urls, incoming.rejected_urls)
+    merged.recommended_manual_actions = merge_unique_strings(
+        existing.recommended_manual_actions,
+        incoming.recommended_manual_actions,
+    )
+    merged.successful_transcript_urls = merge_unique_strings(
+        existing.successful_transcript_urls,
+        incoming.successful_transcript_urls,
+    )
+    merged.prompt_guidance = merge_saved_prompt_guidance(existing.prompt_guidance, incoming.prompt_guidance)
+    merged.navigation_memory = merge_navigation_memory(existing.navigation_memory, incoming.navigation_memory)
+    return merged
+
+
+def merge_company(existing: Company, incoming: Company) -> Company:
+    incoming_name = existing.name if is_weak_identity(incoming) and not is_weak_identity(existing) else incoming.name
+    return existing.model_copy(
+        update={
+            "symbol": incoming.symbol or existing.symbol,
+            "name": incoming_name or existing.name,
+            "sector": incoming.sector or existing.sector,
+            "sub_industry": incoming.sub_industry or existing.sub_industry,
+            "cik": incoming.cik or existing.cik,
+        }
+    )
+
+
+def merge_navigation_memory(
+    existing: CompanyNavigationMemory,
+    incoming: CompanyNavigationMemory,
+) -> CompanyNavigationMemory:
+    successful_hosts = merge_unique_strings(existing.successful_hosts, incoming.successful_hosts)
+    preferred_hosts = merge_unique_strings(existing.preferred_hosts, incoming.preferred_hosts)
+    positive_hosts = {*successful_hosts, *preferred_hosts}
+    return CompanyNavigationMemory(
+        successful_hosts=successful_hosts,
+        successful_paths=merge_unique_strings(existing.successful_paths, incoming.successful_paths),
+        preferred_hosts=preferred_hosts,
+        low_value_hosts=[
+            value
+            for value in merge_unique_strings(existing.low_value_hosts, incoming.low_value_hosts)
+            if value not in positive_hosts
+        ],
+        low_value_path_terms=merge_unique_strings(existing.low_value_path_terms, incoming.low_value_path_terms),
+        known_ir_home_urls=merge_unique_strings(existing.known_ir_home_urls, incoming.known_ir_home_urls),
+        known_event_listing_urls=merge_unique_strings(
+            existing.known_event_listing_urls,
+            incoming.known_event_listing_urls,
+        ),
+        known_transcript_urls=merge_unique_strings(existing.known_transcript_urls, incoming.known_transcript_urls),
+        robots_blocked_hosts=[
+            value
+            for value in merge_unique_strings(existing.robots_blocked_hosts, incoming.robots_blocked_hosts)
+            if value not in positive_hosts
+        ],
+    )
+
+
+def merge_saved_prompt_guidance(
+    existing: PromptGuidance | None,
+    incoming: PromptGuidance | None,
+) -> PromptGuidance | None:
+    if existing is None:
+        return incoming
+    if incoming is None:
+        return existing
+    return PromptGuidance(
+        priority_terms=merge_unique_strings(incoming.priority_terms, existing.priority_terms),
+        avoid_terms=merge_unique_strings(incoming.avoid_terms, existing.avoid_terms),
+        navigation_guidance=incoming.navigation_guidance or existing.navigation_guidance,
+        transcript_guidance=incoming.transcript_guidance or existing.transcript_guidance,
+        risk_notes=merge_unique_strings(incoming.risk_notes, existing.risk_notes),
+    )
+
+
+def merge_unique_strings(existing: list[str], incoming: list[str]) -> list[str]:
+    merged = list(existing)
+    for value in incoming:
+        append_unique(merged, value)
+    return merged
+
+
+def merge_unique_models(existing: list[ModelT], incoming: list[ModelT]) -> list[ModelT]:
+    merged = list(existing)
+    seen = {model_identity(value) for value in merged}
+    for value in incoming:
+        key = model_identity(value)
+        if key not in seen:
+            merged.append(value)
+            seen.add(key)
+    return merged
+
+
+def model_identity(value: BaseModel) -> str:
+    return json.dumps(value.model_dump(mode="json"), sort_keys=True)
 
 
 def remember_crawl_result(memory: CompanyMemory, result: CrawlResult, analysis: FailureAnalysis) -> CompanyMemory:
