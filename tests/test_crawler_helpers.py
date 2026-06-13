@@ -5,10 +5,13 @@ from ir_transcripts.crawler import (
     TranscriptCrawler,
     artifact_stem,
     content_hash,
+    crawl_identity_url,
     fiscal_period_key,
     is_docx_response,
+    is_non_english_variant,
     keep_latest_transcripts,
     link_score,
+    low_value_after_transcript_document,
 )
 from ir_transcripts.http import RobotsDisallowedError, RobotsUnavailableError
 from ir_transcripts.models import CandidateLink, Company, NavigationTrace, PageDecision, TranscriptRecord
@@ -52,11 +55,48 @@ def test_heuristic_links_prioritize_transcript_document_after_page_chrome(tmp_pa
     assert transcript in prioritized
 
 
+def test_low_value_after_transcript_document_keeps_transcript_links() -> None:
+    sec = CandidateLink(
+        url="https://investor.example.com/financial-info/sec-filings/default.aspx",
+        label="SEC Filings",
+        source_url="https://investor.example.com",
+    )
+    presentation = CandidateLink(
+        url="https://investor.example.com/events-and-presentations/presentations/default.aspx",
+        label="Presentations",
+        source_url="https://investor.example.com",
+    )
+    transcript = CandidateLink(
+        url="https://cdn.example.com/files/Example-Q1-Earnings-Call-Transcript.pdf",
+        label="Q1 transcript",
+        source_url="https://investor.example.com",
+    )
+
+    assert low_value_after_transcript_document(sec)
+    assert low_value_after_transcript_document(presentation)
+    assert not low_value_after_transcript_document(transcript)
+
+
 def test_artifact_stem_and_content_hash_are_stable() -> None:
     assert artifact_stem("Q1 Transcript", "https://example.com/a") == artifact_stem(
         "Q1 Transcript", "https://example.com/a"
     )
     assert content_hash("hello   world") == content_hash("hello world")
+
+
+def test_crawl_identity_url_ignores_http_https_scheme() -> None:
+    assert crawl_identity_url("http://example.com/investors/") == crawl_identity_url("https://example.com/investors")
+
+
+def test_non_english_variant_is_skipped_from_english_page() -> None:
+    assert is_non_english_variant(
+        "https://investor.example.com/japanese/quarterly-results/2026/q1",
+        "https://investor.example.com/english/quarterly-results/2026/q1",
+    )
+    assert not is_non_english_variant(
+        "https://investor.example.com/english/quarterly-results/2026/q2",
+        "https://investor.example.com/english/quarterly-results/2026/q1",
+    )
 
 
 def test_fiscal_period_key_handles_common_quarter_shapes() -> None:
@@ -353,6 +393,130 @@ def test_official_linked_docx_still_blocks_when_delegated_policy_disabled(tmp_pa
     assert [failure.failure_type for failure in result.failures] == ["robots_unavailable"]
 
 
+def test_latest_only_prunes_low_value_queue_after_transcript_document(monkeypatch, tmp_path) -> None:
+    class FakeResponse:
+        def __init__(self, text: str = "", content: bytes = b"", content_type: str = "text/html") -> None:
+            self.text = text
+            self.content = content
+            self.headers = {"content-type": content_type}
+
+    pdf_content = b"%PDF transcript fixture"
+    fetched: list[str] = []
+
+    class FakeHttp:
+        def get(self, url: str):
+            fetched.append(url)
+            if url == "https://investor.example.com/quarterly-results":
+                return FakeResponse(
+                    """
+                    <html><head><title>Quarterly Results</title></head>
+                    <body>
+                      <a href="https://cdn.example.com/Example-Q1-Earnings-Call-Transcript.pdf">Q1 Transcript</a>
+                      <a href="https://investor.example.com/financial-info/sec-filings/default.aspx">SEC Filings</a>
+                      <a href="https://investor.example.com/financial-info/annual-meeting/default.aspx">Annual Meeting</a>
+                    </body></html>
+                    """
+                )
+            if url == "https://cdn.example.com/Example-Q1-Earnings-Call-Transcript.pdf":
+                return FakeResponse(content=pdf_content, content_type="application/pdf")
+            return FakeResponse("<html><head><title>Low Value</title></head><body></body></html>")
+
+    class FakeAgent:
+        def decide(self, **kwargs):
+            return PageDecision(page_type="earnings_event", confidence=0.7, reason="earnings page", useful_links=[])
+
+    monkeypatch.setattr(
+        "ir_transcripts.crawler.pdf_text",
+        lambda content: (
+            "Example Co Q1 2027 Earnings Call Transcript\n"
+            "OPERATOR: Welcome to the call.\n"
+            "JANE DOE: Thank you.\n"
+            "JOHN SMITH: Prepared remarks.\n"
+            "ANALYST: My question is about margins.\n"
+            "QUESTION-AND-ANSWER SESSION\n"
+            "END"
+        ),
+    )
+    crawler = TranscriptCrawler(
+        model="test-model",
+        out_dir=tmp_path,
+        seed_urls=["https://investor.example.com/quarterly-results"],
+        http=FakeHttp(),  # type: ignore[arg-type]
+        latest_only=True,
+        max_pages_per_company=10,
+        max_depth=2,
+    )
+    crawler.agent = FakeAgent()  # type: ignore[assignment]
+
+    result = crawler.crawl_company(Company(symbol="EX", name="Example"))
+
+    assert len(result.transcripts) == 1
+    assert "https://investor.example.com/financial-info/sec-filings/default.aspx" not in fetched
+    assert "https://investor.example.com/financial-info/annual-meeting/default.aspx" not in fetched
+
+
+def test_latest_only_stops_after_first_saved_transcript_document(monkeypatch, tmp_path) -> None:
+    class FakeResponse:
+        def __init__(self, text: str = "", content: bytes = b"", content_type: str = "text/html") -> None:
+            self.text = text
+            self.content = content
+            self.headers = {"content-type": content_type}
+
+    fetched: list[str] = []
+
+    class FakeHttp:
+        def get(self, url: str):
+            fetched.append(url)
+            if url == "https://investor.example.com/quarterly-results":
+                return FakeResponse(
+                    """
+                    <html><head><title>Quarterly Results</title></head>
+                    <body>
+                      <a href="https://investor.example.com/q1-transcript.pdf">Q1 Transcript</a>
+                      <a href="https://investor.example.com/quarterly-results/2025/q4">Older quarter</a>
+                    </body></html>
+                    """
+                )
+            if url == "https://investor.example.com/q1-transcript.pdf":
+                return FakeResponse(content=b"%PDF transcript fixture", content_type="application/pdf")
+            return FakeResponse("<html><head><title>Older quarter</title></head><body></body></html>")
+
+    class FakeAgent:
+        def decide(self, **kwargs):
+            return PageDecision(page_type="earnings_event", confidence=0.7, reason="earnings page", useful_links=[])
+
+    monkeypatch.setattr(
+        "ir_transcripts.crawler.pdf_text",
+        lambda content: (
+            "LSEG STREETEVENTS EDITED TRANSCRIPT\n"
+            "Example Co Q1 2027 Earnings Call\n"
+            "CORPORATE PARTICIPANTS\n"
+            "JANE DOE Example Co - CFO\n"
+            "CONFERENCE CALL PARTICIPANTS\n"
+            "Analyst One\n"
+            "PRESENTATION\n"
+            "Operator Welcome.\n"
+            "QUESTION AND ANSWER\n"
+            "END"
+        ),
+    )
+    crawler = TranscriptCrawler(
+        model="test-model",
+        out_dir=tmp_path,
+        seed_urls=["https://investor.example.com/quarterly-results"],
+        http=FakeHttp(),  # type: ignore[arg-type]
+        latest_only=True,
+        max_pages_per_company=10,
+        max_depth=2,
+    )
+    crawler.agent = FakeAgent()  # type: ignore[assignment]
+
+    result = crawler.crawl_company(Company(symbol="EX", name="Example"))
+
+    assert len(result.transcripts) == 1
+    assert "https://investor.example.com/quarterly-results/2025/q4" not in fetched
+
+
 def test_crawler_latest_only_keeps_newest_transcript_artifacts(tmp_path) -> None:
     class FakeResponse:
         headers = {"content-type": "text/html"}
@@ -413,6 +577,79 @@ def test_nav_first_uses_navigation_before_search(monkeypatch, tmp_path) -> None:
     crawler = TranscriptCrawler(model="test-model", out_dir=tmp_path, discovery_mode="nav-first")
 
     assert crawler._discover_seeds(company) == ["https://example.com/investors"]
+
+
+def test_crawler_delegates_unavailable_robots_for_navigation_verified_ir_subdomain(monkeypatch, tmp_path) -> None:
+    company = Company(symbol="EX", name="Example")
+    monkeypatch.setattr(
+        "ir_transcripts.crawler.discover_navigation_seeds",
+        lambda *args, **kwargs: NavigationDiscoveryResult(
+            seeds=["https://ir.example.com/earnings"],
+            trace=NavigationTrace(company=company),
+            robots_verified_official_urls=["https://www.example.com"],
+        ),
+    )
+
+    class FakeResponse:
+        headers = {"content-type": "text/html"}
+        text = """
+        <html><head><title>Example Q1 2026 Earnings Call Transcript</title></head>
+        <body>
+          <p>OPERATOR: Welcome to the Example Q1 2026 earnings call.</p>
+          <p>JANE DOE: Thank you.</p>
+          <p>QUESTION-AND-ANSWER SESSION</p>
+          <p>END</p>
+        </body></html>
+        """
+        content = text.encode("utf-8")
+
+    class FakeHttp:
+        def __init__(self) -> None:
+            self.delegated_fetches: list[str] = []
+
+        def get(self, url: str):
+            raise RobotsUnavailableError(f"Could not verify robots.txt for {url}")
+
+        def get_without_robots_check(self, url: str):
+            self.delegated_fetches.append(url)
+            return FakeResponse()
+
+    class FakeAgent:
+        def decide(self, **kwargs):
+            return PageDecision(page_type="transcript", confidence=1.0, reason="transcript", useful_links=[])
+
+    http = FakeHttp()
+    crawler = TranscriptCrawler(
+        model="test-model",
+        out_dir=tmp_path,
+        discovery_mode="nav-first",
+        http=http,  # type: ignore[arg-type]
+    )
+    crawler.agent = FakeAgent()  # type: ignore[assignment]
+
+    result = crawler.crawl_company(company)
+
+    assert http.delegated_fetches == ["https://ir.example.com/earnings"]
+    assert len(result.transcripts) == 1
+
+
+def test_nav_first_does_not_fallback_to_search_when_navigation_empty(monkeypatch, tmp_path) -> None:
+    company = Company(symbol="EX", name="Example")
+    monkeypatch.setattr(
+        "ir_transcripts.crawler.discover_navigation_seeds",
+        lambda *args, **kwargs: NavigationDiscoveryResult(
+            seeds=[],
+            trace=NavigationTrace(company=company),
+        ),
+    )
+
+    def fail_search(*args, **kwargs):
+        raise AssertionError("search fallback should not run")
+
+    monkeypatch.setattr("ir_transcripts.crawler.find_ir_candidates", fail_search)
+    crawler = TranscriptCrawler(model="test-model", out_dir=tmp_path, discovery_mode="nav-first")
+
+    assert crawler._discover_seeds(company) == []
 
 
 def test_search_first_preserves_search_discovery(monkeypatch, tmp_path) -> None:

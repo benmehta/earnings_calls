@@ -7,6 +7,7 @@ from langchain_core.documents import Document
 from langchain_ollama import OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+from .identity import company_display_name
 from .models import TranscriptRecord
 
 
@@ -42,7 +43,7 @@ def index_transcripts(
     for record in records:
         metadata = {
             "symbol": record.company.symbol,
-            "company": record.company.name,
+            "company": company_display_name(record.company),
             "source_url": str(record.source_url),
             "title": record.title,
         }

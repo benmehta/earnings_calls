@@ -129,6 +129,11 @@ def classify_transcript(text: str, *, title: str = "", url: str = "") -> Transcr
     lower = text.lower()
     context = f"{title} {url}".lower()
     transcript_context = "transcript" in context or "earnings call transcript" in lower[:1500]
+    lseg_transcript = (
+        re.search(r"lseg\s+streetevents\s+edited\s+transcript", lower[:1500]) is not None
+        and "corporate participants" in lower[:3000]
+        and ("conference call participants" in lower[:5000] or "presentation" in lower[:5000])
+    )
     negative_markers = (
         "press release",
         "business highlights",
@@ -155,6 +160,8 @@ def classify_transcript(text: str, *, title: str = "", url: str = "") -> Transcr
     has_operator = any(speaker.lower() == "operator" for speaker in speakers)
     has_end_marker = bool(re.search(r"\bEND\b\s*$", text.strip()))
 
+    if lseg_transcript:
+        return TranscriptDetection(True, "transcript_detected")
     if negative_count >= 2 and len(speakers) < 3:
         return TranscriptDetection(False, "transcript_rejected_press_release_like")
     if transcript_context and (len(speakers) >= 2 or qna_count >= 2 or has_end_marker):

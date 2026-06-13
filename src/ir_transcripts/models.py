@@ -5,11 +5,12 @@ from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field, HttpUrl
+from pydantic import field_validator
 
 
 class Company(BaseModel):
     symbol: str
-    name: str
+    name: str | None = None
     sector: str | None = None
     sub_industry: str | None = None
     cik: str | None = None
@@ -36,9 +37,43 @@ class IRDiscoverySelection(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     reason: str = ""
 
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def coerce_confidence(cls, value):
+        if isinstance(value, (int, float)) and value > 1:
+            return value / 100
+        return value
+
 
 class IRDiscoveryDecision(BaseModel):
     selections: list[IRDiscoverySelection] = Field(default_factory=list)
+
+
+class HomepagePrediction(BaseModel):
+    homepage_urls: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    reason: str = ""
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def coerce_confidence(cls, value):
+        if isinstance(value, (int, float)) and value > 1:
+            return value / 100
+        return value
+
+
+class HomepageValidationDecision(BaseModel):
+    is_official: bool = False
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    linked_ir_urls: list[str] = Field(default_factory=list)
+    reason: str = ""
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def coerce_confidence(cls, value):
+        if isinstance(value, (int, float)) and value > 1:
+            return value / 100
+        return value
 
 
 class NavigationDecision(BaseModel):
@@ -79,6 +114,15 @@ class PromptGuidance(BaseModel):
     risk_notes: list[str] = Field(default_factory=list)
 
 
+class CrawlReflection(BaseModel):
+    preferred_urls: list[str] = Field(default_factory=list)
+    preferred_terms: list[str] = Field(default_factory=list)
+    avoid_urls: list[str] = Field(default_factory=list)
+    avoid_terms: list[str] = Field(default_factory=list)
+    prompt_guidance: PromptGuidance = Field(default_factory=PromptGuidance)
+    reason: str = ""
+
+
 class PageDecision(BaseModel):
     page_type: Literal[
         "transcript",
@@ -106,6 +150,19 @@ class PageDecisionDraft(BaseModel):
     useful_urls: list[str] = Field(default_factory=list)
     reason: str = ""
 
+    @field_validator("useful_urls", mode="before")
+    @classmethod
+    def coerce_useful_urls(cls, value):
+        if not isinstance(value, list):
+            return value
+        urls = []
+        for item in value:
+            if isinstance(item, str):
+                urls.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("url"), str):
+                urls.append(item["url"])
+        return urls
+
 
 class TranscriptRecord(BaseModel):
     company: Company
@@ -119,6 +176,15 @@ class TranscriptRecord(BaseModel):
 
 
 FailureType = Literal[
+    "identity_low_confidence",
+    "homepage_unverified",
+    "navigation_fetch_failed",
+    "navigation_render_failed",
+    "navigation_llm_failed",
+    "page_fetch_failed",
+    "page_render_failed",
+    "page_classification_failed",
+    "document_parse_failed",
     "robots_blocked",
     "robots_disallowed",
     "robots_unavailable",
@@ -185,13 +251,16 @@ class CrawlAttemptConfig(BaseModel):
     discovery_mode: Literal["nav-first", "search-first"] = "nav-first"
     include_discovery_guesses: bool = False
     disable_official_homepage_overrides: bool = False
+    disable_predictive_identity: bool = False
     rerank_discovery: bool = False
     extract_metadata_with_llm: bool = False
     latest_only: bool = False
     allow_official_linked_documents_on_robots_unavailable: bool = False
     use_prompt_planner: bool = False
+    disable_memory: bool = False
     prompt_guidance: PromptGuidance | None = None
     navigation_memory: CompanyNavigationMemory | None = None
+    identity_name_hint: str | None = None
     search_timeout_seconds: float = 30.0
     llm_timeout_seconds: float = 45.0
     navigation_llm_max_links: int = 12
@@ -203,6 +272,10 @@ class CrawlAttemptConfig(BaseModel):
 FailureCategory = Literal[
     "success",
     "wrong_identity",
+    "identity_low_confidence",
+    "homepage_unverified",
+    "navigation_step_failed",
+    "crawl_step_failed",
     "robots_unavailable",
     "render_needed",
     "needs_deeper_crawl",
@@ -223,6 +296,9 @@ class FailureAnalysis(BaseModel):
 SupervisorActionType = Literal[
     "finish",
     "identity_correction",
+    "identity_retry",
+    "step_retry",
+    "retry",
     "search_first",
     "playwright_retry",
     "deeper_crawl",

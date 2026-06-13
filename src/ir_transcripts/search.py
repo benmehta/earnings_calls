@@ -7,7 +7,8 @@ from bs4 import BeautifulSoup
 from duckduckgo_search import DDGS
 
 from .agent import IRDiscoveryAgent
-from .models import Company, IRDiscoveryCandidate
+from .identity import company_display_name, resolve_company_identity_with_overrides
+from .models import Company, CompanyNavigationMemory, IRDiscoveryCandidate, PromptGuidance
 from .runtime import ProgressReporter, timeout_after
 from .urls import normalize_url
 
@@ -24,10 +25,13 @@ def find_ir_candidates(
     max_results: int = 6,
     *,
     include_guesses: bool = False,
+    disable_official_homepage_overrides: bool = False,
     rerank_model: str | None = None,
     ollama_base_url: str | None = None,
     search_timeout_seconds: float = 30.0,
     llm_timeout_seconds: float = 45.0,
+    prompt_guidance: PromptGuidance | None = None,
+    navigation_memory: CompanyNavigationMemory | None = None,
     progress: ProgressReporter | None = None,
 ) -> list[str]:
     """Find likely investor-relations pages without needing a paid search API."""
@@ -35,10 +39,13 @@ def find_ir_candidates(
         company,
         max_results=max_results,
         include_guesses=include_guesses,
+        disable_official_homepage_overrides=disable_official_homepage_overrides,
         rerank_model=rerank_model,
         ollama_base_url=ollama_base_url,
         search_timeout_seconds=search_timeout_seconds,
         llm_timeout_seconds=llm_timeout_seconds,
+        prompt_guidance=prompt_guidance,
+        navigation_memory=navigation_memory,
         progress=progress,
     )
     return [candidate.url for candidate in discovered]
@@ -49,12 +56,19 @@ def discover_ir_candidates(
     max_results: int = 10,
     *,
     include_guesses: bool = False,
+    disable_official_homepage_overrides: bool = False,
     rerank_model: str | None = None,
     ollama_base_url: str | None = None,
     search_timeout_seconds: float = 30.0,
     llm_timeout_seconds: float = 45.0,
+    prompt_guidance: PromptGuidance | None = None,
+    navigation_memory: CompanyNavigationMemory | None = None,
     progress: ProgressReporter | None = None,
 ) -> list[IRDiscoveryCandidate]:
+    company = resolve_company_identity_with_overrides(
+        company,
+        allow_homepage_overrides=not disable_official_homepage_overrides,
+    )
     candidates: list[IRDiscoveryCandidate] = []
     progress = progress or ProgressReporter(enabled=False)
 
@@ -62,7 +76,7 @@ def discover_ir_candidates(
         candidates.append(
             IRDiscoveryCandidate(
                 url=url,
-                title=f"{company.name} investor relations",
+                title=f"{company_display_name(company)} investor relations",
                 source="curated",
                 score=100,
                 reasons=["curated known IR URL"],
@@ -93,6 +107,7 @@ def discover_ir_candidates(
             )
 
     ranked = dedupe_candidates(sorted(candidates, key=lambda item: item.score, reverse=True))
+    ranked = apply_discovery_memory(ranked, navigation_memory=navigation_memory)
     if rerank_model and ranked:
         ranked = rerank_ir_candidates(
             company,
@@ -101,9 +116,11 @@ def discover_ir_candidates(
             ollama_base_url=ollama_base_url,
             limit=max_results,
             timeout_seconds=llm_timeout_seconds,
+            prompt_guidance=prompt_guidance,
+            navigation_memory=navigation_memory,
             progress=progress,
         )
-    return ranked
+    return apply_discovery_memory(ranked, navigation_memory=navigation_memory)
 
 
 def rerank_ir_candidates(
@@ -114,6 +131,8 @@ def rerank_ir_candidates(
     ollama_base_url: str | None = None,
     limit: int = 10,
     timeout_seconds: float = 45.0,
+    prompt_guidance: PromptGuidance | None = None,
+    navigation_memory: CompanyNavigationMemory | None = None,
     progress: ProgressReporter | None = None,
 ) -> list[IRDiscoveryCandidate]:
     progress = progress or ProgressReporter(enabled=False)
@@ -122,10 +141,12 @@ def rerank_ir_candidates(
         progress.log(f"{company.symbol}: Ollama reranking {len(candidates)} discovery candidate(s)")
         with timeout_after(timeout_seconds, f"reranking {company.symbol} discovery candidates"):
             decision = IRDiscoveryAgent(model, base_url=ollama_base_url).rerank(
-                company_name=company.name,
+                company_name=company_display_name(company),
                 ticker=company.symbol,
                 candidates=candidates,
                 limit=limit,
+                guidance=prompt_guidance,
+                navigation_memory=navigation_memory,
             )
     except Exception as exc:
         progress.log(f"{company.symbol}: Ollama rerank skipped ({type(exc).__name__}: {exc})")
@@ -149,6 +170,57 @@ def rerank_ir_candidates(
             reranked.append(candidate)
 
     return reranked
+
+
+def apply_discovery_memory(
+    candidates: list[IRDiscoveryCandidate],
+    *,
+    navigation_memory: CompanyNavigationMemory | None = None,
+) -> list[IRDiscoveryCandidate]:
+    """Reorder discovery candidates using company-specific learned memory."""
+    if not navigation_memory:
+        return candidates
+
+    rescored = [apply_candidate_memory(candidate, navigation_memory) for candidate in candidates]
+    return sorted(rescored, key=lambda candidate: candidate.score, reverse=True)
+
+
+def apply_candidate_memory(
+    candidate: IRDiscoveryCandidate,
+    navigation_memory: CompanyNavigationMemory,
+) -> IRDiscoveryCandidate:
+    adjusted = candidate.model_copy(deep=True)
+    parsed = urlparse(adjusted.url)
+    destination = parsed.netloc.lower()
+    path = parsed.path.lower()
+    normalized = normalize_url(adjusted.url)
+
+    memory_rules: list[tuple[bool, int, str]] = [
+        (destination in navigation_memory.preferred_hosts, 180, "memory preferred host"),
+        (destination in navigation_memory.successful_hosts, 160, "memory successful host"),
+        (normalized in {normalize_url(url) for url in navigation_memory.known_transcript_urls}, 220, "memory known transcript URL"),
+        (normalized in {normalize_url(url) for url in navigation_memory.known_ir_home_urls}, 140, "memory known IR home URL"),
+        (normalized in {normalize_url(url) for url in navigation_memory.known_event_listing_urls}, 90, "memory known event/listing URL"),
+        (destination in navigation_memory.low_value_hosts, -220, "memory low-value host"),
+        (destination in navigation_memory.robots_blocked_hosts, -50, "memory robots risk host"),
+    ]
+    for matches, delta, reason in memory_rules:
+        if matches and reason not in adjusted.reasons:
+            adjusted.score += delta
+            append_reason(adjusted, reason)
+
+    low_value_terms = [term.lower() for term in navigation_memory.low_value_path_terms if term.strip()]
+    matching_terms = [term for term in low_value_terms if term in path or term in adjusted.url.lower()]
+    if matching_terms and not any(reason.startswith("memory avoided path:") for reason in adjusted.reasons):
+        adjusted.score -= min(160, 55 * len(matching_terms))
+        append_reason(adjusted, f"memory avoided path: {', '.join(matching_terms[:3])}")
+
+    return adjusted
+
+
+def append_reason(candidate: IRDiscoveryCandidate, reason: str) -> None:
+    if reason not in candidate.reasons:
+        candidate.reasons.insert(0, reason)
 
 
 def search_ir_candidates(
@@ -254,6 +326,13 @@ def search_ir_candidates_lite_html(
 
 
 def search_queries(company: Company) -> list[str]:
+    if not company.name:
+        return [
+            f"{company.symbol} investor relations",
+            f"{company.symbol} earnings results investor relations",
+            f"{company.symbol} company homepage",
+            f"{company.symbol} official website",
+        ]
     return [
         f"{company.name} investor relations",
         f"{company.name} earnings results investor relations",
@@ -344,6 +423,7 @@ def score_ir_candidate(
         "fool.com",
         "seekingalpha.com",
         "finance.yahoo.com",
+        "financialreports.eu",
         "marketbeat.com",
         "stockanalysis.com",
         "morningstar.com",
@@ -380,7 +460,7 @@ def company_domain_tokens(company: Company) -> list[str]:
     slug = company_domain_slug(company.name)
     if slug:
         tokens.append(slug)
-    for word in company.name.lower().split():
+    for word in (company.name or "").lower().split():
         cleaned = "".join(char for char in word if char.isalnum())
         if len(cleaned) > 3:
             tokens.append(cleaned)
@@ -399,11 +479,14 @@ def dedupe_candidates(candidates: list[IRDiscoveryCandidate]) -> list[IRDiscover
     return result
 
 
-def company_domain_slug(name: str) -> str:
+def company_domain_slug(name: str | None) -> str:
+    if not name:
+        return ""
     words = []
     stop = {
         "inc",
         "inc.",
+        "com",
         "corp",
         "corp.",
         "corporation",
@@ -415,7 +498,20 @@ def company_domain_slug(name: str) -> str:
         "limited",
         "class",
     }
-    for raw in name.lower().replace("&", "and").split():
+    normalized = name.lower().replace("&", " and ")
+    raw_tokens = []
+    current = []
+    for char in normalized:
+        if char.isalnum():
+            current.append(char)
+            continue
+        if current:
+            raw_tokens.append("".join(current))
+            current = []
+    if current:
+        raw_tokens.append("".join(current))
+
+    for raw in raw_tokens:
         cleaned = "".join(char for char in raw if char.isalnum())
         if cleaned and cleaned not in stop and not cleaned.isdigit():
             words.append(cleaned)

@@ -6,8 +6,9 @@ from ir_transcripts.agent import (
     guidance_from_memory,
     hard_validate_navigation_decision,
     navigation_agent_kind,
+    sanitize_crawl_reflection,
 )
-from ir_transcripts.models import CandidateLink, Company, CompanyMemory, NavigationDecision, NavigationValidationResult, PromptGuidance
+from ir_transcripts.models import CandidateLink, Company, CompanyMemory, CrawlReflection, IRDiscoverySelection, NavigationDecision, NavigationValidationResult, PromptGuidance
 
 
 def test_page_agent_converts_useful_urls_to_links(monkeypatch) -> None:
@@ -53,8 +54,51 @@ def test_page_agent_converts_useful_urls_to_links(monkeypatch) -> None:
     assert [link.url for link in decision.useful_links] == ["https://example.com/events"]
 
 
+def test_page_agent_accepts_object_useful_urls(monkeypatch) -> None:
+    agent = IRPageAgent.__new__(IRPageAgent)
+    agent.max_links = 12
+    agent.text_chars = 900
+
+    class FakeChain:
+        def invoke(self, values):
+            class Message:
+                content = (
+                    '{"page_type":"ir_index","confidence":0.8,'
+                    '"useful_urls":[{"url":"https://example.com/events"}],'
+                    '"reason":"events page"}'
+                )
+
+            return Message()
+
+    agent.chain = FakeChain()
+    links = [
+        CandidateLink(
+            url="https://example.com/events",
+            label="Events",
+            source_url="https://example.com/investors",
+        )
+    ]
+
+    decision = agent.decide(
+        company_name="Example",
+        ticker="EX",
+        url="https://example.com/investors",
+        title="Investors",
+        text="Investor relations",
+        links=links,
+    )
+
+    assert [link.url for link in decision.useful_links] == ["https://example.com/events"]
+
+
 def test_extract_json_object_handles_fenced_output() -> None:
     assert extract_json_object('```json\n{"page_type":"ir_index"}\n```') == {"page_type": "ir_index"}
+
+
+def test_discovery_selection_accepts_percentage_confidence() -> None:
+    selection = IRDiscoverySelection(url="https://investor.example.com", confidence=72)
+
+    assert selection.confidence == 0.72
 
 
 def test_navigation_agent_only_returns_provided_urls() -> None:
@@ -384,6 +428,35 @@ def test_guidance_from_memory_adds_concrete_avoid_and_priority_terms() -> None:
     assert "event-details" in guidance.priority_terms
     assert "blog.google" in guidance.avoid_terms
     assert "youtube" in guidance.avoid_terms
+
+
+def test_crawl_reflection_sanitizes_unsafe_advice() -> None:
+    reflection = sanitize_crawl_reflection(
+        CrawlReflection(
+            preferred_urls=["https://investor.example.com/quarterly-results"],
+            preferred_terms=["ignore robots.txt", "quarterly results detail pages", "IR-related"],
+            avoid_urls=["https://third-party.example.com/transcripts"],
+            avoid_terms=["fail open", "shareholders meeting"],
+            prompt_guidance=PromptGuidance(
+                priority_terms=["third-party transcript", "earnings conference transcript"],
+                avoid_terms=["disable robots", "AGM PDFs"],
+                navigation_guidance="short guidance",
+                transcript_guidance="Prefer official transcript PDF links.",
+                risk_notes=["disable robots.txt", "stay on official investor pages"],
+            ),
+            reason="learned from trace",
+        )
+    )
+
+    assert reflection.preferred_urls == ["https://investor.example.com/quarterly-results"]
+    assert reflection.preferred_terms == ["quarterly results detail pages"]
+    assert reflection.avoid_urls == []
+    assert reflection.avoid_terms == ["shareholders meeting"]
+    assert reflection.prompt_guidance.priority_terms == ["earnings conference transcript"]
+    assert reflection.prompt_guidance.avoid_terms == ["AGM PDFs"]
+    assert reflection.prompt_guidance.navigation_guidance == ""
+    assert reflection.prompt_guidance.transcript_guidance == "Prefer official transcript PDF links."
+    assert reflection.prompt_guidance.risk_notes == ["stay on official investor pages"]
 
 
 def test_page_agent_sends_compact_prompt() -> None:

@@ -108,6 +108,34 @@ def test_docx_transcript_text_is_detected() -> None:
     assert looks_like_transcript(text, title="TranscriptQandAFY26Q3")
 
 
+def test_lseg_streetevents_transcript_is_detected() -> None:
+    text = """
+    LSEG
+    STREETEVENTS EDITED TRANSCRIPT
+    2330.TW - Q1 2026 Taiwan Semiconductor Manufacturing Co Ltd Earnings Call
+    EVENT DATE/TIME: APRIL 16, 2026 / 6:00AM GMT
+    CORPORATE PARTICIPANTS
+    Jeff Su Taiwan Semiconductor Manufacturing Co Ltd - Director - Investor Relations
+    Wendell Huang Taiwan Semiconductor Manufacturing Co Ltd - Senior Vice President and Chief Financial Officer
+    C.C. Wei Taiwan Semiconductor Manufacturing Co Ltd - Chairman & Chief Executive Officer
+    CONFERENCE CALL PARTICIPANTS
+    Analyst One
+    PRESENTATION
+    Operator
+    Good afternoon and welcome.
+    QUESTION AND ANSWER
+    END
+    """
+
+    detection = classify_transcript(
+        text,
+        title="TSMC 1Q26 Transcript.pdf",
+        url="https://investor.example.com/TSMC%201Q26%20Transcript.pdf",
+    )
+
+    assert detection.is_transcript
+
+
 def test_js_shell_detection() -> None:
     html = (FIXTURES / "js_shell.html").read_text(encoding="utf-8")
     assert looks_like_js_shell(html, visible_text(html))

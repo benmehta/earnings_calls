@@ -3,15 +3,17 @@ from __future__ import annotations
 import hashlib
 import re
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
 from .agent import IRPageAgent
 from .browser import PlaywrightRenderer
 from .http import HttpClient, RobotsDisallowedError, RobotsUnavailableError
+from .identity import company_display_name
 from .metadata import TranscriptMetadataAgent, extract_metadata_heuristic
 from .models import CandidateLink, CandidatePage, Company, CompanyNavigationMemory, CrawlFailure, CrawlResult, FailureType, PromptGuidance, TranscriptRecord
-from .navigation import discover_navigation_seeds
+from .navigation import can_delegate_unavailable_ir_subdomain_robots, discover_navigation_seeds
 from .parsing import classify_transcript, docx_text, extract_links, looks_like_js_shell, looks_like_transcript, page_title, pdf_text, visible_text
 from .runtime import ProgressReporter, timeout_after
 from .search import find_ir_candidates
@@ -22,6 +24,34 @@ from .urls import host, normalize_url, resolve_document_url
 TRANSCRIPT_HINTS = ("transcript", "earnings-call", "earnings call", "quarterly-results")
 IR_HINTS = ("investor", "/ir", "shareholder", "financial", "events", "earnings", "quarter")
 TRANSCRIPT_DOCUMENT_EXTENSIONS = (".pdf", ".docx")
+LOW_VALUE_AFTER_TRANSCRIPT_TERMS = (
+    "annual-meeting",
+    "annual meeting",
+    "annual-reports",
+    "annual reports",
+    "email-alert",
+    "email alert",
+    "governance",
+    "news-release",
+    "news release",
+    "press-release",
+    "press release",
+    "presentation",
+    "proxy",
+    "rss",
+    "sec-filings",
+    "sec filings",
+    "stock-info",
+    "stock quote",
+)
+
+
+@dataclass
+class SeedDiscoveryResult:
+    seeds: list[str]
+    failures: list[CrawlFailure]
+    skipped_reason: str = "No investor-relations candidates found"
+    robots_verified_official_urls: list[str] | None = None
 
 
 class TranscriptCrawler:
@@ -51,6 +81,8 @@ class TranscriptCrawler:
         llm_text_chars: int = 900,
         prompt_guidance: PromptGuidance | None = None,
         navigation_memory: CompanyNavigationMemory | None = None,
+        identity_name_hint: str | None = None,
+        disable_predictive_identity: bool = False,
         allow_official_linked_documents_on_robots_unavailable: bool = False,
         progress: ProgressReporter | None = None,
         http: HttpClient | None = None,
@@ -84,6 +116,8 @@ class TranscriptCrawler:
         self.llm_text_chars = llm_text_chars
         self.prompt_guidance = prompt_guidance
         self.navigation_memory = navigation_memory
+        self.identity_name_hint = identity_name_hint
+        self.disable_predictive_identity = disable_predictive_identity
         self.allow_official_linked_documents_on_robots_unavailable = allow_official_linked_documents_on_robots_unavailable
         self.progress = progress or ProgressReporter(enabled=False)
         self.http = http or HttpClient()
@@ -91,17 +125,20 @@ class TranscriptCrawler:
 
     def crawl_company(self, company: Company) -> CrawlResult:
         self.progress.log(f"{company.symbol}: crawl starting")
-        seeds = self._discover_seeds(company)
+        discovery = self._discover_seed_result(company)
+        seeds = discovery.seeds
         seeds = [resolve_document_url(seed) for seed in seeds]
         if not seeds:
-            self.progress.log(f"{company.symbol}: crawl skipped; no investor-relations candidates found")
-            return CrawlResult(company=company, skipped_reason="No investor-relations candidates found")
+            self.progress.log(f"{company.symbol}: crawl skipped; {discovery.skipped_reason}")
+            return CrawlResult(company=company, failures=discovery.failures, skipped_reason=discovery.skipped_reason)
 
         result = CrawlResult(company=company, ir_url=seeds[0])
         self.progress.log(f"{company.symbol}: crawling {len(seeds)} seed URL(s)")
         queue: deque[tuple[str, int, CandidateLink | None]] = deque((seed, 0, None) for seed in seeds)
         run_visited: set[str] = set()
         allowed_official_pages: set[str] = set()
+        robots_verified_official_urls = discovery.robots_verified_official_urls or []
+        transcript_document_found = False
         allowed_hosts = {host(seed) for seed in seeds}
         state = CrawlState.load(self._state_path(company)) if self.resume else CrawlState(path=self._state_path(company))
 
@@ -109,32 +146,40 @@ class TranscriptCrawler:
             url, depth, source_link = queue.popleft()
             url = resolve_document_url(url)
             normalized = normalize_url(url)
-            if normalized in run_visited or depth > self.max_depth:
+            crawl_identity = crawl_identity_url(url)
+            if crawl_identity in run_visited or depth > self.max_depth:
                 continue
             if state.has_visited(url):
                 continue
             if host(url) not in allowed_hosts:
                 continue
 
-            run_visited.add(normalized)
+            run_visited.add(crawl_identity)
             try:
                 self.progress.log(f"{company.symbol}: fetching depth={depth} {url}")
-                response = self._fetch_url(company, url, source_link, allowed_official_pages, result)
+                response = self._fetch_url(
+                    company,
+                    url,
+                    source_link,
+                    allowed_official_pages,
+                    result,
+                    robots_verified_official_urls,
+                )
             except RobotsDisallowedError as exc:
                 result.failures.append(self._failure(company, url, "robots_disallowed", exc))
-                continue
+                return self._finish_result(company, result, state=state, run_visited=run_visited)
             except RobotsUnavailableError as exc:
                 result.failures.append(self._failure(company, url, "robots_unavailable", exc))
-                continue
+                return self._finish_result(company, result, state=state, run_visited=run_visited)
             except PermissionError as exc:
                 result.failures.append(self._failure(company, url, "robots_blocked", exc))
-                continue
+                return self._finish_result(company, result, state=state, run_visited=run_visited)
             except TimeoutError as exc:
                 result.failures.append(self._failure(company, url, "timeout", exc))
-                continue
+                return self._finish_result(company, result, state=state, run_visited=run_visited)
             except Exception as exc:
                 result.failures.append(self._failure(company, url, "http_error", exc))
-                continue
+                return self._finish_result(company, result, state=state, run_visited=run_visited)
             state.mark_visited(url)
 
             content_type = response.headers.get("content-type", "").lower()
@@ -143,6 +188,12 @@ class TranscriptCrawler:
                 record = self._record_pdf(company, url, response.content, state, result)
                 if record:
                     result.transcripts.append(record)
+                    transcript_document_found = True
+                    queue = self._trim_queue_after_transcript_document(queue)
+                    if self.latest_only:
+                        queue.clear()
+                elif result.failures and result.failures[-1].failure_type != "not_transcript":
+                    return self._finish_result(company, result, state=state, run_visited=run_visited)
                 continue
             if is_docx_response(url, content_type, response.content):
                 self._cache_bytes(company, url, response.content, suffix=".docx")
@@ -150,12 +201,18 @@ class TranscriptCrawler:
                     record = self._record_docx(company, url, response.content, state, result)
                     if record:
                         result.transcripts.append(record)
+                        transcript_document_found = True
+                        queue = self._trim_queue_after_transcript_document(queue)
+                        if self.latest_only:
+                            queue.clear()
+                    elif result.failures and result.failures[-1].failure_type != "not_transcript":
+                        return self._finish_result(company, result, state=state, run_visited=run_visited)
                 else:
                     try:
                         text = docx_text(response.content)
                     except Exception as exc:
-                        result.failures.append(self._failure(company, url, "parse_error", exc))
-                        continue
+                        result.failures.append(self._failure(company, url, "document_parse_failed", exc))
+                        return self._finish_result(company, result, state=state, run_visited=run_visited)
                     detection = classify_transcript(text, title=url.rstrip("/").split("/")[-1], url=url)
                     result.candidates.append(
                         CandidatePage(
@@ -186,8 +243,8 @@ class TranscriptCrawler:
                     text = visible_text(html)
                     rendered = True
                 except Exception as exc:
-                    result.failures.append(self._failure(company, url, "playwright_error", exc))
-                    rendered = False
+                    result.failures.append(self._failure(company, url, "page_render_failed", exc))
+                    return self._finish_result(company, result, state=state, run_visited=run_visited)
             links = extract_links(html, url)
             detection = classify_transcript(text, title=title, url=url)
 
@@ -201,7 +258,7 @@ class TranscriptCrawler:
                 self.progress.log(f"{company.symbol}: asking Ollama to classify page {url}")
                 with timeout_after(self.llm_timeout_seconds, f"classifying page {url}"):
                     decision = self.agent.decide(
-                        company_name=company.name,
+                        company_name=company_display_name(company),
                         ticker=company.symbol,
                         url=url,
                         title=title,
@@ -209,9 +266,9 @@ class TranscriptCrawler:
                         links=self._prioritize_links(links),
                     )
             except Exception as exc:
-                self.progress.log(f"{company.symbol}: page LLM skipped ({type(exc).__name__}: {url})")
-                result.failures.append(self._failure(company, url, "llm_error", exc))
-                decision = None
+                self.progress.log(f"{company.symbol}: page LLM failed ({type(exc).__name__}: {url})")
+                result.failures.append(self._failure(company, url, "page_classification_failed", exc))
+                return self._finish_result(company, result, state=state, run_visited=run_visited)
 
             candidate = CandidatePage(
                 company=company,
@@ -227,16 +284,31 @@ class TranscriptCrawler:
 
             if decision:
                 for link in decision.useful_links:
+                    if self._should_skip_after_transcript_document(link, transcript_document_found):
+                        continue
                     if self._should_follow(link, allowed_hosts, current_url=url):
                         allowed_hosts.add(host(link.url))
                         queue.append((link.url, depth + 1, link))
 
             for link in self._heuristic_links(links):
+                if self._should_skip_after_transcript_document(link, transcript_document_found):
+                    continue
                 if self._should_follow(link, allowed_hosts, current_url=url):
                     allowed_hosts.add(host(link.url))
                     queue.append((link.url, depth + 1, link))
 
-        result.visited_count = len(run_visited)
+        return self._finish_result(company, result, state=state, run_visited=run_visited)
+
+    def _finish_result(
+        self,
+        company: Company,
+        result: CrawlResult,
+        *,
+        state: CrawlState | None = None,
+        run_visited: set[str] | None = None,
+    ) -> CrawlResult:
+        if run_visited is not None:
+            result.visited_count = len(run_visited)
         if self.latest_only and len(result.transcripts) > 1:
             before = len(result.transcripts)
             result.transcripts = keep_latest_transcripts(result.transcripts)
@@ -245,12 +317,28 @@ class TranscriptCrawler:
         self._write_company_index(result)
         self._write_failures(result)
         self._write_candidates(result)
-        state.save()
+        if state:
+            state.save()
         self.progress.log(
             f"{company.symbol}: crawl finished with {len(result.transcripts)} transcript(s), "
             f"{result.visited_count} page(s) visited"
         )
         return result
+
+    def _trim_queue_after_transcript_document(
+        self,
+        queue: deque[tuple[str, int, CandidateLink | None]],
+    ) -> deque[tuple[str, int, CandidateLink | None]]:
+        if not self.latest_only:
+            return queue
+        return deque(
+            item
+            for item in queue
+            if not item[2] or not low_value_after_transcript_document(item[2])
+        )
+
+    def _should_skip_after_transcript_document(self, link: CandidateLink, transcript_document_found: bool) -> bool:
+        return self.latest_only and transcript_document_found and low_value_after_transcript_document(link)
 
     def _fetch_url(
         self,
@@ -259,22 +347,29 @@ class TranscriptCrawler:
         source_link: CandidateLink | None,
         allowed_official_pages: set[str],
         result: CrawlResult,
+        robots_verified_official_urls: list[str],
     ):
         try:
             return self.http.get(url)
         except RobotsUnavailableError:
-            if not self._can_fetch_official_linked_document(url, source_link, allowed_official_pages):
-                raise
-            result.candidates.append(
-                CandidatePage(
-                    company=company,
-                    url=url,
-                    title=url.rstrip("/").split("/")[-1],
-                    reason="robots_unavailable_allowed_official_linked_document",
+            if self._can_fetch_official_linked_document(url, source_link, allowed_official_pages):
+                result.candidates.append(
+                    CandidatePage(
+                        company=company,
+                        url=url,
+                        title=url.rstrip("/").split("/")[-1],
+                        reason="robots_unavailable_allowed_official_linked_document",
+                    )
                 )
-            )
-            self.progress.log(f"{company.symbol}: fetching official linked document despite unavailable robots.txt {url}")
-            return self.http.get_without_robots_check(url)
+                self.progress.log(f"{company.symbol}: fetching official linked document despite unavailable robots.txt {url}")
+                return self.http.get_without_robots_check(url)
+            if can_delegate_unavailable_ir_subdomain_robots(
+                url,
+                verified_official_urls=robots_verified_official_urls,
+            ):
+                self.progress.log(f"{company.symbol}: fetching official IR subdomain despite unavailable robots.txt {url}")
+                return self.http.get_without_robots_check(url)
+            raise
 
     def _can_fetch_official_linked_document(
         self,
@@ -297,11 +392,14 @@ class TranscriptCrawler:
         return True
 
     def _discover_seeds(self, company: Company) -> list[str]:
+        return self._discover_seed_result(company).seeds
+
+    def _discover_seed_result(self, company: Company) -> SeedDiscoveryResult:
         if self.seed_urls:
             self.progress.log(f"{company.symbol}: using {len(self.seed_urls)} provided seed URL(s)")
-            return self.seed_urls
+            return SeedDiscoveryResult(seeds=self.seed_urls, failures=[])
         if self.discovery_mode == "search-first":
-            return self._search_seeds(company)
+            return SeedDiscoveryResult(seeds=self._search_seeds(company), failures=[])
 
         self.progress.log(f"{company.symbol}: nav-first discovery")
         navigation = discover_navigation_seeds(
@@ -318,24 +416,46 @@ class TranscriptCrawler:
             llm_text_chars=self.llm_text_chars,
             prompt_guidance=self.prompt_guidance,
             navigation_memory=self.navigation_memory,
+            identity_name_hint=self.identity_name_hint,
+            disable_predictive_identity=self.disable_predictive_identity,
             progress=self.progress,
         )
         self._write_navigation_trace(navigation.trace)
+        if navigation.failure_type:
+            failure = CrawlFailure(
+                company=company,
+                url=", ".join(navigation.failure_urls or []),
+                failure_type=navigation.failure_type,
+                message=navigation.failure_message,
+            )
+            return SeedDiscoveryResult(
+                seeds=[],
+                failures=[failure],
+                skipped_reason=navigation.failure_message or str(navigation.failure_type),
+                robots_verified_official_urls=navigation.robots_verified_official_urls or [],
+            )
         if navigation.seeds:
             self.progress.log(f"{company.symbol}: nav-first discovery produced {len(navigation.seeds)} seed(s)")
-            return navigation.seeds
-        self.progress.log(f"{company.symbol}: nav-first discovery empty; falling back to search")
-        return self._search_seeds(company)
+            return SeedDiscoveryResult(
+                seeds=navigation.seeds,
+                failures=[],
+                robots_verified_official_urls=navigation.robots_verified_official_urls or [],
+            )
+        self.progress.log(f"{company.symbol}: nav-first discovery empty; search fallback disabled")
+        return SeedDiscoveryResult(seeds=[], failures=[])
 
     def _search_seeds(self, company: Company) -> list[str]:
         self.progress.log(f"{company.symbol}: search-first discovery")
         return find_ir_candidates(
             company,
             include_guesses=self.include_discovery_guesses,
+            disable_official_homepage_overrides=self.disable_official_homepage_overrides,
             rerank_model=self.model if self.rerank_discovery else None,
             ollama_base_url=self.ollama_base_url,
             search_timeout_seconds=self.search_timeout_seconds,
             llm_timeout_seconds=self.llm_timeout_seconds,
+            prompt_guidance=self.prompt_guidance,
+            navigation_memory=self.navigation_memory,
             progress=self.progress,
         )
 
@@ -391,7 +511,7 @@ class TranscriptCrawler:
         try:
             text = pdf_text(content)
         except Exception as exc:
-            result.failures.append(self._failure(company, url, "pdf_error", exc))
+            result.failures.append(self._failure(company, url, "document_parse_failed", exc))
             return None
         title = url.rstrip("/").split("/")[-1] or "transcript.pdf"
         if not looks_like_transcript(text, title=title, url=url):
@@ -432,7 +552,7 @@ class TranscriptCrawler:
         try:
             text = docx_text(content)
         except Exception as exc:
-            result.failures.append(self._failure(company, url, "parse_error", exc))
+            result.failures.append(self._failure(company, url, "document_parse_failed", exc))
             return None
         title = url.rstrip("/").split("/")[-1] or "transcript.docx"
         if not looks_like_transcript(text, title=title, url=url):
@@ -539,6 +659,8 @@ class TranscriptCrawler:
         parsed = urlparse(link.url)
         if parsed.scheme not in {"http", "https"}:
             return False
+        if is_non_english_variant(link.url, current_url):
+            return False
         link_host = host(link.url)
         if link_host not in allowed_hosts and not can_expand_host(link, current_url):
             return False
@@ -615,6 +737,14 @@ def content_hash(text: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def crawl_identity_url(url: str) -> str:
+    normalized = normalize_url(url)
+    parsed = urlparse(normalized)
+    if parsed.scheme in {"http", "https"}:
+        return parsed._replace(scheme="https").geturl()
+    return normalized
+
+
 def is_docx_response(url: str, content_type: str, content: bytes) -> bool:
     return (
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document" in content_type
@@ -632,6 +762,21 @@ def looks_like_transcript_document(url: str) -> bool:
 def transcript_document_link_score(link: CandidateLink) -> bool:
     haystack = f"{link.url} {link.label}".lower()
     return "transcript" in haystack or "earnings-call" in haystack or "earnings call" in haystack
+
+
+def low_value_after_transcript_document(link: CandidateLink) -> bool:
+    haystack = f"{link.url} {link.label}".lower()
+    if looks_like_transcript_document(link.url) or transcript_document_link_score(link):
+        return False
+    return any(term in haystack for term in LOW_VALUE_AFTER_TRANSCRIPT_TERMS)
+
+
+def is_non_english_variant(url: str, current_url: str) -> bool:
+    current_path = urlparse(current_url).path.lower()
+    target_path = urlparse(url).path.lower()
+    if "/english/" not in current_path:
+        return False
+    return any(f"/{language}/" in target_path for language in ("chinese", "schinese", "japanese", "zh", "zh_tw", "zh_cn", "ja"))
 
 
 def keep_latest_transcripts(records: list[TranscriptRecord]) -> list[TranscriptRecord]:

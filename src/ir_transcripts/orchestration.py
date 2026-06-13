@@ -6,25 +6,33 @@ from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from .agent import PromptPlannerAgent
+from .agent import CrawlReflectionAgent, PromptPlannerAgent, merge_prompt_guidance as merge_agent_prompt_guidance
 from .crawler import TranscriptCrawler
 from .http import HttpClient
-from .memory import load_company_memory, memory_path, remember_crawl_result, save_company_memory
+from .identity import company_display_name, resolve_company_identity_with_overrides
+from .memory import apply_crawl_reflection, load_company_memory, memory_path, remember_crawl_result, save_company_memory
 from .models import (
     CandidatePage,
     Company,
     CompanyMemory,
     CrawlAttemptConfig,
     CrawlFailure,
+    CrawlReflection,
     CrawlResult,
     FailureAnalysis,
+    NavigationTrace,
     SupervisorAction,
     SupervisorRunResult,
 )
 from .runtime import ProgressReporter, timeout_after
+from .urls import normalize_url
 
 
 AttemptRunner = Callable[[Company, CrawlAttemptConfig], CrawlResult]
+
+
+def resolve_company_identity(company: Company) -> Company:
+    return resolve_company_identity_with_overrides(company)
 
 
 class SupervisorState(TypedDict, total=False):
@@ -68,11 +76,12 @@ class SupervisedCrawler:
 
     def run_company(self, company: Company) -> SupervisorRunResult:
         self.progress.log(f"{company.symbol}: supervised run starting")
+        use_persisted_memory = not self.base_config.disable_memory
         initial_state: SupervisorState = {
             "original_company": company,
             "current_company": company,
             "current_config": self.base_config.model_copy(update={"attempt": 1, "reason": "initial"}),
-            "memory": load_company_memory(self.out_dir, company),
+            "memory": load_company_memory(self.out_dir, company) if use_persisted_memory else CompanyMemory(company=company),
             "attempts": [],
             "analyses": [],
             "actions": [],
@@ -85,7 +94,7 @@ class SupervisedCrawler:
         analyses = final_state.get("analyses", [])
         actions = final_state.get("actions", [])
         memory = final_state.get("memory") or CompanyMemory(company=company)
-        path = save_company_memory(self.out_dir, memory)
+        path = save_company_memory(self.out_dir, memory) if use_persisted_memory else None
         self.progress.log(f"{company.symbol}: supervised run finished with status={supervisor_status(result, actions)}")
         return SupervisorRunResult(
             company=company,
@@ -104,6 +113,7 @@ class SupervisedCrawler:
         graph.add_node("prompt", self._prompt_node)
         graph.add_node("crawl", self._crawl_node)
         graph.add_node("analyze", self._analyze_node)
+        graph.add_node("reflect", self._reflect_node)
         graph.add_node("plan", self._plan_node)
         graph.add_node("retry", self._retry_node)
         graph.add_node("validate", self._validate_node)
@@ -111,7 +121,8 @@ class SupervisedCrawler:
         graph.add_edge("identity", "prompt")
         graph.add_edge("prompt", "crawl")
         graph.add_edge("crawl", "analyze")
-        graph.add_edge("analyze", "plan")
+        graph.add_edge("analyze", "reflect")
+        graph.add_edge("reflect", "plan")
         graph.add_conditional_edges(
             "plan",
             lambda state: "retry" if state.get("should_retry") else "validate",
@@ -123,12 +134,16 @@ class SupervisedCrawler:
 
     def _identity_node(self, state: SupervisorState) -> SupervisorState:
         company = state["current_company"]
-        resolved = resolve_company_identity(company)
+        config = state["current_config"]
+        resolved = resolve_company_identity_with_overrides(
+            company,
+            allow_homepage_overrides=not config.disable_official_homepage_overrides,
+        )
         if resolved != company:
-            self.progress.log(f"{company.symbol}: identity resolved to {resolved.name}")
+            self.progress.log(f"{company.symbol}: identity resolved to {company_display_name(resolved)}")
             action = SupervisorAction(
                 action_type="identity_correction",
-                reason=f"Resolved {company.symbol} from {company.name} to {resolved.name}",
+                reason=f"Resolved {company.symbol} from {company_display_name(company)} to {company_display_name(resolved)}",
                 next_company=resolved,
             )
             state["current_company"] = resolved
@@ -139,11 +154,16 @@ class SupervisedCrawler:
     def _prompt_node(self, state: SupervisorState) -> SupervisorState:
         config = state["current_config"]
         memory = state["memory"]
+        memory_name_hint = memory.company.name if memory.company.name and memory.company.name.upper() != memory.company.symbol.upper() else None
+        navigation_memory = memory.navigation_memory.model_copy(deep=True)
         if not config.use_prompt_planner:
-            updates = {"navigation_memory": memory.navigation_memory}
+            updates = {
+                "navigation_memory": navigation_memory,
+                "identity_name_hint": memory_name_hint,
+            }
             if memory.prompt_guidance:
-                updates["prompt_guidance"] = memory.prompt_guidance
-            state["current_config"] = config.model_copy(update=updates)
+                updates["prompt_guidance"] = memory.prompt_guidance.model_copy(deep=True)
+            state["current_config"] = config.model_copy(deep=True, update=updates)
             return state
 
         company = state["current_company"]
@@ -159,19 +179,31 @@ class SupervisedCrawler:
             self.progress.log(f"{company.symbol}: prompt planner skipped ({type(exc).__name__}: {exc})")
             guidance = memory.prompt_guidance
 
+        if guidance and memory.prompt_guidance:
+            guidance = merge_agent_prompt_guidance(guidance, memory.prompt_guidance)
+
         if guidance:
             self.progress.log(f"{company.symbol}: prompt planner guidance active")
             memory.prompt_guidance = guidance
             state["memory"] = memory
             state["current_config"] = config.model_copy(
+                deep=True,
                 update={
-                    "prompt_guidance": guidance,
-                    "navigation_memory": memory.navigation_memory,
+                    "prompt_guidance": guidance.model_copy(deep=True),
+                    "navigation_memory": memory.navigation_memory.model_copy(deep=True),
+                    "identity_name_hint": memory_name_hint,
                 }
             )
-            save_company_memory(self.out_dir, memory)
+            if not config.disable_memory:
+                save_company_memory(self.out_dir, memory)
         else:
-            state["current_config"] = config.model_copy(update={"navigation_memory": memory.navigation_memory})
+            state["current_config"] = config.model_copy(
+                deep=True,
+                update={
+                    "navigation_memory": memory.navigation_memory.model_copy(deep=True),
+                    "identity_name_hint": memory_name_hint,
+                }
+            )
         return state
 
     def _crawl_node(self, state: SupervisorState) -> SupervisorState:
@@ -187,9 +219,10 @@ class SupervisedCrawler:
             f"({len(result.transcripts)} transcript(s), {result.visited_count} page(s))"
         )
         state["result"] = result
-        state["attempts"] = [*state.get("attempts", []), config]
+        config_snapshot = config.model_copy(deep=True)
+        state["attempts"] = [*state.get("attempts", []), config_snapshot]
         memory = state["memory"]
-        memory.attempted_configs.append(config)
+        memory.attempted_configs.append(config_snapshot.model_copy(deep=True))
         state["memory"] = memory
         return state
 
@@ -201,7 +234,49 @@ class SupervisedCrawler:
         memory = remember_crawl_result(state["memory"], result, analysis)
         state["memory"] = memory
         state["analyses"] = [*state.get("analyses", []), analysis]
-        save_company_memory(self.out_dir, memory)
+        if not config.disable_memory:
+            save_company_memory(self.out_dir, memory)
+        return state
+
+    def _reflect_node(self, state: SupervisorState) -> SupervisorState:
+        result = state["result"]
+        if result.transcripts:
+            return state
+        analysis = state["analyses"][-1]
+        if analysis.manual_recommendations:
+            return state
+
+        company = state["current_company"]
+        config = state["current_config"]
+        if not config.use_prompt_planner:
+            return state
+        try:
+            self.progress.log(f"{company.symbol}: reflection agent starting")
+            with timeout_after(config.llm_timeout_seconds, f"reflecting on {company.symbol} crawl"):
+                evidence = reflection_evidence(
+                    result,
+                    analysis,
+                    load_navigation_trace(self.out_dir, company),
+                )
+                reflection = CrawlReflectionAgent(
+                    self.model,
+                    base_url=self.ollama_base_url,
+                    text_chars=config.llm_text_chars * 3,
+                ).reflect(
+                    company=company,
+                    evidence=evidence,
+                )
+        except Exception as exc:
+            self.progress.log(f"{company.symbol}: reflection skipped ({type(exc).__name__}: {exc})")
+            return state
+
+        reflection = filter_reflection_urls_to_evidence(reflection, evidence)
+        if reflection.reason or reflection.preferred_urls or reflection.avoid_urls or reflection.avoid_terms:
+            self.progress.log(f"{company.symbol}: reflection guidance active")
+        memory = apply_crawl_reflection(state["memory"], reflection)
+        state["memory"] = memory
+        if not config.disable_memory:
+            save_company_memory(self.out_dir, memory)
         return state
 
     def _plan_node(self, state: SupervisorState) -> SupervisorState:
@@ -215,7 +290,7 @@ class SupervisedCrawler:
             max_attempts=state.get("max_attempts", self.max_attempts),
         )
         self.progress.log(f"{state['current_company'].symbol}: supervisor action={action.action_type}: {action.reason}")
-        state["actions"] = [*state.get("actions", []), action]
+        state["actions"] = [*state.get("actions", []), action.model_copy(deep=True)]
         state["should_retry"] = action.next_config is not None and action.action_type not in {"finish", "manual_review"}
         return state
 
@@ -230,7 +305,8 @@ class SupervisedCrawler:
         return state
 
     def _validate_node(self, state: SupervisorState) -> SupervisorState:
-        save_company_memory(self.out_dir, state["memory"])
+        if not state["current_config"].disable_memory:
+            save_company_memory(self.out_dir, state["memory"])
         return state
 
     def _run_crawler_attempt(self, company: Company, config: CrawlAttemptConfig) -> CrawlResult:
@@ -248,12 +324,14 @@ class SupervisedCrawler:
             discovery_mode=config.discovery_mode,
             include_discovery_guesses=config.include_discovery_guesses,
             disable_official_homepage_overrides=config.disable_official_homepage_overrides,
+            disable_predictive_identity=config.disable_predictive_identity,
             rerank_discovery=config.rerank_discovery,
             extract_metadata_with_llm=config.extract_metadata_with_llm,
             latest_only=config.latest_only,
             allow_official_linked_documents_on_robots_unavailable=config.allow_official_linked_documents_on_robots_unavailable,
             prompt_guidance=config.prompt_guidance,
             navigation_memory=config.navigation_memory,
+            identity_name_hint=config.identity_name_hint,
             search_timeout_seconds=config.search_timeout_seconds,
             llm_timeout_seconds=config.llm_timeout_seconds,
             navigation_llm_max_links=config.navigation_llm_max_links,
@@ -265,12 +343,6 @@ class SupervisedCrawler:
         return crawler.crawl_company(company)
 
 
-def resolve_company_identity(company: Company) -> Company:
-    if company.symbol.upper() in {"GOOG", "GOOGL"} and company.name.upper() in {"GOOG", "GOOGL", "GOOGLE"}:
-        return company.model_copy(update={"name": "Alphabet Google"})
-    return company
-
-
 def analyze_crawl_result(result: CrawlResult, config: CrawlAttemptConfig) -> FailureAnalysis:
     if result.transcripts:
         return FailureAnalysis(
@@ -278,6 +350,61 @@ def analyze_crawl_result(result: CrawlResult, config: CrawlAttemptConfig) -> Fai
             summary=f"Saved {len(result.transcripts)} transcript(s).",
             retryable=False,
             evidence_urls=[str(record.source_url) for record in result.transcripts],
+        )
+
+    identity_low_confidence = [failure for failure in result.failures if failure.failure_type == "identity_low_confidence"]
+    if identity_low_confidence:
+        return FailureAnalysis(
+            category="identity_low_confidence",
+            summary="Homepage prediction was low confidence before crawling.",
+            retryable=True,
+            evidence_urls=[failure.url for failure in identity_low_confidence if failure.url],
+        )
+
+    homepage_unverified = [failure for failure in result.failures if failure.failure_type == "homepage_unverified"]
+    if homepage_unverified:
+        return FailureAnalysis(
+            category="homepage_unverified",
+            summary="No predicted homepage could be verified before crawling.",
+            retryable=True,
+            evidence_urls=[failure.url for failure in homepage_unverified if failure.url],
+        )
+
+    navigation_step_failures = [
+        failure
+        for failure in result.failures
+        if failure.failure_type in {
+            "navigation_fetch_failed",
+            "navigation_render_failed",
+            "navigation_llm_failed",
+        }
+    ]
+    if navigation_step_failures:
+        return FailureAnalysis(
+            category="navigation_step_failed",
+            summary="Navigation discovery failed before crawl pages were visited.",
+            retryable=True,
+            evidence_urls=[failure.url for failure in navigation_step_failures if failure.url],
+        )
+
+    crawl_step_failures = [
+        failure
+        for failure in result.failures
+        if failure.failure_type in {
+            "timeout",
+            "http_error",
+            "robots_blocked",
+            "page_render_failed",
+            "page_classification_failed",
+            "document_parse_failed",
+        }
+    ]
+    if crawl_step_failures:
+        return FailureAnalysis(
+            category="crawl_step_failed",
+            summary="A crawl step failed and the current attempt stopped early.",
+            retryable=True,
+            evidence_urls=[failure.url for failure in crawl_step_failures if failure.url],
         )
 
     robots_unavailable = [failure for failure in result.failures if failure.failure_type == "robots_unavailable"]
@@ -366,6 +493,7 @@ def plan_next_action(
             action_type="playwright_retry",
             reason=analysis.summary,
             next_config=config.model_copy(
+                deep=True,
                 update={
                     "attempt": next_attempt,
                     "use_playwright": True,
@@ -375,20 +503,12 @@ def plan_next_action(
             ),
         )
 
-    if analysis.category in {"no_useful_links", "no_transcript_found"} and config.discovery_mode == "nav-first":
-        return SupervisorAction(
-            action_type="search_first",
-            reason=analysis.summary,
-            next_config=config.model_copy(
-                update={"attempt": next_attempt, "discovery_mode": "search-first", "reason": "search_first_retry"}
-            ),
-        )
-
     if analysis.category == "needs_deeper_crawl":
         return SupervisorAction(
             action_type="deeper_crawl",
             reason=analysis.summary,
             next_config=config.model_copy(
+                deep=True,
                 update={
                     "attempt": next_attempt,
                     "max_depth": min(config.max_depth + 1, 6),
@@ -398,13 +518,55 @@ def plan_next_action(
             ),
         )
 
-    resolved = resolve_company_identity(company)
+    if analysis.category in {"identity_low_confidence", "homepage_unverified"}:
+        return SupervisorAction(
+            action_type="identity_retry",
+            reason=analysis.summary,
+            next_config=config.model_copy(
+                deep=True,
+                update={
+                    "attempt": next_attempt,
+                    "reason": f"{analysis.category}_retry",
+                }
+            ),
+        )
+
+    if analysis.category in {"navigation_step_failed", "crawl_step_failed"}:
+        return SupervisorAction(
+            action_type="step_retry",
+            reason=analysis.summary,
+            next_config=config.model_copy(
+                deep=True,
+                update={
+                    "attempt": next_attempt,
+                    "reason": f"{analysis.category}_retry",
+                }
+            ),
+        )
+
+    if analysis.retryable:
+        return SupervisorAction(
+            action_type="retry",
+            reason=analysis.summary,
+            next_config=config.model_copy(
+                deep=True,
+                update={
+                    "attempt": next_attempt,
+                    "reason": f"{analysis.category}_retry",
+                }
+            ),
+        )
+
+    resolved = resolve_company_identity_with_overrides(
+        company,
+        allow_homepage_overrides=not config.disable_official_homepage_overrides,
+    )
     if resolved != company:
         return SupervisorAction(
             action_type="identity_correction",
-            reason=f"Resolved company identity to {resolved.name}.",
+            reason=f"Resolved company identity to {company_display_name(resolved)}.",
             next_company=resolved,
-            next_config=config.model_copy(update={"attempt": next_attempt, "reason": "identity_correction_retry"}),
+            next_config=config.model_copy(deep=True, update={"attempt": next_attempt, "reason": "identity_correction_retry"}),
         )
 
     return SupervisorAction(action_type="finish", reason=analysis.summary)
@@ -433,6 +595,89 @@ def promising_candidate(candidate: CandidatePage) -> bool:
 
 def page_haystack(candidate: CandidatePage) -> str:
     return f"{candidate.url} {candidate.title} {candidate.llm_page_type or ''} {candidate.reason}"
+
+
+def load_navigation_trace(out_dir: Path, company: Company) -> NavigationTrace | None:
+    path = out_dir / company.symbol / "_navigation_trace.json"
+    if not path.exists():
+        return None
+    try:
+        return NavigationTrace.model_validate_json(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def reflection_evidence(
+    result: CrawlResult,
+    analysis: FailureAnalysis,
+    trace: NavigationTrace | None,
+) -> dict[str, Any]:
+    return {
+        "analysis": analysis.model_dump(mode="json"),
+        "visited_count": result.visited_count,
+        "ir_url": result.ir_url,
+        "candidates": [
+            {
+                "url": candidate.url,
+                "title": candidate.title,
+                "depth": candidate.depth,
+                "page_type": candidate.llm_page_type,
+                "reason": candidate.reason,
+            }
+            for candidate in result.candidates[:30]
+        ],
+        "failures": [
+            {
+                "url": failure.url,
+                "failure_type": failure.failure_type,
+                "message": failure.message[:160],
+            }
+            for failure in result.failures[:30]
+        ],
+        "navigation_steps": [
+            {
+                "current_url": step.current_url,
+                "title": step.title,
+                "chosen_urls": step.chosen_urls,
+                "rejected_urls": step.rejected_urls,
+                "reason": step.reason,
+                "stop_reason": step.stop_reason,
+            }
+            for step in (trace.steps if trace else [])[:20]
+        ],
+    }
+
+
+URL_EVIDENCE_KEYS = {"url", "urls", "ir_url", "source_url", "current_url", "chosen_urls", "rejected_urls", "evidence_urls"}
+
+
+def filter_reflection_urls_to_evidence(reflection: CrawlReflection, evidence: dict[str, Any]) -> CrawlReflection:
+    allowed_urls = evidence_url_set(evidence)
+    return reflection.model_copy(
+        update={
+            "preferred_urls": [url for url in reflection.preferred_urls if normalize_url(url) in allowed_urls],
+            "avoid_urls": [url for url in reflection.avoid_urls if normalize_url(url) in allowed_urls],
+        }
+    )
+
+
+def evidence_url_set(evidence: dict[str, Any]) -> set[str]:
+    urls: set[str] = set()
+
+    def collect(value: Any, *, parent_key: str | None = None) -> None:
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                collect(nested, parent_key=key if key in URL_EVIDENCE_KEYS else None)
+            return
+        if isinstance(value, list):
+            for item in value:
+                collect(item, parent_key=parent_key)
+            return
+        if isinstance(value, str) and parent_key in URL_EVIDENCE_KEYS and value.startswith(("http://", "https://")):
+            urls.add(normalize_url(value))
+
+    collect(evidence)
+    return urls
 
 
 def looks_like_transcript_document(url: str) -> bool:

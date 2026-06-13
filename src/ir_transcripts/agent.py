@@ -9,10 +9,15 @@ from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama
 
+from .identity import company_display_name
 from .models import (
     CandidateLink,
     Company,
     CompanyMemory,
+    CompanyNavigationMemory,
+    CrawlReflection,
+    HomepagePrediction,
+    HomepageValidationDecision,
     IRDiscoveryCandidate,
     IRDiscoveryDecision,
     NavigationDecision,
@@ -130,14 +135,18 @@ class IRDiscoveryAgent:
                 [
                     (
                         "system",
-                        "Select likely official company investor-relations seed URLs from search results. "
-                        "Prefer official company-hosted IR pages. Accept vendor-hosted IR pages only when "
-                        "the title/snippet strongly indicates they are official for the company. Avoid "
-                        "third-party finance, transcript, news, SEC, careers, support, and store pages.",
+                        "Select official company homepage or investor-relations seed URLs from search results. "
+                        "Choose only provided URLs. Prefer the company homepage, official investor-relations "
+                        "home, official financial/quarterly results pages, or official vendor-hosted IR pages. "
+                        "Reject similarly named but different companies when the title, host, or snippet does "
+                        "not match the requested company/ticker. Avoid third-party finance, transcript archive, "
+                        "news, SEC, careers, support, and store pages. Return only official seeds.",
                     ),
                     (
                         "human",
                         "Company: {company_name} ({ticker})\n"
+                        "Run guidance:\n{guidance}\n\n"
+                        "Memory summary:\n{memory_summary}\n\n"
                         "Candidates as JSON:\n{candidates_json}\n\n"
                         "Return up to {limit} URLs in ranked order.\n"
                         "{format_instructions}",
@@ -155,6 +164,8 @@ class IRDiscoveryAgent:
         ticker: str,
         candidates: list[IRDiscoveryCandidate],
         limit: int,
+        guidance: PromptGuidance | None = None,
+        navigation_memory: CompanyNavigationMemory | None = None,
     ) -> IRDiscoveryDecision:
         compact = [
             {
@@ -171,11 +182,125 @@ class IRDiscoveryAgent:
             {
                 "company_name": company_name,
                 "ticker": ticker,
+                "guidance": guidance_for_agent(guidance, "navigation"),
+                "memory_summary": discovery_memory_summary(navigation_memory),
                 "candidates_json": json.dumps(compact, ensure_ascii=True),
                 "limit": limit,
                 "format_instructions": self.parser.get_format_instructions(),
             }
         )
+
+
+class HomepagePredictionAgent:
+    """Predicts official company homepages from a ticker before discovery."""
+
+    def __init__(self, model: str, base_url: str | None = None) -> None:
+        self.chain = (
+            ChatPromptTemplate.from_messages(
+                [
+                    (
+                        "system",
+                        "Predict official public-company homepage URLs from a ticker. "
+                        "Return JSON only. Predict homepages only, never investor-relations, "
+                        "transcript, SEC, finance portal, news, or third-party URLs. "
+                        "If uncertain, return low confidence and few or no URLs.",
+                    ),
+                    (
+                        "human",
+                        "Ticker: {ticker}\n"
+                        "Memory-backed company name hint: {name_hint}\n\n"
+                        "Return exactly:\n"
+                        "{{\"homepage_urls\":[\"https://www.example.com\"],"
+                        "\"confidence\":0.8,\"reason\":\"short reason\"}}",
+                    ),
+                ]
+            )
+            | build_llm(model, base_url=base_url, json_mode=True)
+        )
+
+    def predict(self, *, ticker: str, name_hint: str | None = None) -> HomepagePrediction:
+        message = self.chain.invoke(
+            {
+                "ticker": ticker,
+                "name_hint": name_hint or "None.",
+            }
+        )
+        return HomepagePrediction.model_validate(extract_json_object(message.content))
+
+
+class HomepageValidationAgent:
+    """Validates fetched homepage evidence and extracts official IR links."""
+
+    def __init__(
+        self,
+        model: str,
+        base_url: str | None = None,
+        *,
+        max_links: int = 16,
+        text_chars: int = 1200,
+    ) -> None:
+        self.max_links = max_links
+        self.text_chars = text_chars
+        self.chain = (
+            ChatPromptTemplate.from_messages(
+                [
+                    (
+                        "system",
+                        "Validate whether a fetched page is an official company homepage. "
+                        "Use only page evidence and provided links. Return JSON only. "
+                        "Accept only official home/about/corporate pages. Reject IR pages, "
+                        "finance portals, news sites, SEC pages, transcript archives, and unofficial pages.",
+                    ),
+                    (
+                        "human",
+                        "Ticker: {ticker}\n"
+                        "Memory-backed name hint: {name_hint}\n"
+                        "URL: {url}\n"
+                        "Title: {title}\n"
+                        "Text:\n{text}\n\n"
+                        "Links JSON:\n{links_json}\n\n"
+                        "Return exactly:\n"
+                        "{{\"is_official\":true,\"confidence\":0.8,"
+                        "\"linked_ir_urls\":[\"https://example.com/investors\"],"
+                        "\"reason\":\"short evidence-based reason\"}}",
+                    ),
+                ]
+            )
+            | build_llm(model, base_url=base_url, json_mode=True)
+        )
+
+    def validate(
+        self,
+        *,
+        ticker: str,
+        name_hint: str | None,
+        url: str,
+        title: str,
+        text: str,
+        links: list[CandidateLink],
+    ) -> HomepageValidationDecision:
+        compact_links = [
+            {"url": link.url, "label": compact_text(link.label, 80), "context": compact_text(link.reason, 80)}
+            for link in links[: self.max_links]
+        ]
+        message = self.chain.invoke(
+            {
+                "ticker": ticker,
+                "name_hint": name_hint or "None.",
+                "url": url,
+                "title": title,
+                "text": compact_text(text, self.text_chars),
+                "links_json": json.dumps(compact_links, ensure_ascii=True),
+            }
+        )
+        decision = HomepageValidationDecision.model_validate(extract_json_object(message.content))
+        candidate_urls = {link.url for link in links}
+        decision.linked_ir_urls = [
+            url
+            for url in decision.linked_ir_urls
+            if url in candidate_urls
+        ]
+        return decision
 
 
 class PromptPlannerAgent:
@@ -214,12 +339,59 @@ class PromptPlannerAgent:
         )
         message = self.chain.invoke(
             {
-                "company": f"{company.name} ({company.symbol})",
+                "company": f"{company_display_name(company)} ({company.symbol})",
                 "memory_json": memory_json,
             }
         )
         model_guidance = sanitize_prompt_guidance(PromptGuidance.model_validate(extract_json_object(message.content)))
         return merge_prompt_guidance(model_guidance, guidance_from_memory(memory))
+
+
+class CrawlReflectionAgent:
+    """Learns advisory navigation guidance from a failed supervised attempt."""
+
+    def __init__(self, model: str, base_url: str | None = None, *, text_chars: int = 1800) -> None:
+        self.text_chars = text_chars
+        self.chain = (
+            ChatPromptTemplate.from_messages(
+                [
+                    (
+                        "system",
+                        "Analyze a failed official investor-relations transcript crawl. "
+                        "Return company-specific advisory memory updates for the next attempt. "
+                        "Use only evidence in the crawl summary. Do not invent URLs. "
+                        "Do not grant permissions, ignore robots.txt, fail open, or recommend third-party transcript sources. "
+                        "Return JSON only.",
+                    ),
+                    (
+                        "human",
+                        "Company: {company}\n"
+                        "Crawl evidence JSON:\n{evidence_json}\n\n"
+                        "Return exactly:\n"
+                        "{{\"preferred_urls\":[\"https://example.com/earnings\"],"
+                        "\"preferred_terms\":[\"quarterly results detail pages\"],"
+                        "\"avoid_urls\":[\"https://example.com/shareholders\"],"
+                        "\"avoid_terms\":[\"shareholders meeting\"],"
+                        "\"prompt_guidance\":{{\"priority_terms\":[\"term\"],\"avoid_terms\":[\"term\"],"
+                        "\"navigation_guidance\":\"short guidance\","
+                        "\"transcript_guidance\":\"short guidance\","
+                        "\"risk_notes\":[\"short note\"]}},"
+                        "\"reason\":\"short reason\"}}",
+                    ),
+                ]
+            )
+            | build_llm(model, base_url=base_url, json_mode=True)
+        )
+
+    def reflect(self, *, company: Company, evidence: dict) -> CrawlReflection:
+        evidence_json = compact_text(json.dumps(evidence, ensure_ascii=True), self.text_chars)
+        message = self.chain.invoke(
+            {
+                "company": f"{company_display_name(company)} ({company.symbol})",
+                "evidence_json": evidence_json,
+            }
+        )
+        return sanitize_crawl_reflection(CrawlReflection.model_validate(extract_json_object(message.content)))
 
 
 class LinkSelectionAgent:
@@ -808,6 +980,16 @@ def link_matches_intrinsic_avoid_terms(link: CandidateLink) -> bool:
             "youtu.be",
             "presentation",
             "webcast-only",
+            "/chinese/",
+            "/schinese/",
+            "/tchinese/",
+            "/japanese/",
+            "/korean/",
+            "/zh/",
+            "/zh-cn/",
+            "/zh-tw/",
+            "/ja/",
+            "/ko/",
         )
     )
 
@@ -891,6 +1073,29 @@ def combine_guidance(base_guidance: str, repair_guidance: str | None) -> str:
     return compact_text(f"{base_guidance} Repair: {repair_guidance}", 500)
 
 
+def discovery_memory_summary(navigation_memory: CompanyNavigationMemory | None) -> str:
+    if not navigation_memory:
+        return "None."
+    parts = []
+    if navigation_memory.preferred_hosts:
+        parts.append(f"Prefer hosts: {', '.join(navigation_memory.preferred_hosts[:5])}.")
+    if navigation_memory.successful_hosts:
+        parts.append(f"Prior successful hosts: {', '.join(navigation_memory.successful_hosts[:5])}.")
+    if navigation_memory.known_ir_home_urls:
+        parts.append(f"Known IR homes: {', '.join(navigation_memory.known_ir_home_urls[:3])}.")
+    if navigation_memory.known_event_listing_urls:
+        parts.append(f"Known earnings/results pages: {', '.join(navigation_memory.known_event_listing_urls[:3])}.")
+    if navigation_memory.known_transcript_urls:
+        parts.append(f"Known transcript URLs: {', '.join(navigation_memory.known_transcript_urls[:3])}.")
+    if navigation_memory.low_value_hosts:
+        parts.append(f"Avoid low-value hosts: {', '.join(navigation_memory.low_value_hosts[:5])}.")
+    if navigation_memory.low_value_path_terms:
+        parts.append(f"Avoid path terms: {', '.join(navigation_memory.low_value_path_terms[:8])}.")
+    if navigation_memory.robots_blocked_hosts:
+        parts.append(f"Robots-risk hosts: {', '.join(navigation_memory.robots_blocked_hosts[:5])}.")
+    return compact_text(" ".join(parts), 900) or "None."
+
+
 def sanitize_prompt_guidance(guidance: PromptGuidance) -> PromptGuidance:
     banned = ("ignore robots", "disable robots", "fail open", "third-party transcript")
     risk_notes = [
@@ -898,12 +1103,30 @@ def sanitize_prompt_guidance(guidance: PromptGuidance) -> PromptGuidance:
         if not any(token in note.lower() for token in banned)
     ]
     return PromptGuidance(
-        priority_terms=[compact_text(term, 80) for term in guidance.priority_terms[:10]],
-        avoid_terms=[compact_text(term, 80) for term in guidance.avoid_terms[:10]],
-        navigation_guidance=compact_text(guidance.navigation_guidance, 280),
-        transcript_guidance=compact_text(guidance.transcript_guidance, 280),
+        priority_terms=[compact_text(term, 80) for term in guidance.priority_terms[:10] if safe_reflection_text(term, banned)],
+        avoid_terms=[compact_text(term, 80) for term in guidance.avoid_terms[:10] if safe_reflection_text(term, banned)],
+        navigation_guidance="" if not safe_reflection_text(guidance.navigation_guidance, banned) else compact_text(guidance.navigation_guidance, 280),
+        transcript_guidance="" if not safe_reflection_text(guidance.transcript_guidance, banned) else compact_text(guidance.transcript_guidance, 280),
         risk_notes=risk_notes,
     )
+
+
+def sanitize_crawl_reflection(reflection: CrawlReflection) -> CrawlReflection:
+    banned = ("ignore robots", "disable robots", "fail open", "third-party", "quartr", "seeking alpha")
+    return CrawlReflection(
+        preferred_urls=[url for url in reflection.preferred_urls[:8] if safe_reflection_text(url, banned)],
+        preferred_terms=[compact_text(term, 80) for term in reflection.preferred_terms[:10] if safe_reflection_text(term, banned)],
+        avoid_urls=[url for url in reflection.avoid_urls[:12] if safe_reflection_text(url, banned)],
+        avoid_terms=[compact_text(term, 80) for term in reflection.avoid_terms[:12] if safe_reflection_text(term, banned)],
+        prompt_guidance=sanitize_prompt_guidance(reflection.prompt_guidance),
+        reason=compact_text(reflection.reason, 240),
+    )
+
+
+def safe_reflection_text(value: str, banned: tuple[str, ...]) -> bool:
+    lowered = value.lower()
+    placeholders = ("short guidance", "short reason", "term", "ir-related")
+    return bool(value.strip()) and lowered not in placeholders and not any(token in lowered for token in banned)
 
 
 def guidance_from_memory(memory: CompanyMemory) -> PromptGuidance:
@@ -918,6 +1141,12 @@ def guidance_from_memory(memory: CompanyMemory) -> PromptGuidance:
         append_unique_text(priority_terms, "known IR home URL")
     if navigation_memory.known_event_listing_urls:
         append_unique_text(priority_terms, "known event listing URL")
+    for url in navigation_memory.known_event_listing_urls:
+        lowered = url.lower()
+        if "quarterly-results" in lowered:
+            append_unique_text(priority_terms, "quarterly results detail pages")
+        if "transcript" in lowered:
+            append_unique_text(priority_terms, "transcript links")
     if navigation_memory.low_value_hosts:
         append_unique_text(avoid_terms, "previously low-value host")
     for term in navigation_memory.low_value_path_terms:

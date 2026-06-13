@@ -9,20 +9,12 @@ from dotenv import load_dotenv
 
 from .crawler import TranscriptCrawler
 from .http import DEFAULT_USER_AGENT, HttpClient, random_browser_user_agent
+from .identity import COMMON_COMPANY_NAMES, resolve_company_identity
 from .indexing import index_transcripts
 from .models import Company, CrawlAttemptConfig
 from .orchestration import run_supervised_company
 from .runtime import ProgressReporter
 from .sp500 import load_sp500
-
-
-COMMON_COMPANY_NAMES = {
-    "AAPL": "Apple",
-    "GOOG": "Alphabet Google",
-    "GOOGL": "Alphabet Google",
-    "MSFT": "Microsoft",
-    "NVDA": "NVIDIA",
-}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -94,9 +86,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable curated official homepage starts such as GOOG -> abc.xyz for blind discovery tests",
     )
+    parser.add_argument(
+        "--disable-predictive-identity",
+        action="store_true",
+        help="Disable local Ollama homepage prediction for ticker-only company identities",
+    )
     parser.add_argument("--rerank-discovery", action="store_true", help="Use local Ollama to rerank discovery search results")
     parser.add_argument("--metadata-llm", action="store_true", help="Use a second local Ollama pass for confirmed transcript metadata")
     parser.add_argument("--prompt-planner", action="store_true", help="Use a local Ollama planner to create advisory prompts from company memory in supervised mode")
+    parser.add_argument(
+        "--disable-memory",
+        action="store_true",
+        help=(
+            "Ignore existing company memory and leave memory files unchanged. "
+            "Supervised retries may still use memory learned during this run."
+        ),
+    )
     parser.add_argument("--latest-only", action="store_true", help="Keep only the latest detected transcript per company")
     parser.add_argument(
         "--allow-official-linked-documents-on-robots-unavailable",
@@ -130,25 +135,37 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
-    load_dotenv()
-    args = build_parser().parse_args()
-
-    if args.symbols:
-        wanted = {symbol.upper() for symbol in args.symbols}
+def load_requested_companies(symbols: list[str] | None) -> list[Company]:
+    wanted_symbols = [symbol.upper() for symbol in symbols] if symbols else []
+    if wanted_symbols:
+        wanted = set(wanted_symbols)
         try:
             companies = load_sp500()
         except Exception:
             companies = [
-                Company(symbol=symbol, name=COMMON_COMPANY_NAMES.get(symbol, symbol))
-                for symbol in sorted(wanted)
+                Company(symbol=symbol, name=COMMON_COMPANY_NAMES.get(symbol))
+                for symbol in wanted_symbols
             ]
-    else:
-        companies = load_sp500()
+        companies = [
+            resolve_company_identity(company)
+            for company in companies
+            if company.symbol.upper() in wanted
+        ]
+        found = {company.symbol.upper() for company in companies}
+        companies.extend(
+            resolve_company_identity(Company(symbol=symbol, name=COMMON_COMPANY_NAMES.get(symbol)))
+            for symbol in wanted_symbols
+            if symbol not in found
+        )
+        return companies
+    return load_sp500()
 
-    if args.symbols:
-        wanted = {symbol.upper() for symbol in args.symbols}
-        companies = [company for company in companies if company.symbol.upper() in wanted]
+
+def main() -> None:
+    load_dotenv()
+    args = build_parser().parse_args()
+
+    companies = load_requested_companies(args.symbols)
 
     if args.limit is not None:
         companies = companies[: args.limit]
@@ -178,6 +195,7 @@ def main() -> None:
         discovery_mode=args.discovery_mode,
         include_discovery_guesses=args.include_discovery_guesses,
         disable_official_homepage_overrides=args.disable_official_homepage_overrides,
+        disable_predictive_identity=args.disable_predictive_identity,
         rerank_discovery=args.rerank_discovery,
         extract_metadata_with_llm=args.metadata_llm,
         latest_only=args.latest_only,
@@ -201,11 +219,13 @@ def main() -> None:
         discovery_mode=args.discovery_mode,
         include_discovery_guesses=args.include_discovery_guesses,
         disable_official_homepage_overrides=args.disable_official_homepage_overrides,
+        disable_predictive_identity=args.disable_predictive_identity,
         rerank_discovery=args.rerank_discovery,
         extract_metadata_with_llm=args.metadata_llm,
         latest_only=args.latest_only,
         allow_official_linked_documents_on_robots_unavailable=args.allow_official_linked_documents_on_robots_unavailable,
         use_prompt_planner=args.prompt_planner,
+        disable_memory=args.disable_memory,
         search_timeout_seconds=args.search_timeout,
         llm_timeout_seconds=args.llm_timeout,
         navigation_llm_max_links=args.navigation_llm_max_links,

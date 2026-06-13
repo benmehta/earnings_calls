@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from urllib.parse import urlparse
 
-from .models import Company, CompanyMemory, CrawlResult, FailureAnalysis
+from .models import Company, CompanyMemory, CrawlReflection, CrawlResult, FailureAnalysis, PromptGuidance
 from .urls import host
 
 
@@ -38,7 +38,7 @@ def remember_crawl_result(memory: CompanyMemory, result: CrawlResult, analysis: 
                 memory.official_hosts = append_unique(memory.official_hosts, url_host)
             if is_ir_home_url(url):
                 navigation_memory.known_ir_home_urls = append_unique(navigation_memory.known_ir_home_urls, url)
-            if is_event_listing_url(url):
+            if is_event_listing_url(url) and not low_value_memory_path(url):
                 navigation_memory.known_event_listing_urls = append_unique(navigation_memory.known_event_listing_urls, url)
             remember_low_value_url(navigation_memory.low_value_hosts, navigation_memory.low_value_path_terms, url)
 
@@ -67,6 +67,69 @@ def remember_crawl_result(memory: CompanyMemory, result: CrawlResult, analysis: 
     return memory
 
 
+def apply_crawl_reflection(memory: CompanyMemory, reflection: CrawlReflection) -> CompanyMemory:
+    navigation_memory = memory.navigation_memory
+    reflection_preferred_hosts = {host(url) for url in reflection.preferred_urls if host(url)}
+    for url in reflection.preferred_urls:
+        memory.known_ir_urls = append_unique(memory.known_ir_urls, url)
+        if is_ir_home_url(url):
+            navigation_memory.known_ir_home_urls = append_unique(navigation_memory.known_ir_home_urls, url)
+        if is_event_listing_url(url) or looks_like_quarterly_detail_url(url):
+            navigation_memory.known_event_listing_urls = append_unique(navigation_memory.known_event_listing_urls, url)
+    for url in reflection.avoid_urls:
+        memory.rejected_urls = append_unique(memory.rejected_urls, url)
+        remember_low_value_url(navigation_memory.low_value_hosts, navigation_memory.low_value_path_terms, url)
+        avoided_host = host(url)
+        if (
+            avoided_host
+            and avoided_host not in reflection_preferred_hosts
+            and avoided_host not in navigation_memory.preferred_hosts
+            and avoided_host not in navigation_memory.successful_hosts
+            and not low_value_memory_path(url)
+        ):
+            navigation_memory.low_value_hosts = append_unique(navigation_memory.low_value_hosts, avoided_host)
+    for term in reflection.avoid_terms:
+        navigation_memory.low_value_path_terms = append_unique(navigation_memory.low_value_path_terms, term)
+    if reflection.prompt_guidance or reflection.preferred_terms or reflection.avoid_terms:
+        reflected_guidance = reflection.prompt_guidance.model_copy(
+            update={
+                "priority_terms": merge_unique(
+                    reflection.prompt_guidance.priority_terms,
+                    reflection.preferred_terms,
+                    limit=10,
+                ),
+                "avoid_terms": merge_unique(
+                    reflection.prompt_guidance.avoid_terms,
+                    reflection.avoid_terms,
+                    limit=10,
+                ),
+            }
+        )
+        memory.prompt_guidance = merge_prompt_guidance(memory.prompt_guidance, reflected_guidance)
+    return memory
+
+
+def merge_prompt_guidance(existing: PromptGuidance | None, reflected: PromptGuidance) -> PromptGuidance:
+    if existing is None:
+        return reflected
+    return PromptGuidance(
+        priority_terms=merge_unique(reflected.priority_terms, existing.priority_terms, limit=10),
+        avoid_terms=merge_unique(reflected.avoid_terms, existing.avoid_terms, limit=10),
+        navigation_guidance=reflected.navigation_guidance or existing.navigation_guidance,
+        transcript_guidance=reflected.transcript_guidance or existing.transcript_guidance,
+        risk_notes=merge_unique(reflected.risk_notes, existing.risk_notes, limit=5),
+    )
+
+
+def merge_unique(primary: list[str], secondary: list[str], *, limit: int) -> list[str]:
+    merged: list[str] = []
+    for value in [*primary, *secondary]:
+        append_unique(merged, value)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
 def append_unique(values: list[str], value: str) -> list[str]:
     if value not in values:
         values.append(value)
@@ -75,6 +138,28 @@ def append_unique(values: list[str], value: str) -> list[str]:
 
 def low_value_memory_host(value: str) -> bool:
     return any(token in value.lower() for token in ("blog.", "youtube.com", "youtu.be"))
+
+
+def low_value_memory_path(url: str) -> bool:
+    path = urlparse(url).path.lower()
+    return any(
+        token in path
+        for token in (
+            "agm",
+            "annual-meeting",
+            "annual-reports",
+            "board-of-directors",
+            "governance",
+            "japanese/",
+            "press-release",
+            "proxy",
+            "schinese/",
+            "shareholders-meeting",
+            "shareholders-meetings",
+            "zh/",
+            "chinese/",
+        )
+    )
 
 
 def is_ir_home_url(url: str) -> bool:
@@ -87,11 +172,32 @@ def is_event_listing_url(url: str) -> bool:
     return any(token in path for token in ("/events", "/earnings", "/financial-results", "/financial-reports")) and "event-details" not in path
 
 
+def looks_like_quarterly_detail_url(url: str) -> bool:
+    path = urlparse(url).path.lower()
+    return "/quarterly-results/" in path and any(f"/q{quarter}" in path for quarter in range(1, 5))
+
+
 def remember_low_value_url(low_value_hosts: list[str], low_value_path_terms: list[str], url: str) -> None:
     url_host = host(url)
     path = urlparse(url).path.lower()
     if url_host and low_value_memory_host(url_host):
         append_unique(low_value_hosts, url_host)
-    for token in ("blog", "youtube", "presentation", "webcast", "press-release"):
+    for token in (
+        "agm",
+        "annual-reports",
+        "blog",
+        "board-of-directors",
+        "chinese/",
+        "governance",
+        "japanese/",
+        "presentation",
+        "press-release",
+        "proxy",
+        "schinese/",
+        "shareholders-meeting",
+        "shareholders-meetings",
+        "webcast",
+        "youtube",
+    ):
         if token in f"{url_host or ''} {path}":
             append_unique(low_value_path_terms, token)

@@ -5,7 +5,7 @@ import json
 
 from dotenv import load_dotenv
 
-from .cli import COMMON_COMPANY_NAMES
+from .identity import COMMON_COMPANY_NAMES, resolve_company_identity
 from .models import Company
 from .search import discover_ir_candidates
 
@@ -27,7 +27,7 @@ def main() -> None:
     load_dotenv()
     args = build_parser().parse_args()
     symbol = args.symbol.upper()
-    company = Company(symbol=symbol, name=args.name or COMMON_COMPANY_NAMES.get(symbol, symbol))
+    company = resolve_company_identity(Company(symbol=symbol, name=args.name or COMMON_COMPANY_NAMES.get(symbol)))
     candidates = discover_ir_candidates(
         company,
         max_results=args.max_results,
