@@ -35,6 +35,10 @@ def resolve_company_identity(company: Company) -> Company:
     return resolve_company_identity_with_overrides(company)
 
 
+def should_save_memory_incrementally(config: CrawlAttemptConfig) -> bool:
+    return not config.disable_memory and not config.no_memory_write
+
+
 class SupervisorState(TypedDict, total=False):
     original_company: Company
     current_company: Company
@@ -76,12 +80,13 @@ class SupervisedCrawler:
 
     def run_company(self, company: Company) -> SupervisorRunResult:
         self.progress.log(f"{company.symbol}: supervised run starting")
-        use_persisted_memory = not self.base_config.disable_memory
+        load_persisted_memory = not self.base_config.disable_memory
+        write_memory = not self.base_config.no_memory_write
         initial_state: SupervisorState = {
             "original_company": company,
             "current_company": company,
             "current_config": self.base_config.model_copy(update={"attempt": 1, "reason": "initial"}),
-            "memory": load_company_memory(self.out_dir, company) if use_persisted_memory else CompanyMemory(company=company),
+            "memory": load_company_memory(self.out_dir, company) if load_persisted_memory else CompanyMemory(company=company),
             "attempts": [],
             "analyses": [],
             "actions": [],
@@ -94,7 +99,7 @@ class SupervisedCrawler:
         analyses = final_state.get("analyses", [])
         actions = final_state.get("actions", [])
         memory = final_state.get("memory") or CompanyMemory(company=company)
-        path = save_company_memory(self.out_dir, memory) if use_persisted_memory else None
+        path = save_company_memory(self.out_dir, memory) if write_memory else None
         self.progress.log(f"{company.symbol}: supervised run finished with status={supervisor_status(result, actions)}")
         return SupervisorRunResult(
             company=company,
@@ -194,7 +199,7 @@ class SupervisedCrawler:
                     "identity_name_hint": memory_name_hint,
                 }
             )
-            if not config.disable_memory:
+            if should_save_memory_incrementally(config):
                 save_company_memory(self.out_dir, memory)
         else:
             state["current_config"] = config.model_copy(
@@ -234,7 +239,7 @@ class SupervisedCrawler:
         memory = remember_crawl_result(state["memory"], result, analysis)
         state["memory"] = memory
         state["analyses"] = [*state.get("analyses", []), analysis]
-        if not config.disable_memory:
+        if should_save_memory_incrementally(config):
             save_company_memory(self.out_dir, memory)
         return state
 
@@ -275,7 +280,7 @@ class SupervisedCrawler:
             self.progress.log(f"{company.symbol}: reflection guidance active")
         memory = apply_crawl_reflection(state["memory"], reflection)
         state["memory"] = memory
-        if not config.disable_memory:
+        if should_save_memory_incrementally(config):
             save_company_memory(self.out_dir, memory)
         return state
 
@@ -305,7 +310,7 @@ class SupervisedCrawler:
         return state
 
     def _validate_node(self, state: SupervisorState) -> SupervisorState:
-        if not state["current_config"].disable_memory:
+        if should_save_memory_incrementally(state["current_config"]):
             save_company_memory(self.out_dir, state["memory"])
         return state
 

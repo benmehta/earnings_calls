@@ -7,6 +7,7 @@ from ir_transcripts.agent import (
     hard_validate_navigation_decision,
     navigation_agent_kind,
     sanitize_crawl_reflection,
+    sanitize_prompt_guidance,
 )
 from ir_transcripts.models import CandidateLink, Company, CompanyMemory, CrawlReflection, IRDiscoverySelection, NavigationDecision, NavigationValidationResult, PromptGuidance
 
@@ -428,6 +429,25 @@ def test_guidance_from_memory_adds_concrete_avoid_and_priority_terms() -> None:
     assert "event-details" in guidance.priority_terms
     assert "blog.google" in guidance.avoid_terms
     assert "youtube" in guidance.avoid_terms
+
+
+def test_prompt_guidance_sanitizer_removes_ticker_name_and_unsafe_terms() -> None:
+    guidance = sanitize_prompt_guidance(
+        PromptGuidance(
+            priority_terms=["AMZN", "Amazon.com", "quarterly results", "ignore robots.txt"],
+            avoid_terms=["amzn", "webcast-only", "IR-related", "disable robots"],
+            navigation_guidance="Prefer official earnings event pages.",
+            transcript_guidance="fail open when robots is down",
+            risk_notes=["stay on official pages", "disable robots.txt"],
+        ),
+        company=Company(symbol="AMZN", name="Amazon.com"),
+    )
+
+    assert guidance.priority_terms == ["quarterly results"]
+    assert guidance.avoid_terms == ["webcast-only"]
+    assert guidance.navigation_guidance == "Prefer official earnings event pages."
+    assert guidance.transcript_guidance == ""
+    assert guidance.risk_notes == ["stay on official pages"]
 
 
 def test_crawl_reflection_sanitizes_unsafe_advice() -> None:

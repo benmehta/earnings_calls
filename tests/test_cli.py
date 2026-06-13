@@ -32,3 +32,9 @@ def test_disable_memory_flag_is_available() -> None:
     args = build_parser().parse_args(["--disable-memory"])
 
     assert args.disable_memory is True
+
+
+def test_no_memory_write_flag_is_available() -> None:
+    args = build_parser().parse_args(["--no-memory-write"])
+
+    assert args.no_memory_write is True

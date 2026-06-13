@@ -97,10 +97,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--disable-memory",
         action="store_true",
-        help=(
-            "Ignore existing company memory and leave memory files unchanged. "
-            "Supervised retries may still use memory learned during this run."
-        ),
+        help="Start supervised runs from blank company memory, then merge learned memory into the memory file at the end.",
+    )
+    parser.add_argument(
+        "--no-memory-write",
+        action="store_true",
+        help="Do not write company memory after supervised runs. Retries may still use memory learned during this run.",
     )
     parser.add_argument("--latest-only", action="store_true", help="Keep only the latest detected transcript per company")
     parser.add_argument(
@@ -226,6 +228,7 @@ def main() -> None:
         allow_official_linked_documents_on_robots_unavailable=args.allow_official_linked_documents_on_robots_unavailable,
         use_prompt_planner=args.prompt_planner,
         disable_memory=args.disable_memory,
+        no_memory_write=args.no_memory_write,
         search_timeout_seconds=args.search_timeout,
         llm_timeout_seconds=args.llm_timeout,
         navigation_llm_max_links=args.navigation_llm_max_links,

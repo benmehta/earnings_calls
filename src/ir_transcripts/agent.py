@@ -313,14 +313,28 @@ class PromptPlannerAgent:
                 [
                     (
                         "system",
-                        "Create brief advisory guidance for IR crawler agents. "
-                        "Do not grant permissions. Do not suggest ignoring robots.txt. "
+                        "Create brief advisory guidance for official investor-relations transcript crawler agents. "
+                        "Use only the supplied company memory. Do not infer or invent URLs, hosts, company names, "
+                        "permissions, or facts not present in memory. Guidance is advisory only: it must not override "
+                        "robots.txt, strict transcript detection, official-source requirements, or homepage validation. "
+                        "Write reusable navigation and transcript-selection patterns, not broad search queries. "
+                        "Priority terms should name concrete page/link patterns such as 'quarterly results', "
+                        "'event-detail pages', 'earnings call transcript', or 'speaker turns'. "
+                        "Avoid terms should name concrete low-value patterns such as 'blog', 'webcast-only', "
+                        "'presentation', 'shareholders meeting', or non-English path variants. "
+                        "Do not output the ticker, company name, generic placeholders, or plain words like "
+                        "'IR-related' as priority_terms or avoid_terms. "
+                        "Do not recommend third-party transcript sources, SEC/finance portals, news sites, "
+                        "or any action that ignores, disables, bypasses, or fails open on robots.txt. "
                         "Return JSON only.",
                     ),
                     (
                         "human",
                         "Company: {company}\n"
                         "Memory JSON:\n{memory_json}\n\n"
+                        "Return empty arrays/strings when memory is too thin for specific guidance. "
+                        "Do not include URLs unless they already appear in memory, and prefer describing URL patterns "
+                        "over copying full URLs. "
                         "Return exactly:\n"
                         "{{\"priority_terms\":[\"term\"],\"avoid_terms\":[\"term\"],"
                         "\"navigation_guidance\":\"short guidance\","
@@ -343,7 +357,10 @@ class PromptPlannerAgent:
                 "memory_json": memory_json,
             }
         )
-        model_guidance = sanitize_prompt_guidance(PromptGuidance.model_validate(extract_json_object(message.content)))
+        model_guidance = sanitize_prompt_guidance(
+            PromptGuidance.model_validate(extract_json_object(message.content)),
+            company=company,
+        )
         return merge_prompt_guidance(model_guidance, guidance_from_memory(memory))
 
 
@@ -1096,15 +1113,24 @@ def discovery_memory_summary(navigation_memory: CompanyNavigationMemory | None) 
     return compact_text(" ".join(parts), 900) or "None."
 
 
-def sanitize_prompt_guidance(guidance: PromptGuidance) -> PromptGuidance:
+def sanitize_prompt_guidance(guidance: PromptGuidance, *, company: Company | None = None) -> PromptGuidance:
     banned = ("ignore robots", "disable robots", "fail open", "third-party transcript")
     risk_notes = [
         note for note in guidance.risk_notes[:5]
         if not any(token in note.lower() for token in banned)
     ]
+    banned_exact_terms = prompt_guidance_banned_exact_terms(company)
     return PromptGuidance(
-        priority_terms=[compact_text(term, 80) for term in guidance.priority_terms[:10] if safe_reflection_text(term, banned)],
-        avoid_terms=[compact_text(term, 80) for term in guidance.avoid_terms[:10] if safe_reflection_text(term, banned)],
+        priority_terms=[
+            compact_text(term, 80)
+            for term in guidance.priority_terms[:10]
+            if safe_prompt_guidance_term(term, banned, banned_exact_terms)
+        ],
+        avoid_terms=[
+            compact_text(term, 80)
+            for term in guidance.avoid_terms[:10]
+            if safe_prompt_guidance_term(term, banned, banned_exact_terms)
+        ],
         navigation_guidance="" if not safe_reflection_text(guidance.navigation_guidance, banned) else compact_text(guidance.navigation_guidance, 280),
         transcript_guidance="" if not safe_reflection_text(guidance.transcript_guidance, banned) else compact_text(guidance.transcript_guidance, 280),
         risk_notes=risk_notes,
@@ -1127,6 +1153,23 @@ def safe_reflection_text(value: str, banned: tuple[str, ...]) -> bool:
     lowered = value.lower()
     placeholders = ("short guidance", "short reason", "term", "ir-related")
     return bool(value.strip()) and lowered not in placeholders and not any(token in lowered for token in banned)
+
+
+def safe_prompt_guidance_term(value: str, banned: tuple[str, ...], banned_exact_terms: set[str]) -> bool:
+    lowered = value.strip().lower()
+    return safe_reflection_text(value, banned) and lowered not in banned_exact_terms
+
+
+def prompt_guidance_banned_exact_terms(company: Company | None) -> set[str]:
+    if not company:
+        return set()
+    terms = {company.symbol.lower()}
+    if company.name:
+        terms.add(company.name.lower())
+    display_name = company_display_name(company)
+    if display_name:
+        terms.add(display_name.lower())
+    return terms
 
 
 def guidance_from_memory(memory: CompanyMemory) -> PromptGuidance:

@@ -258,6 +258,7 @@ class CrawlAttemptConfig(BaseModel):
     allow_official_linked_documents_on_robots_unavailable: bool = False
     use_prompt_planner: bool = False
     disable_memory: bool = False
+    no_memory_write: bool = False
     prompt_guidance: PromptGuidance | None = None
     navigation_memory: CompanyNavigationMemory | None = None
     identity_name_hint: str | None = None

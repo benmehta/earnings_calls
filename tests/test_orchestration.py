@@ -695,7 +695,7 @@ def test_disable_memory_ignores_persisted_memory_but_keeps_run_memory_for_retrie
     result = supervisor.run_company(company)
 
     assert result.status == "success"
-    assert result.memory_path is None
+    assert result.memory_path == memory_path(tmp_path, company)
     assert len(seen_configs) == 2
     assert seen_configs[0].identity_name_hint is None
     assert seen_configs[0].prompt_guidance is None
@@ -712,6 +712,48 @@ def test_disable_memory_ignores_persisted_memory_but_keeps_run_memory_for_retrie
     assert result.actions[0].next_config
     assert result.actions[0].next_config.navigation_memory
     assert result.actions[0].next_config.navigation_memory.low_value_hosts == []
+    assert memory_path(tmp_path, company).read_text(encoding="utf-8") != original_memory_json
+    saved_memory = load_company_memory(tmp_path, company)
+    assert saved_memory.company.name == "Amazon.com"
+    assert saved_memory.navigation_memory.known_event_listing_urls == ["https://investors.amazon.com/earnings.aspx"]
+    assert saved_memory.navigation_memory.low_value_hosts == ["blog.example.com"]
+    assert saved_memory.navigation_memory.successful_hosts == ["investors.amazon.com"]
+
+
+def test_no_memory_write_keeps_disable_memory_run_ephemeral(tmp_path: Path) -> None:
+    company = Company(symbol="AMZN", name=None)
+    persisted = CompanyMemory(company=Company(symbol="AMZN", name="Amazon.com"))
+    persisted.navigation_memory.preferred_hosts = ["investors.amazon.com"]
+    saved_path = save_company_memory(tmp_path, persisted)
+    original_memory_json = saved_path.read_text(encoding="utf-8")
+
+    def runner(run_company: Company, config: CrawlAttemptConfig) -> CrawlResult:
+        return CrawlResult(
+            company=run_company,
+            transcripts=[
+                TranscriptRecord(
+                    company=run_company,
+                    source_url="https://investors.amazon.com/q1-transcript.pdf",
+                    title="Amazon Q1 2026 Earnings Call Transcript",
+                    text="OPERATOR: Welcome.\nQUESTION-AND-ANSWER SESSION\nEND",
+                )
+            ],
+            visited_count=1,
+        )
+
+    supervisor = SupervisedCrawler(
+        model="test-model",
+        out_dir=tmp_path,
+        http=None,  # type: ignore[arg-type]
+        max_attempts=1,
+        base_config=CrawlAttemptConfig(disable_memory=True, no_memory_write=True),
+        attempt_runner=runner,
+    )
+
+    result = supervisor.run_company(company)
+
+    assert result.status == "success"
+    assert result.memory_path is None
     assert memory_path(tmp_path, company).read_text(encoding="utf-8") == original_memory_json
 
 
