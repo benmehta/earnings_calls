@@ -95,6 +95,8 @@ class NavigationValidationResult(BaseModel):
 class NavigationStep(BaseModel):
     current_url: str
     title: str = ""
+    candidate_urls: list[str] = Field(default_factory=list)
+    raw_link_count: int = 0
     chosen_urls: list[str] = Field(default_factory=list)
     rejected_urls: list[str] = Field(default_factory=list)
     render_strategy: str | None = None

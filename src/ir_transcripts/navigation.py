@@ -269,6 +269,7 @@ def discover_navigation_seeds(
                 NavigationStep(
                     current_url=current_url,
                     title=title,
+                    raw_link_count=len(raw_links),
                     chosen_urls=list(verification.linked_ir_urls),
                     render_strategy=render_strategy,
                     stop_reason="no_useful_links",
@@ -286,7 +287,8 @@ def discover_navigation_seeds(
                 page_context=page_context,
             )
             progress.log(
-                f"{company.symbol}: asking {agent_kind} agent to choose from {len(links)} navigation link(s)"
+                f"{company.symbol}: asking {agent_kind} agent to choose from "
+                f"{min(len(links), navigation_llm_max_links)} of {len(links)} navigation candidate(s)"
             )
             with timeout_after(llm_timeout_seconds, f"choosing navigation links for {current_url}"):
                 decision = agent.decide(
@@ -301,6 +303,17 @@ def discover_navigation_seeds(
         except Exception as exc:
             message = f"navigation LLM failed ({type(exc).__name__}: {exc})"
             progress.log(f"{company.symbol}: {message}")
+            trace.steps.append(
+                NavigationStep(
+                    current_url=current_url,
+                    title=title,
+                    candidate_urls=[link.url for link in links],
+                    raw_link_count=len(raw_links),
+                    render_strategy=render_strategy,
+                    reason=message,
+                    stop_reason="navigation_llm_failed",
+                )
+            )
             return NavigationDiscoveryResult(
                 seeds=[],
                 trace=trace,
@@ -327,6 +340,8 @@ def discover_navigation_seeds(
             NavigationStep(
                 current_url=current_url,
                 title=title,
+                candidate_urls=[link.url for link in links],
+                raw_link_count=len(raw_links),
                 chosen_urls=chosen_urls,
                 rejected_urls=rejected,
                 render_strategy=render_strategy,

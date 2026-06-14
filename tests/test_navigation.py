@@ -332,6 +332,37 @@ def test_navigation_discovery_uses_homepage_content_to_enqueue_ir_link(monkeypat
     assert "https://ir.example.com" in result.seeds
 
 
+def test_navigation_trace_records_candidates_when_agent_fails(monkeypatch) -> None:
+    class FailingNavigationAgent(FakeNavigationAgent):
+        def decide(self, **kwargs) -> NavigationDecision:
+            raise TimeoutError("local model timed out")
+
+    pages = {
+        "https://www.example.com": """
+        <html><head><title>Example Company</title></head>
+        <body>
+          <footer>Copyright Example. All rights reserved.</footer>
+          <a href="/investors">Investor Relations</a>
+          <a href="/careers">Careers</a>
+        </body></html>
+        """,
+    }
+    monkeypatch.setattr("ir_transcripts.navigation.IRNavigationAgent", FailingNavigationAgent)
+    monkeypatch.setattr("ir_transcripts.navigation.discover_ir_candidates", lambda *args, **kwargs: [])
+
+    result = discover_navigation_seeds(
+        Company(symbol="EX", name="Example"),
+        http=FakeHttp(pages),  # type: ignore[arg-type]
+        model="test-model",
+        max_steps=1,
+    )
+
+    assert result.failure_type == "navigation_llm_failed"
+    assert result.trace.steps[0].candidate_urls == ["https://www.example.com/investors"]
+    assert result.trace.steps[0].raw_link_count == 2
+    assert result.trace.steps[0].stop_reason == "navigation_llm_failed"
+
+
 def test_navigation_delegates_unavailable_robots_for_official_ir_subdomain(monkeypatch) -> None:
     class DelegatingFakeHttp(FakeHttp):
         def __init__(self, pages: dict[str, str]) -> None:
