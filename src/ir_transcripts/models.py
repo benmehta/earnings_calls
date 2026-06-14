@@ -163,6 +163,41 @@ class SearchCandidateRankingDecision(BaseModel):
     selections: list[SearchCandidateSelection] = Field(default_factory=list)
 
 
+class TranscriptResearchProposal(BaseModel):
+    issuer_name: str | None = None
+    official_homepage_urls: list[str] = Field(default_factory=list)
+    official_ir_urls: list[str] = Field(default_factory=list)
+    transcript_candidate_urls: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    reason: str = ""
+    evidence: list[str] = Field(default_factory=list)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def coerce_confidence(cls, value):
+        if isinstance(value, (int, float)) and value > 1:
+            return value / 100
+        return value
+
+
+class TranscriptResearchJudgment(BaseModel):
+    accepted: bool = False
+    accepted_homepage_urls: list[str] = Field(default_factory=list)
+    accepted_ir_urls: list[str] = Field(default_factory=list)
+    accepted_transcript_urls: list[str] = Field(default_factory=list)
+    official_company_name: str | None = None
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    reason: str = ""
+    retry_guidance: str = ""
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def coerce_confidence(cls, value):
+        if isinstance(value, (int, float)) and value > 1:
+            return value / 100
+        return value
+
+
 class CrawlNavigatorDecision(BaseModel):
     page_type: Literal[
         "transcript",
@@ -303,6 +338,7 @@ class TranscriptRecord(BaseModel):
 FailureType = Literal[
     "identity_low_confidence",
     "homepage_unverified",
+    "official_research_unverified",
     "navigation_fetch_failed",
     "navigation_render_failed",
     "navigation_llm_failed",
@@ -402,6 +438,7 @@ class CrawlAttemptConfig(BaseModel):
     include_discovery_guesses: bool = False
     disable_official_homepage_overrides: bool = False
     disable_predictive_identity: bool = False
+    use_research_agent: bool = False
     rerank_discovery: bool = False
     extract_metadata_with_llm: bool = False
     latest_only: bool = False
@@ -426,6 +463,7 @@ FailureCategory = Literal[
     "wrong_identity",
     "identity_low_confidence",
     "homepage_unverified",
+    "official_research_unverified",
     "navigation_step_failed",
     "crawl_step_failed",
     "robots_unavailable",

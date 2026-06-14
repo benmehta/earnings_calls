@@ -914,8 +914,8 @@ def mark_agent_selected(link: CandidateLink) -> CandidateLink:
 
 
 def order_chosen_urls(chosen_urls: list[str], links: list[CandidateLink]) -> list[str]:
-    link_order = {link.url: index for index, link in enumerate(links)}
-    return sorted(chosen_urls, key=lambda url: link_order.get(url, len(link_order)))
+    candidate_urls = {link.url for link in links}
+    return [url for url in chosen_urls if url in candidate_urls]
 
 
 def classify_navigation_page_context(
@@ -989,10 +989,19 @@ def navigation_link_score(
 def navigation_seed_score(url: str, label: str, context: str, company: Company) -> int:
     haystack = f"{url} {label} {context}".lower()
     positive = {
-        "events/event-details": 60,
-        "event-details": 55,
-        "earnings call": 45,
-        "quarterly earnings call": 45,
+        "transcript": 95,
+        "edited transcript": 110,
+        "earnings call transcript": 120,
+        "quarterly earnings call transcript": 130,
+        "events/event-details": 105,
+        "event-details": 95,
+        "earnings call": 90,
+        "quarterly earnings call": 105,
+        "q1 earnings": 55,
+        "q2 earnings": 55,
+        "q3 earnings": 55,
+        "q4 earnings": 55,
+        "fy earnings": 45,
         "investor relations": 40,
         "investors": 35,
         "investor": 30,
@@ -1001,11 +1010,10 @@ def navigation_seed_score(url: str, label: str, context: str, company: Company) 
         "financial reports": 35,
         "quarterly results": 30,
         "earnings releases": 30,
-        "earnings": 22,
+        "earnings": 42,
         "events": 16,
-        "presentations": 14,
+        "presentations": 4,
         "webcast": 14,
-        "transcript": 25,
         "results": 12,
         "news releases": 10,
     }
@@ -1022,6 +1030,12 @@ def navigation_seed_score(url: str, label: str, context: str, company: Company) 
         "additional information": 20,
         "faqs": 15,
         "home page": 15,
+        "sec filings": 55,
+        "/sec-filings": 70,
+        "governance": 35,
+        "annual meeting": 35,
+        "stock": 30,
+        "news releases": 20,
     }
     score -= sum(value for token, value in negative.items() if token in haystack)
     if is_company_host(url, company):

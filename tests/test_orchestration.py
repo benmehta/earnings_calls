@@ -123,6 +123,30 @@ def test_robots_unavailable_transcript_doc_requires_manual_review() -> None:
     assert "--robots-fail-open" in action.manual_recommendations[0]
 
 
+def test_retryable_analysis_with_manual_recommendation_retries_before_manual_review() -> None:
+    company = Company(symbol="GOOG", name="Alphabet Google")
+    config = CrawlAttemptConfig(discovery_mode="nav-first", use_research_agent=True)
+    analysis = FailureAnalysis(
+        category="no_transcript_found",
+        summary="No relevant transcript found in official crawl evidence.",
+        retryable=True,
+        evidence_urls=["https://abc.xyz/investor/earnings/"],
+        manual_recommendations=["Manually review if retries are exhausted."],
+    )
+
+    action = plan_next_action(
+        analysis,
+        company=company,
+        config=config,
+        attempt_count=1,
+        max_attempts=3,
+    )
+
+    assert action.action_type == "retry"
+    assert action.next_config
+    assert action.next_config.reason == "no_transcript_found_retry"
+
+
 def test_successful_transcript_stops_graph_and_updates_memory(tmp_path: Path) -> None:
     company = Company(symbol="EX", name="Example")
 

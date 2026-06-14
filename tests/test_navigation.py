@@ -3,7 +3,7 @@ import requests
 from urllib.parse import urljoin
 
 from ir_transcripts.http import RobotsUnavailableError
-from ir_transcripts.models import Company, CompanyNavigationMemory, HomepagePrediction, HomepageValidationDecision, NavigationDecision, PromptGuidance
+from ir_transcripts.models import CandidateLink, Company, CompanyNavigationMemory, HomepagePrediction, HomepageValidationDecision, NavigationDecision, PromptGuidance
 from ir_transcripts.navigation import (
     can_delegate_unavailable_ir_subdomain_robots,
     discover_navigation_seeds,
@@ -12,6 +12,7 @@ from ir_transcripts.navigation import (
     navigation_link_score,
     navigation_start_score,
     navigation_start_urls,
+    order_chosen_urls,
     predict_and_validate_homepage_starts,
     rank_discovered_urls,
     rank_navigation_starts,
@@ -748,6 +749,54 @@ def test_event_detail_links_outrank_page_chrome() -> None:
         company=company,
     )
     assert navigation_link_score(skip, current_url=current_url, allowed_hosts={"abc.xyz"}, company=company) <= 0
+
+
+def test_earnings_event_detail_outranks_sec_filings() -> None:
+    company = Company(symbol="GOOG", name="Alphabet Google")
+    current_url = "https://abc.xyz/investor/"
+    event = extract_links(
+        '<a href="/investor/events/event-details/2026/2026-Q1-Earnings-Call/default.aspx">2026 Q1 Earnings Call</a>',
+        current_url,
+    )[0]
+    sec = extract_links(
+        '<a href="/investor/sec-filings/default.aspx">SEC Filings</a>',
+        current_url,
+    )[0]
+
+    assert navigation_link_score(event, current_url=current_url, allowed_hosts={"abc.xyz"}, company=company) > navigation_link_score(
+        sec,
+        current_url=current_url,
+        allowed_hosts={"abc.xyz"},
+        company=company,
+    )
+
+
+def test_order_chosen_urls_preserves_agent_preference() -> None:
+    links = [
+        CandidateLink(
+            url="https://abc.xyz/investor/sec-filings/default.aspx",
+            label="SEC Filings",
+            source_url="https://abc.xyz/investor/",
+        ),
+        CandidateLink(
+            url="https://abc.xyz/investor/events/event-details/2026/2026-Q1-Earnings-Call/default.aspx",
+            label="2026 Q1 Earnings Call",
+            source_url="https://abc.xyz/investor/",
+        ),
+    ]
+
+    ordered = order_chosen_urls(
+        [
+            "https://abc.xyz/investor/events/event-details/2026/2026-Q1-Earnings-Call/default.aspx",
+            "https://abc.xyz/investor/sec-filings/default.aspx",
+        ],
+        links,
+    )
+
+    assert ordered == [
+        "https://abc.xyz/investor/events/event-details/2026/2026-Q1-Earnings-Call/default.aspx",
+        "https://abc.xyz/investor/sec-filings/default.aspx",
+    ]
 
 
 def test_navigation_auto_renders_q4_event_listing(monkeypatch) -> None:

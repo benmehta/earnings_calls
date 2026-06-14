@@ -271,6 +271,53 @@ def test_crawler_does_not_save_press_release_like_html(tmp_path) -> None:
     assert not [path for path in (tmp_path / "EX").glob("*.json") if not path.name.startswith("_")]
 
 
+def test_crawler_does_not_save_ir_homepage_on_vague_transcript_evidence(tmp_path) -> None:
+    class FakeResponse:
+        headers = {"content-type": "text/html"}
+        content = b""
+        text = """
+        <html><head><title>Example Investor Relations - Home</title></head>
+        <body>
+        <nav>Home Investors Results & Financials Earnings SEC Filings News Events Governance</nav>
+        <h1>Investor Relations</h1>
+        <p>Find earnings, financial results, SEC filings, and investor events.</p>
+        </body></html>
+        """
+
+    class FakeHttp:
+        def get(self, url: str):
+            return FakeResponse()
+
+    class FalsePositiveTranscriptEvidenceAgent:
+        def classify(self, **kwargs):
+            return TranscriptEvidenceDecision(
+                is_transcript=True,
+                confidence=0.9,
+                evidence=["earnings and investor relations page"],
+                rejection_reason="",
+            )
+
+    class FakeAgent:
+        def decide(self, **kwargs):
+            return PageDecision(page_type="ir_index", confidence=0.9, reason="IR homepage")
+
+    crawler = TranscriptCrawler(
+        model="test-model",
+        out_dir=tmp_path,
+        seed_urls=["https://investor.example.com/default.aspx"],
+        http=FakeHttp(),  # type: ignore[arg-type]
+    )
+    crawler.agent = FakeAgent()  # type: ignore[assignment]
+    crawler.transcript_evidence_agent = FalsePositiveTranscriptEvidenceAgent()  # type: ignore[assignment]
+    crawler.document_triage_agent = FakeDocumentTriageAgent()  # type: ignore[assignment]
+
+    result = crawler.crawl_company(Company(symbol="EX", name="Example"))
+
+    assert result.transcripts == []
+    assert result.candidates[0].reason.endswith("transcript_rejected_agent_evidence")
+    assert not [path for path in (tmp_path / "EX").glob("*.json") if not path.name.startswith("_")]
+
+
 def test_crawler_always_playwright_mode_renders_plain_html(monkeypatch, tmp_path) -> None:
     class FakeResponse:
         headers = {"content-type": "text/html"}

@@ -36,6 +36,8 @@ from .models import (
     RetryPlanningDecision,
     SearchCandidateRankingDecision,
     SearchQueryPlan,
+    TranscriptResearchJudgment,
+    TranscriptResearchProposal,
     TranscriptEvidenceDecision,
 )
 
@@ -56,6 +58,8 @@ MEMORY_GUIDANCE_PROMPT = load_agent_prompt("memory_guidance")
 COMPANY_PLAYBOOK_PROMPT = load_agent_prompt("company_playbook")
 SEARCH_QUERY_PLANNER_PROMPT = load_agent_prompt("search_query_planner")
 SEARCH_CANDIDATE_RANKING_PROMPT = load_agent_prompt("search_candidate_ranking")
+TRANSCRIPT_RESEARCH_PROMPT = load_agent_prompt("transcript_research")
+TRANSCRIPT_RESEARCH_JUDGE_PROMPT = load_agent_prompt("transcript_research_judge")
 ORCHESTRATION_ANALYSIS_PROMPT = load_agent_prompt("orchestration_analysis")
 RETRY_PLANNING_PROMPT = load_agent_prompt("retry_planning")
 PROMPT_PLANNER_PROMPT = load_agent_prompt("prompt_planner")
@@ -772,6 +776,109 @@ class SearchCandidateRankingAgent:
         candidate_urls = {candidate.url for candidate in candidates}
         decision.selections = [selection for selection in decision.selections if selection.url in candidate_urls]
         return decision
+
+
+class OfficialTranscriptResearchAgent:
+    """Proposes official-source transcript discovery targets from search evidence."""
+
+    SYSTEM_PROMPT = TRANSCRIPT_RESEARCH_PROMPT.system_prompt
+    HUMAN_PROMPT = TRANSCRIPT_RESEARCH_PROMPT.human_prompt or ""
+
+    def __init__(self, model: str, base_url: str | None = None, *, max_candidates: int = 30) -> None:
+        self.max_candidates = max_candidates
+        self.chain = (
+            ChatPromptTemplate.from_messages(
+                [
+                    ("system", self.SYSTEM_PROMPT),
+                    ("human", self.HUMAN_PROMPT),
+                ]
+            )
+            | build_llm(model, base_url=base_url, json_mode=True)
+        )
+
+    def research(
+        self,
+        *,
+        company: Company,
+        candidates: list[IRDiscoveryCandidate],
+        guidance: PromptGuidance | None = None,
+        navigation_memory: CompanyNavigationMemory | None = None,
+    ) -> TranscriptResearchProposal:
+        compact = [
+            {
+                "url": candidate.url,
+                "title": compact_text(candidate.title, 140),
+                "snippet": compact_text(candidate.snippet, 320),
+                "source": candidate.source,
+                "score": candidate.score,
+                "reasons": candidate.reasons[:5],
+            }
+            for candidate in candidates[: self.max_candidates]
+        ]
+        message = self.chain.invoke(
+            {
+                "company_name": company_display_name(company),
+                "ticker": company.symbol,
+                "guidance": guidance_for_agent(guidance, "search", agent_name="OfficialTranscriptResearchAgent"),
+                "memory_summary": discovery_memory_summary(navigation_memory),
+                "candidates_json": json.dumps(compact, ensure_ascii=True),
+            }
+        )
+        proposal = TranscriptResearchProposal.model_validate(extract_json_object(message.content))
+        allowed_urls = {candidate.url for candidate in candidates}
+        proposal.official_homepage_urls = [url for url in proposal.official_homepage_urls if url in allowed_urls]
+        proposal.official_ir_urls = [url for url in proposal.official_ir_urls if url in allowed_urls]
+        proposal.transcript_candidate_urls = [url for url in proposal.transcript_candidate_urls if url in allowed_urls]
+        return proposal
+
+
+class TranscriptResearchJudgeAgent:
+    """Judges whether a research proposal has enough official-source evidence."""
+
+    SYSTEM_PROMPT = TRANSCRIPT_RESEARCH_JUDGE_PROMPT.system_prompt
+    HUMAN_PROMPT = TRANSCRIPT_RESEARCH_JUDGE_PROMPT.human_prompt or ""
+
+    def __init__(self, model: str, base_url: str | None = None, *, text_chars: int = 4000) -> None:
+        self.text_chars = text_chars
+        self.chain = (
+            ChatPromptTemplate.from_messages(
+                [
+                    ("system", self.SYSTEM_PROMPT),
+                    ("human", self.HUMAN_PROMPT),
+                ]
+            )
+            | build_llm(model, base_url=base_url, json_mode=True)
+        )
+
+    def judge(
+        self,
+        *,
+        company: Company,
+        proposal: TranscriptResearchProposal,
+        evidence: dict,
+        guidance: PromptGuidance | None = None,
+    ) -> TranscriptResearchJudgment:
+        message = self.chain.invoke(
+            {
+                "company_name": company_display_name(company),
+                "ticker": company.symbol,
+                "guidance": guidance_for_agent(guidance, "search", agent_name="TranscriptResearchJudgeAgent"),
+                "proposal_json": proposal.model_dump_json(),
+                "evidence_json": compact_text(json.dumps(evidence, ensure_ascii=True), self.text_chars),
+            }
+        )
+        judgment = TranscriptResearchJudgment.model_validate(extract_json_object(message.content))
+        proposed_urls = {
+            *proposal.official_homepage_urls,
+            *proposal.official_ir_urls,
+            *proposal.transcript_candidate_urls,
+        }
+        judgment.accepted_homepage_urls = [url for url in judgment.accepted_homepage_urls if url in proposed_urls]
+        judgment.accepted_ir_urls = [url for url in judgment.accepted_ir_urls if url in proposed_urls]
+        judgment.accepted_transcript_urls = [url for url in judgment.accepted_transcript_urls if url in proposed_urls]
+        if not (judgment.accepted_homepage_urls or judgment.accepted_ir_urls or judgment.accepted_transcript_urls):
+            judgment.accepted = False
+        return judgment
 
 
 class OrchestrationAnalysisAgent:

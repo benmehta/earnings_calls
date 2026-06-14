@@ -15,6 +15,7 @@ from .metadata import TranscriptMetadataAgent, extract_metadata_heuristic
 from .models import CandidateLink, CandidatePage, Company, CompanyNavigationMemory, CrawlFailure, CrawlResult, FailureType, PageDecision, PromptGuidance, TranscriptRecord
 from .navigation import can_delegate_unavailable_ir_subdomain_robots, discover_navigation_seeds
 from .parsing import TranscriptDetection, docx_text, extract_links, looks_like_js_shell, page_title, pdf_text, visible_text
+from .research import discover_transcript_research_seeds
 from .runtime import ProgressReporter, timeout_after
 from .search import find_ir_candidates
 from .state import CrawlState
@@ -64,6 +65,7 @@ class TranscriptCrawler:
         identity_name_hint: str | None = None,
         homepage_candidates: list[str] | None = None,
         disable_predictive_identity: bool = False,
+        use_research_agent: bool = False,
         allow_official_linked_documents_on_robots_unavailable: bool = False,
         progress: ProgressReporter | None = None,
         http: HttpClient | None = None,
@@ -110,6 +112,7 @@ class TranscriptCrawler:
         self.identity_name_hint = identity_name_hint
         self.homepage_candidates = homepage_candidates or []
         self.disable_predictive_identity = disable_predictive_identity
+        self.use_research_agent = use_research_agent
         self.allow_official_linked_documents_on_robots_unavailable = allow_official_linked_documents_on_robots_unavailable
         self.progress = progress or ProgressReporter(enabled=False)
         self.http = http or HttpClient()
@@ -501,6 +504,39 @@ class TranscriptCrawler:
         if self.seed_urls:
             self.progress.log(f"{company.symbol}: using {len(self.seed_urls)} provided seed URL(s)")
             return SeedDiscoveryResult(seeds=self.seed_urls, failures=[])
+        if self.use_research_agent:
+            research = discover_transcript_research_seeds(
+                company,
+                http=self.http,
+                model=self.model,
+                ollama_base_url=self.ollama_base_url,
+                search_timeout_seconds=self.search_timeout_seconds,
+                llm_timeout_seconds=self.llm_timeout_seconds,
+                prompt_guidance=self.prompt_guidance,
+                navigation_memory=self.navigation_memory,
+                progress=self.progress,
+            )
+            if research.failure_type:
+                failure = CrawlFailure(
+                    company=company,
+                    url=", ".join(research.failure_urls or []),
+                    failure_type=research.failure_type,
+                    message=research.failure_message,
+                )
+                return SeedDiscoveryResult(
+                    seeds=[],
+                    failures=[failure],
+                    skipped_reason=research.failure_message or str(research.failure_type),
+                    verified_homepage_urls=research.verified_homepage_urls or [],
+                    verified_company_name=research.verified_company_name,
+                )
+            return SeedDiscoveryResult(
+                seeds=research.seeds,
+                failures=[],
+                skipped_reason="Official transcript research produced no accepted seeds",
+                verified_homepage_urls=research.verified_homepage_urls or [],
+                verified_company_name=research.verified_company_name,
+            )
         if self.discovery_mode == "search-first":
             return SeedDiscoveryResult(seeds=self._search_seeds(company), failures=[])
 
@@ -880,9 +916,40 @@ class TranscriptCrawler:
         except Exception as exc:
             self.progress.log(f"{company.symbol}: transcript evidence failed ({type(exc).__name__}: {url})")
             return TranscriptDetection(False, "transcript_rejected_agent_unavailable")
-        if decision.is_transcript and decision.confidence >= 0.75 and decision.evidence:
+        if (
+            decision.is_transcript
+            and decision.confidence >= 0.75
+            and decision.evidence
+            and has_concrete_transcript_evidence(text, title=title, url=url, evidence=decision.evidence)
+        ):
             return TranscriptDetection(True, "transcript_detected_agent_evidence")
         return TranscriptDetection(False, decision.rejection_reason or "transcript_rejected_agent_evidence")
+
+
+def has_concrete_transcript_evidence(
+    text: str,
+    *,
+    title: str = "",
+    url: str = "",
+    evidence: list[str] | None = None,
+) -> bool:
+    haystack = f"{title} {url} {text} {' '.join(evidence or [])}".lower()
+    concrete_markers = (
+        "operator:",
+        "moderator:",
+        "question-and-answer",
+        "question and answer",
+        "questions-and-answers",
+        "prepared remarks",
+        "edited transcript",
+        "lseg streetevents",
+        "corporate participants",
+        "conference call participants",
+        "presentation operator message",
+        "analyst:",
+        "speaker:",
+    )
+    return any(marker in haystack for marker in concrete_markers)
 
 
 def link_score(link: CandidateLink) -> int:

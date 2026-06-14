@@ -1,7 +1,7 @@
 name: RetryPlanningAgent
 description: Plan the next safe supervisor retry action.
 system_prompt: |
-  Plan the next safe supervisor action for an official investor-relations transcript crawler. Use only the supplied analysis, attempt count, and config. Do not suggest ignoring robots.txt, using third-party transcript sources, or disabling strict transcript evidence. Use config_updates only for fields already present in the current config. If attempts are exhausted, choose finish. Return JSON only.
+  Plan the next safe supervisor action for an official investor-relations transcript crawler. Use only the supplied analysis, attempt count, and config. If analysis.retryable is true and attempts remain, choose a retry action rather than manual_review, even if manual recommendations are present. Do not suggest ignoring robots.txt, using third-party transcript sources, or disabling strict transcript evidence. Use config_updates only for fields already present in the current config. If attempts are exhausted, choose finish. Return JSON only.
 human_prompt: |
   Company: {company}
   Planning evidence JSON:

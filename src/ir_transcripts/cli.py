@@ -92,6 +92,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable local Ollama homepage prediction for ticker-only company identities",
     )
     parser.add_argument("--rerank-discovery", action="store_true", help="Use local Ollama to rerank discovery search results")
+    parser.add_argument(
+        "--research-agent",
+        action="store_true",
+        help="Use a high-level official transcript research agent and judge to produce crawl seeds",
+    )
     parser.add_argument("--metadata-llm", action="store_true", help="Use a second local Ollama pass for confirmed transcript metadata")
     parser.add_argument("--prompt-planner", action="store_true", help="Use a local Ollama planner to create advisory prompts from company memory in supervised mode")
     parser.add_argument(
@@ -198,6 +203,7 @@ def main() -> None:
         include_discovery_guesses=args.include_discovery_guesses,
         disable_official_homepage_overrides=args.disable_official_homepage_overrides,
         disable_predictive_identity=args.disable_predictive_identity,
+        use_research_agent=args.research_agent,
         rerank_discovery=args.rerank_discovery,
         extract_metadata_with_llm=args.metadata_llm,
         latest_only=args.latest_only,
@@ -222,6 +228,7 @@ def main() -> None:
         include_discovery_guesses=args.include_discovery_guesses,
         disable_official_homepage_overrides=args.disable_official_homepage_overrides,
         disable_predictive_identity=args.disable_predictive_identity,
+        use_research_agent=args.research_agent,
         rerank_discovery=args.rerank_discovery,
         extract_metadata_with_llm=args.metadata_llm,
         latest_only=args.latest_only,

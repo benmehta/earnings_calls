@@ -410,6 +410,7 @@ class SupervisedCrawler:
             include_discovery_guesses=config.include_discovery_guesses,
             disable_official_homepage_overrides=config.disable_official_homepage_overrides,
             disable_predictive_identity=config.disable_predictive_identity,
+            use_research_agent=config.use_research_agent,
             rerank_discovery=config.rerank_discovery,
             extract_metadata_with_llm=config.extract_metadata_with_llm,
             latest_only=config.latest_only,
@@ -461,6 +462,17 @@ def analyze_crawl_result(
             summary="No predicted homepage could be verified before crawling.",
             retryable=True,
             evidence_urls=[failure.url for failure in homepage_unverified if failure.url],
+        )
+
+    official_research_unverified = [
+        failure for failure in result.failures if failure.failure_type == "official_research_unverified"
+    ]
+    if official_research_unverified:
+        return FailureAnalysis(
+            category="official_research_unverified",
+            summary="Official transcript research could not verify safe crawl seeds.",
+            retryable=True,
+            evidence_urls=[failure.url for failure in official_research_unverified if failure.url],
         )
 
     navigation_step_failures = [
@@ -584,17 +596,17 @@ def plan_next_action(
     if analysis.category == "success":
         return SupervisorAction(action_type="finish", reason=analysis.summary)
 
-    if analysis.manual_recommendations:
+    if attempt_count >= max_attempts:
+        return SupervisorAction(action_type="finish", reason=f"Reached supervisor max attempts ({max_attempts}).")
+
+    next_attempt = attempt_count + 1
+    if analysis.manual_recommendations and not analysis.retryable:
         return SupervisorAction(
             action_type="manual_review",
             reason=analysis.summary,
             manual_recommendations=analysis.manual_recommendations,
         )
 
-    if attempt_count >= max_attempts:
-        return SupervisorAction(action_type="finish", reason=f"Reached supervisor max attempts ({max_attempts}).")
-
-    next_attempt = attempt_count + 1
     planned = plan_with_retry_agent(
         analysis,
         company=company,
