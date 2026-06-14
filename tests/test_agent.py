@@ -1,6 +1,7 @@
 from ir_transcripts.agent import (
     IRNavigationAgent,
     IRPageAgent,
+    compact_candidate_links,
     extract_json_object,
     fallback_links_for_kind,
     guidance_from_memory,
@@ -180,6 +181,33 @@ def test_navigation_agent_sends_compact_prompt() -> None:
     assert captured["links_json"].count("https://example.com/") == 2
     assert "source_url" not in captured["links_json"]
     assert captured["guidance"] == "None."
+
+
+def test_compact_candidate_links_respects_character_budget() -> None:
+    links = [
+        CandidateLink(
+            url="https://www.amazon.com/ir",
+            label="Investor Relations",
+            source_url="https://www.amazon.com",
+            reason="footer",
+        ),
+        CandidateLink(
+            url="https://www.amazon.com/events/devicedeals/?" + "tracking=1&" * 30,
+            label="Device Deals",
+            source_url="https://www.amazon.com",
+            reason="body",
+        ),
+        CandidateLink(
+            url="https://www.amazon.com/s/?" + "tracking=2&" * 60,
+            label="Retail Search",
+            source_url="https://www.amazon.com",
+            reason="body",
+        ),
+    ]
+
+    compact_links = compact_candidate_links(links, max_links=10, char_budget=500)
+
+    assert [link["url"] for link in compact_links] == ["https://www.amazon.com/ir"]
 
 
 def test_navigation_agent_includes_prompt_guidance() -> None:

@@ -4,7 +4,7 @@ from collections import deque
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-from .agent import HomepagePredictionAgent, HomepageValidationAgent, IRNavigationAgent
+from .agent import HomepagePredictionAgent, HomepageValidationAgent, IRNavigationAgent, compact_candidate_links
 from .browser import BROWSER_COMPATIBLE_USER_AGENT, PlaywrightRenderer
 from .http import HttpClient, RobotsUnavailableError
 from .identity import company_display_name, filter_homepage_prediction_urls, is_homepage_candidate_url, is_weak_identity, official_homepage_urls, resolve_company_identity_with_overrides, verify_homepage_content
@@ -286,9 +286,10 @@ def discover_navigation_seeds(
                 links=links,
                 page_context=page_context,
             )
+            sent_link_count = len(compact_candidate_links(links, max_links=navigation_llm_max_links))
             progress.log(
                 f"{company.symbol}: asking {agent_kind} agent to choose from "
-                f"{min(len(links), navigation_llm_max_links)} of {len(links)} navigation candidate(s)"
+                f"{sent_link_count} of {len(links)} navigation candidate(s)"
             )
             with timeout_after(llm_timeout_seconds, f"choosing navigation links for {current_url}"):
                 decision = agent.decide(

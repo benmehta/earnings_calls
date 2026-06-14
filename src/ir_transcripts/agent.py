@@ -29,6 +29,7 @@ from .models import (
 
 
 NavigationAgentKind = Literal["homepage", "ir_section", "event_listing", "transcript_link"]
+LINKS_JSON_CHAR_BUDGET = 800
 
 
 def build_llm(
@@ -95,10 +96,7 @@ class IRPageAgent:
         text: str,
         links: list[CandidateLink],
     ) -> PageDecision:
-        compact_links = [
-            {"url": link.url, "label": compact_text(link.label, 80), "context": compact_text(link.reason, 80)}
-            for link in links[: self.max_links]
-        ]
+        compact_links = compact_candidate_links(links, max_links=self.max_links)
         message = self.chain.invoke(
             {
                 "company_name": company_name,
@@ -461,14 +459,7 @@ class LinkSelectionAgent:
         links: list[CandidateLink],
         repair_guidance: str | None = None,
     ) -> NavigationDecision:
-        compact_links = [
-            {
-                "url": link.url,
-                "label": compact_text(link.label, 80),
-                "context": compact_text(link.reason, 80),
-            }
-            for link in links[: self.max_links]
-        ]
+        compact_links = compact_candidate_links(links, max_links=self.max_links)
         message = self.chain.invoke(
             {
                 "company_name": company_name,
@@ -542,14 +533,7 @@ class NavigationValidationAgent:
         links: list[CandidateLink],
         decision: NavigationDecision,
     ) -> NavigationValidationResult:
-        compact_links = [
-            {
-                "url": link.url,
-                "label": compact_text(link.label, 80),
-                "context": compact_text(link.reason, 80),
-            }
-            for link in links[: self.max_links]
-        ]
+        compact_links = compact_candidate_links(links, max_links=self.max_links)
         message = self.chain.invoke(
             {
                 "kind": kind,
@@ -1067,6 +1051,26 @@ def extract_json_object(content: str) -> dict:
 
 def compact_text(value: str, limit: int) -> str:
     return " ".join(value.split())[:limit]
+
+
+def compact_candidate_links(
+    links: list[CandidateLink],
+    *,
+    max_links: int,
+    char_budget: int = LINKS_JSON_CHAR_BUDGET,
+) -> list[dict[str, str]]:
+    compact_links: list[dict[str, str]] = []
+    for link in links[:max_links]:
+        item = {
+            "url": link.url,
+            "label": compact_text(link.label, 80),
+            "context": compact_text(link.reason, 80),
+        }
+        candidate = [*compact_links, item]
+        if compact_links and len(json.dumps(candidate, ensure_ascii=True)) > char_budget:
+            break
+        compact_links.append(item)
+    return compact_links
 
 
 def guidance_for_agent(guidance: PromptGuidance | None, mode: Literal["navigation", "page"]) -> str:
