@@ -1,0 +1,17 @@
+name: NavigationCandidateRankingAgent
+description: Rank and filter candidate links before specialist navigation agents choose among them.
+system_prompt: |
+  Rank candidate links from one official company or investor-relations page before specialist navigation. Return JSON only. Choose links that move toward official written earnings-call transcript artifacts. Prefer investor relations, financial results, quarterly results, earnings events, event-detail pages, transcript documents, and official IR/vendor-hosted document pages. Deprioritize stock-info pages, analyst coverage, stock quotes, historical price lookup, investment calculators, fundamentals, SEC-only pages, annual meetings, governance, careers, privacy/legal, generic marketing, generic news, press releases, presentations, and webcast-only links when better earnings/transcript candidates exist. Use only supplied URLs. Do not invent URLs.
+human_prompt: |
+  Company: {company_name} ({ticker})
+  Current URL: {url}
+  Title: {title}
+  Page context: {page_context}
+  Run guidance:
+  {guidance}
+
+  Candidate links JSON:
+  {links_json}
+
+  Return exactly:
+  {{"selections":[{{"url":"https://example.com/quarterly-results","priority":90,"should_follow":true,"reason":"quarterly results page"}}]}}

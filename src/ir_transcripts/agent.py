@@ -9,27 +9,63 @@ from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama
 
+from .agent_prompts import load_agent_prompt
 from .identity import company_display_name
 from .models import (
     CandidateLink,
     Company,
     CompanyMemory,
     CompanyNavigationMemory,
+    CompanyPlaybook,
+    CrawlNavigatorDecision,
     CrawlReflection,
+    DocumentLinkTriageDecision,
     HomepagePrediction,
     HomepageValidationDecision,
     IRDiscoveryCandidate,
     IRDiscoveryDecision,
+    LinkBatchTriageDecision,
     NavigationDecision,
+    NavigationCandidateRankingDecision,
+    NavigationPageContextDecision,
     NavigationValidationResult,
+    OrchestrationAnalysisDecision,
     PageDecision,
     PageDecisionDraft,
     PromptGuidance,
+    RetryPlanningDecision,
+    SearchCandidateRankingDecision,
+    SearchQueryPlan,
+    TranscriptEvidenceDecision,
 )
 
 
 NavigationAgentKind = Literal["homepage", "ir_section", "event_listing", "transcript_link"]
 LINKS_JSON_CHAR_BUDGET = 800
+IR_PAGE_PROMPT = load_agent_prompt("ir_page")
+CRAWL_NAVIGATOR_PROMPT = load_agent_prompt("crawl_navigator")
+IR_DISCOVERY_PROMPT = load_agent_prompt("ir_discovery")
+HOMEPAGE_PREDICTION_PROMPT = load_agent_prompt("homepage_prediction")
+HOMEPAGE_VALIDATION_PROMPT = load_agent_prompt("homepage_validation")
+DOCUMENT_LINK_TRIAGE_PROMPT = load_agent_prompt("document_link_triage")
+TRANSCRIPT_EVIDENCE_PROMPT = load_agent_prompt("transcript_evidence")
+LINK_BATCH_TRIAGE_PROMPT = load_agent_prompt("link_batch_triage")
+NAVIGATION_CANDIDATE_RANKING_PROMPT = load_agent_prompt("navigation_candidate_ranking")
+NAVIGATION_PAGE_CONTEXT_PROMPT = load_agent_prompt("navigation_page_context")
+MEMORY_GUIDANCE_PROMPT = load_agent_prompt("memory_guidance")
+COMPANY_PLAYBOOK_PROMPT = load_agent_prompt("company_playbook")
+SEARCH_QUERY_PLANNER_PROMPT = load_agent_prompt("search_query_planner")
+SEARCH_CANDIDATE_RANKING_PROMPT = load_agent_prompt("search_candidate_ranking")
+ORCHESTRATION_ANALYSIS_PROMPT = load_agent_prompt("orchestration_analysis")
+RETRY_PLANNING_PROMPT = load_agent_prompt("retry_planning")
+PROMPT_PLANNER_PROMPT = load_agent_prompt("prompt_planner")
+CRAWL_REFLECTION_PROMPT = load_agent_prompt("crawl_reflection")
+LINK_SELECTION_PROMPT = load_agent_prompt("link_selection")
+NAVIGATION_VALIDATION_PROMPT = load_agent_prompt("navigation_validation")
+HOMEPAGE_NAV_PROMPT = load_agent_prompt("homepage_nav")
+IR_SECTION_PROMPT = load_agent_prompt("ir_section")
+EVENT_LISTING_PROMPT = load_agent_prompt("event_listing")
+TRANSCRIPT_LINK_PROMPT = load_agent_prompt("transcript_link")
 
 
 def build_llm(
@@ -47,8 +83,88 @@ def build_llm(
     return ChatOllama(**kwargs)
 
 
+class CrawlNavigatorAgent:
+    """Unified page classifier and link navigator for the live crawler path."""
+
+    SYSTEM_PROMPT = CRAWL_NAVIGATOR_PROMPT.system_prompt
+    HUMAN_PROMPT = CRAWL_NAVIGATOR_PROMPT.human_prompt or ""
+
+    def __init__(
+        self,
+        model: str,
+        base_url: str | None = None,
+        *,
+        max_links: int = 40,
+        text_chars: int = 900,
+        guidance: PromptGuidance | None = None,
+    ) -> None:
+        self.max_links = max_links
+        self.text_chars = text_chars
+        self.guidance = guidance
+        self.chain = (
+            ChatPromptTemplate.from_messages(
+                [
+                    ("system", self.SYSTEM_PROMPT),
+                    ("human", self.HUMAN_PROMPT),
+                ]
+            )
+            | build_llm(model, base_url=base_url, json_mode=True)
+        )
+
+    def decide(
+        self,
+        *,
+        company_name: str,
+        ticker: str,
+        url: str,
+        title: str,
+        text: str,
+        links: list[CandidateLink],
+        page_context: str = "",
+    ) -> CrawlNavigatorDecision:
+        compact_links = compact_candidate_links(links, max_links=self.max_links)
+        message = self.chain.invoke(
+            {
+                "company_name": company_name,
+                "ticker": ticker,
+                "url": url,
+                "title": title,
+                "page_context": page_context or "unknown",
+                "guidance": guidance_for_agent(getattr(self, "guidance", None), "navigation", agent_name="CrawlNavigatorAgent"),
+                "text": compact_text(text, self.text_chars),
+                "links_json": json.dumps(compact_links, ensure_ascii=True),
+            }
+        )
+        decision = CrawlNavigatorDecision.model_validate(extract_json_object(message.content))
+        candidate_urls = {link.url for link in links}
+        decision.chosen_urls = [url for url in decision.chosen_urls if url in candidate_urls]
+        return decision
+
+    def decide_page(self, **kwargs) -> PageDecision:
+        decision = self.decide(**kwargs)
+        links_by_url = {link.url: link for link in kwargs["links"]}
+        return PageDecision(
+            page_type=decision.page_type,
+            confidence=decision.confidence,
+            useful_links=[links_by_url[url] for url in decision.chosen_urls if url in links_by_url],
+            reason=decision.reason,
+        )
+
+    def decide_navigation(self, **kwargs) -> NavigationDecision:
+        decision = self.decide(**kwargs)
+        return NavigationDecision(
+            chosen_urls=decision.chosen_urls,
+            confidence=decision.confidence,
+            reason=decision.reason,
+            stop_reason=decision.stop_reason,
+        )
+
+
 class IRPageAgent:
     """Small LangChain/Ollama page classifier used by the crawler."""
+
+    SYSTEM_PROMPT = IR_PAGE_PROMPT.system_prompt
+    HUMAN_PROMPT = IR_PAGE_PROMPT.human_prompt or ""
 
     def __init__(
         self,
@@ -67,19 +183,11 @@ class IRPageAgent:
                 [
                     (
                         "system",
-                        "Classify one IR page. Return JSON only. "
-                        "High precision: transcript only for real earnings-call transcript text.",
+                        self.SYSTEM_PROMPT,
                     ),
                     (
                         "human",
-                        "{company_name} ({ticker})\n{url}\nTitle: {title}\n"
-                        "Run guidance:\n{guidance}\n\n"
-                        "Text:\n{text}\n\n"
-                        "Links JSON. Put useful URL strings in useful_urls:\n"
-                        "{links_json}\n\n"
-                        "Return exactly:\n"
-                        "{{\"page_type\":\"ir_index\",\"confidence\":0.8,\"useful_urls\":[\"https://example.com/events\"],\"reason\":\"short reason\"}}\n\n"
-                        "page_type: transcript, earnings_event, press_release, filings, ir_index, not_relevant.",
+                        self.HUMAN_PROMPT,
                     ),
                 ]
             )
@@ -103,7 +211,7 @@ class IRPageAgent:
                 "ticker": ticker,
                 "url": url,
                 "title": title,
-                "guidance": guidance_for_agent(getattr(self, "guidance", None), "page"),
+                "guidance": guidance_for_agent(getattr(self, "guidance", None), "page", agent_name="IRPageAgent"),
                 "text": compact_text(text, self.text_chars),
                 "links_json": json.dumps(compact_links, ensure_ascii=True),
             }
@@ -126,6 +234,9 @@ class IRPageAgent:
 class IRDiscoveryAgent:
     """Local Ollama reranker for search-derived investor-relations candidates."""
 
+    SYSTEM_PROMPT = IR_DISCOVERY_PROMPT.system_prompt
+    HUMAN_PROMPT = IR_DISCOVERY_PROMPT.human_prompt or ""
+
     def __init__(self, model: str, base_url: str | None = None) -> None:
         self.parser = PydanticOutputParser(pydantic_object=IRDiscoveryDecision)
         self.chain = (
@@ -133,21 +244,11 @@ class IRDiscoveryAgent:
                 [
                     (
                         "system",
-                        "Select official company homepage or investor-relations seed URLs from search results. "
-                        "Choose only provided URLs. Prefer the company homepage, official investor-relations "
-                        "home, official financial/quarterly results pages, or official vendor-hosted IR pages. "
-                        "Reject similarly named but different companies when the title, host, or snippet does "
-                        "not match the requested company/ticker. Avoid third-party finance, transcript archive, "
-                        "news, SEC, careers, support, and store pages. Return only official seeds.",
+                        self.SYSTEM_PROMPT,
                     ),
                     (
                         "human",
-                        "Company: {company_name} ({ticker})\n"
-                        "Run guidance:\n{guidance}\n\n"
-                        "Memory summary:\n{memory_summary}\n\n"
-                        "Candidates as JSON:\n{candidates_json}\n\n"
-                        "Return up to {limit} URLs in ranked order.\n"
-                        "{format_instructions}",
+                        self.HUMAN_PROMPT,
                     ),
                 ]
             )
@@ -180,7 +281,7 @@ class IRDiscoveryAgent:
             {
                 "company_name": company_name,
                 "ticker": ticker,
-                "guidance": guidance_for_agent(guidance, "navigation"),
+                "guidance": guidance_for_agent(guidance, "search", agent_name="IRDiscoveryAgent"),
                 "memory_summary": discovery_memory_summary(navigation_memory),
                 "candidates_json": json.dumps(compact, ensure_ascii=True),
                 "limit": limit,
@@ -192,24 +293,20 @@ class IRDiscoveryAgent:
 class HomepagePredictionAgent:
     """Predicts official company homepages from a ticker before discovery."""
 
+    SYSTEM_PROMPT = HOMEPAGE_PREDICTION_PROMPT.system_prompt
+    HUMAN_PROMPT = HOMEPAGE_PREDICTION_PROMPT.human_prompt or ""
+
     def __init__(self, model: str, base_url: str | None = None) -> None:
         self.chain = (
             ChatPromptTemplate.from_messages(
                 [
                     (
                         "system",
-                        "Predict official public-company homepage URLs from a ticker. "
-                        "Return JSON only. Predict homepages only, never investor-relations, "
-                        "transcript, SEC, finance portal, news, or third-party URLs. "
-                        "If uncertain, return low confidence and few or no URLs.",
+                        self.SYSTEM_PROMPT,
                     ),
                     (
                         "human",
-                        "Ticker: {ticker}\n"
-                        "Memory-backed company name hint: {name_hint}\n\n"
-                        "Return exactly:\n"
-                        "{{\"homepage_urls\":[\"https://www.example.com\"],"
-                        "\"confidence\":0.8,\"reason\":\"short reason\"}}",
+                        self.HUMAN_PROMPT,
                     ),
                 ]
             )
@@ -229,6 +326,9 @@ class HomepagePredictionAgent:
 class HomepageValidationAgent:
     """Validates fetched homepage evidence and extracts official IR links."""
 
+    SYSTEM_PROMPT = HOMEPAGE_VALIDATION_PROMPT.system_prompt
+    HUMAN_PROMPT = HOMEPAGE_VALIDATION_PROMPT.human_prompt or ""
+
     def __init__(
         self,
         model: str,
@@ -244,26 +344,11 @@ class HomepageValidationAgent:
                 [
                     (
                         "system",
-                        "Validate whether a fetched page is an official company homepage. "
-                        "Use only page evidence and provided links. Return JSON only. "
-                        "Accept only official home/about/corporate pages. Reject IR pages, "
-                        "finance portals, news sites, SEC pages, transcript archives, and unofficial pages. "
-                        "If official, extract the concise official company or brand name from page evidence "
-                        "(for example Amazon, Microsoft, NVIDIA), not the ticker and not a legal suffix unless needed.",
+                        self.SYSTEM_PROMPT,
                     ),
                     (
                         "human",
-                        "Ticker: {ticker}\n"
-                        "Memory-backed name hint: {name_hint}\n"
-                        "URL: {url}\n"
-                        "Title: {title}\n"
-                        "Text:\n{text}\n\n"
-                        "Links JSON:\n{links_json}\n\n"
-                        "Return exactly:\n"
-                        "{{\"is_official\":true,\"confidence\":0.8,"
-                        "\"official_company_name\":\"Example\","
-                        "\"linked_ir_urls\":[\"https://example.com/investors\"],"
-                        "\"reason\":\"short evidence-based reason\"}}",
+                        self.HUMAN_PROMPT,
                     ),
                 ]
             )
@@ -304,8 +389,452 @@ class HomepageValidationAgent:
         return decision
 
 
+class DocumentLinkTriageAgent:
+    """Classifies document-like links before queue promotion."""
+
+    SYSTEM_PROMPT = DOCUMENT_LINK_TRIAGE_PROMPT.system_prompt
+    HUMAN_PROMPT = DOCUMENT_LINK_TRIAGE_PROMPT.human_prompt or ""
+
+    def __init__(self, model: str, base_url: str | None = None) -> None:
+        self.chain = (
+            ChatPromptTemplate.from_messages(
+                [
+                    ("system", self.SYSTEM_PROMPT),
+                    ("human", self.HUMAN_PROMPT),
+                ]
+            )
+            | build_llm(model, base_url=base_url, json_mode=True)
+        )
+
+    def triage(
+        self,
+        *,
+        company_name: str,
+        ticker: str,
+        source_url: str,
+        source_title: str,
+        link: CandidateLink,
+    ) -> DocumentLinkTriageDecision:
+        message = self.chain.invoke(
+            {
+                "company_name": company_name,
+                "ticker": ticker,
+                "source_url": source_url,
+                "source_title": source_title,
+                "document_url": link.url,
+                "label": compact_text(link.label, 240),
+                "context": compact_text(link.reason, 240),
+            }
+        )
+        return DocumentLinkTriageDecision.model_validate(extract_json_object(message.content))
+
+
+class TranscriptEvidenceAgent:
+    """High-precision transcript evidence classifier for the final save gate."""
+
+    SYSTEM_PROMPT = TRANSCRIPT_EVIDENCE_PROMPT.system_prompt
+    HUMAN_PROMPT = TRANSCRIPT_EVIDENCE_PROMPT.human_prompt or ""
+
+    def __init__(self, model: str, base_url: str | None = None, *, text_chars: int = 5000) -> None:
+        self.text_chars = text_chars
+        self.chain = (
+            ChatPromptTemplate.from_messages(
+                [
+                    ("system", self.SYSTEM_PROMPT),
+                    ("human", self.HUMAN_PROMPT),
+                ]
+            )
+            | build_llm(model, base_url=base_url, json_mode=True)
+        )
+
+    def classify(
+        self,
+        *,
+        company_name: str,
+        ticker: str,
+        url: str,
+        title: str,
+        text: str,
+    ) -> TranscriptEvidenceDecision:
+        message = self.chain.invoke(
+            {
+                "company_name": company_name,
+                "ticker": ticker,
+                "url": url,
+                "title": title,
+                "text": compact_text(text, self.text_chars),
+            }
+        )
+        return TranscriptEvidenceDecision.model_validate(extract_json_object(message.content))
+
+
+class LinkBatchTriageAgent:
+    """Ranks extracted page links for crawl follow-up in one LLM call."""
+
+    SYSTEM_PROMPT = LINK_BATCH_TRIAGE_PROMPT.system_prompt
+    HUMAN_PROMPT = LINK_BATCH_TRIAGE_PROMPT.human_prompt or ""
+
+    def __init__(
+        self,
+        model: str,
+        base_url: str | None = None,
+        *,
+        max_links: int = 80,
+        guidance: PromptGuidance | None = None,
+    ) -> None:
+        self.max_links = max_links
+        self.guidance = guidance
+        self.chain = (
+            ChatPromptTemplate.from_messages(
+                [
+                    ("system", self.SYSTEM_PROMPT),
+                    ("human", self.HUMAN_PROMPT),
+                ]
+            )
+            | build_llm(model, base_url=base_url, json_mode=True)
+        )
+
+    def triage(
+        self,
+        *,
+        company_name: str,
+        ticker: str,
+        url: str,
+        title: str,
+        links: list[CandidateLink],
+    ) -> LinkBatchTriageDecision:
+        compact_links = compact_candidate_links(links, max_links=self.max_links)
+        message = self.chain.invoke(
+            {
+                "company_name": company_name,
+                "ticker": ticker,
+                "url": url,
+                "title": title,
+                "guidance": guidance_for_agent(getattr(self, "guidance", None), "page", agent_name="LinkBatchTriageAgent"),
+                "links_json": json.dumps(compact_links, ensure_ascii=True),
+            }
+        )
+        decision = LinkBatchTriageDecision.model_validate(extract_json_object(message.content))
+        candidate_urls = {link.url for link in links}
+        decision.selections = [selection for selection in decision.selections if selection.url in candidate_urls]
+        return decision
+
+
+class NavigationCandidateRankingAgent:
+    """Ranks navigation candidate links before specialist selection."""
+
+    SYSTEM_PROMPT = NAVIGATION_CANDIDATE_RANKING_PROMPT.system_prompt
+    HUMAN_PROMPT = NAVIGATION_CANDIDATE_RANKING_PROMPT.human_prompt or ""
+
+    def __init__(
+        self,
+        model: str,
+        base_url: str | None = None,
+        *,
+        max_links: int = 40,
+        guidance: PromptGuidance | None = None,
+    ) -> None:
+        self.max_links = max_links
+        self.guidance = guidance
+        self.chain = (
+            ChatPromptTemplate.from_messages(
+                [
+                    ("system", self.SYSTEM_PROMPT),
+                    ("human", self.HUMAN_PROMPT),
+                ]
+            )
+            | build_llm(model, base_url=base_url, json_mode=True)
+        )
+
+    def rank(
+        self,
+        *,
+        company_name: str,
+        ticker: str,
+        url: str,
+        title: str,
+        page_context: str,
+        links: list[CandidateLink],
+    ) -> NavigationCandidateRankingDecision:
+        compact_links = compact_candidate_links(links, max_links=self.max_links)
+        message = self.chain.invoke(
+            {
+                "company_name": company_name,
+                "ticker": ticker,
+                "url": url,
+                "title": title,
+                "page_context": page_context,
+                "guidance": guidance_for_agent(getattr(self, "guidance", None), "navigation", agent_name="NavigationCandidateRankingAgent"),
+                "links_json": json.dumps(compact_links, ensure_ascii=True),
+            }
+        )
+        decision = NavigationCandidateRankingDecision.model_validate(extract_json_object(message.content))
+        candidate_urls = {link.url for link in links}
+        decision.selections = [selection for selection in decision.selections if selection.url in candidate_urls]
+        return decision
+
+
+class NavigationPageContextAgent:
+    """Classifies the navigation role of a fetched page."""
+
+    SYSTEM_PROMPT = NAVIGATION_PAGE_CONTEXT_PROMPT.system_prompt
+    HUMAN_PROMPT = NAVIGATION_PAGE_CONTEXT_PROMPT.human_prompt or ""
+
+    def __init__(self, model: str, base_url: str | None = None, *, text_chars: int = 900) -> None:
+        self.text_chars = text_chars
+        self.chain = (
+            ChatPromptTemplate.from_messages(
+                [
+                    ("system", self.SYSTEM_PROMPT),
+                    ("human", self.HUMAN_PROMPT),
+                ]
+            )
+            | build_llm(model, base_url=base_url, json_mode=True)
+        )
+
+    def classify(
+        self,
+        *,
+        company_name: str,
+        ticker: str,
+        url: str,
+        title: str,
+        text: str,
+    ) -> NavigationPageContextDecision:
+        message = self.chain.invoke(
+            {
+                "company_name": company_name,
+                "ticker": ticker,
+                "url": url,
+                "title": title,
+                "text": compact_text(text, self.text_chars),
+            }
+        )
+        return NavigationPageContextDecision.model_validate(extract_json_object(message.content))
+
+
+class CompanyPlaybookAgent:
+    """Builds a ticker-specific advisory playbook stored in company memory."""
+
+    SYSTEM_PROMPT = COMPANY_PLAYBOOK_PROMPT.system_prompt
+    HUMAN_PROMPT = COMPANY_PLAYBOOK_PROMPT.human_prompt or ""
+
+    def __init__(self, model: str, base_url: str | None = None, *, text_chars: int = 1800) -> None:
+        self.text_chars = text_chars
+        self.chain = (
+            ChatPromptTemplate.from_messages(
+                [
+                    ("system", self.SYSTEM_PROMPT),
+                    ("human", self.HUMAN_PROMPT),
+                ]
+            )
+            | build_llm(model, base_url=base_url, json_mode=True)
+        )
+
+    def build(self, *, company: Company, memory: CompanyMemory) -> CompanyPlaybook:
+        memory_json = compact_text(
+            json.dumps(memory.model_dump(mode="json"), ensure_ascii=True),
+            self.text_chars,
+        )
+        message = self.chain.invoke(
+            {
+                "company": f"{company_display_name(company)} ({company.symbol})",
+                "memory_json": memory_json,
+            }
+        )
+        return sanitize_company_playbook(
+            CompanyPlaybook.model_validate(extract_json_object(message.content)),
+        )
+
+
+class MemoryGuidanceAgent:
+    """Converts company memory into advisory prompt guidance."""
+
+    SYSTEM_PROMPT = MEMORY_GUIDANCE_PROMPT.system_prompt
+    HUMAN_PROMPT = MEMORY_GUIDANCE_PROMPT.human_prompt or ""
+
+    def __init__(self, model: str, base_url: str | None = None, *, text_chars: int = 1400) -> None:
+        self.text_chars = text_chars
+        self.chain = (
+            ChatPromptTemplate.from_messages(
+                [
+                    ("system", self.SYSTEM_PROMPT),
+                    ("human", self.HUMAN_PROMPT),
+                ]
+            )
+            | build_llm(model, base_url=base_url, json_mode=True)
+        )
+
+    def guide(self, *, company: Company, memory: CompanyMemory) -> PromptGuidance:
+        memory_json = compact_text(
+            json.dumps(memory.model_dump(mode="json"), ensure_ascii=True),
+            self.text_chars,
+        )
+        message = self.chain.invoke(
+            {
+                "company": f"{company_display_name(company)} ({company.symbol})",
+                "memory_json": memory_json,
+            }
+        )
+        return sanitize_prompt_guidance(
+            PromptGuidance.model_validate(extract_json_object(message.content)),
+            company=company,
+        )
+
+
+class SearchQueryPlannerAgent:
+    """Plans discovery search queries from identity and memory context."""
+
+    SYSTEM_PROMPT = SEARCH_QUERY_PLANNER_PROMPT.system_prompt
+    HUMAN_PROMPT = SEARCH_QUERY_PLANNER_PROMPT.human_prompt or ""
+
+    def __init__(self, model: str, base_url: str | None = None, *, text_chars: int = 1000) -> None:
+        self.text_chars = text_chars
+        self.chain = (
+            ChatPromptTemplate.from_messages(
+                [
+                    ("system", self.SYSTEM_PROMPT),
+                    ("human", self.HUMAN_PROMPT),
+                ]
+            )
+            | build_llm(model, base_url=base_url, json_mode=True)
+        )
+
+    def plan(
+        self,
+        *,
+        company: Company,
+        guidance: PromptGuidance | None = None,
+        navigation_memory: CompanyNavigationMemory | None = None,
+        limit: int = 4,
+    ) -> SearchQueryPlan:
+        message = self.chain.invoke(
+            {
+                "company_name": company_display_name(company),
+                "ticker": company.symbol,
+                "guidance": guidance_for_agent(guidance, "search", agent_name="SearchQueryPlannerAgent"),
+                "memory_summary": discovery_memory_summary(navigation_memory),
+                "limit": limit,
+            }
+        )
+        plan = SearchQueryPlan.model_validate(extract_json_object(message.content))
+        plan.queries = sanitize_search_queries(plan.queries, limit=limit, ticker=company.symbol)
+        return plan
+
+
+class SearchCandidateRankingAgent:
+    """Ranks search result candidates before deterministic fallback scoring is used."""
+
+    SYSTEM_PROMPT = SEARCH_CANDIDATE_RANKING_PROMPT.system_prompt
+    HUMAN_PROMPT = SEARCH_CANDIDATE_RANKING_PROMPT.human_prompt or ""
+
+    def __init__(self, model: str, base_url: str | None = None, *, max_candidates: int = 25) -> None:
+        self.max_candidates = max_candidates
+        self.chain = (
+            ChatPromptTemplate.from_messages(
+                [
+                    ("system", self.SYSTEM_PROMPT),
+                    ("human", self.HUMAN_PROMPT),
+                ]
+            )
+            | build_llm(model, base_url=base_url, json_mode=True)
+        )
+
+    def rank(
+        self,
+        *,
+        company: Company,
+        candidates: list[IRDiscoveryCandidate],
+        guidance: PromptGuidance | None = None,
+        navigation_memory: CompanyNavigationMemory | None = None,
+    ) -> SearchCandidateRankingDecision:
+        compact = [
+            {
+                "url": candidate.url,
+                "title": compact_text(candidate.title, 120),
+                "snippet": compact_text(candidate.snippet, 240),
+                "source": candidate.source,
+                "fallback_score": candidate.score,
+                "fallback_reasons": candidate.reasons[:5],
+            }
+            for candidate in candidates[: self.max_candidates]
+        ]
+        message = self.chain.invoke(
+            {
+                "company_name": company_display_name(company),
+                "ticker": company.symbol,
+                "guidance": guidance_for_agent(guidance, "search", agent_name="SearchCandidateRankingAgent"),
+                "memory_summary": discovery_memory_summary(navigation_memory),
+                "candidates_json": json.dumps(compact, ensure_ascii=True),
+            }
+        )
+        decision = SearchCandidateRankingDecision.model_validate(extract_json_object(message.content))
+        candidate_urls = {candidate.url for candidate in candidates}
+        decision.selections = [selection for selection in decision.selections if selection.url in candidate_urls]
+        return decision
+
+
+class OrchestrationAnalysisAgent:
+    """Classifies crawl outcomes for supervisor retries."""
+
+    SYSTEM_PROMPT = ORCHESTRATION_ANALYSIS_PROMPT.system_prompt
+    HUMAN_PROMPT = ORCHESTRATION_ANALYSIS_PROMPT.human_prompt or ""
+
+    def __init__(self, model: str, base_url: str | None = None, *, text_chars: int = 2200) -> None:
+        self.text_chars = text_chars
+        self.chain = (
+            ChatPromptTemplate.from_messages(
+                [
+                    ("system", self.SYSTEM_PROMPT),
+                    ("human", self.HUMAN_PROMPT),
+                ]
+            )
+            | build_llm(model, base_url=base_url, json_mode=True)
+        )
+
+    def analyze(self, *, company: Company, evidence: dict) -> OrchestrationAnalysisDecision:
+        message = self.chain.invoke(
+            {
+                "company": f"{company_display_name(company)} ({company.symbol})",
+                "evidence_json": compact_text(json.dumps(evidence, ensure_ascii=True), self.text_chars),
+            }
+        )
+        return OrchestrationAnalysisDecision.model_validate(extract_json_object(message.content))
+
+
+class RetryPlanningAgent:
+    """Plans the next supervisor action from a failure analysis and current config."""
+
+    SYSTEM_PROMPT = RETRY_PLANNING_PROMPT.system_prompt
+    HUMAN_PROMPT = RETRY_PLANNING_PROMPT.human_prompt or ""
+
+    def __init__(self, model: str, base_url: str | None = None, *, text_chars: int = 1600) -> None:
+        self.text_chars = text_chars
+        self.chain = (
+            ChatPromptTemplate.from_messages(
+                [
+                    ("system", self.SYSTEM_PROMPT),
+                    ("human", self.HUMAN_PROMPT),
+                ]
+            )
+            | build_llm(model, base_url=base_url, json_mode=True)
+        )
+
+    def plan(self, *, company: Company, evidence: dict) -> RetryPlanningDecision:
+        message = self.chain.invoke(
+            {
+                "company": f"{company_display_name(company)} ({company.symbol})",
+                "evidence_json": compact_text(json.dumps(evidence, ensure_ascii=True), self.text_chars),
+            }
+        )
+        return RetryPlanningDecision.model_validate(extract_json_object(message.content))
+
+
 class PromptPlannerAgent:
     """Produces non-authoritative prompt guidance from company memory."""
+
+    SYSTEM_PROMPT = PROMPT_PLANNER_PROMPT.system_prompt
+    HUMAN_PROMPT = PROMPT_PLANNER_PROMPT.human_prompt or ""
 
     def __init__(self, model: str, base_url: str | None = None, *, text_chars: int = 1200) -> None:
         self.text_chars = text_chars
@@ -314,33 +843,11 @@ class PromptPlannerAgent:
                 [
                     (
                         "system",
-                        "Create brief advisory guidance for official investor-relations transcript crawler agents. "
-                        "Use only the supplied company memory. Do not infer or invent URLs, hosts, company names, "
-                        "permissions, or facts not present in memory. Guidance is advisory only: it must not override "
-                        "robots.txt, strict transcript detection, official-source requirements, or homepage validation. "
-                        "Write reusable navigation and transcript-selection patterns, not broad search queries. "
-                        "Priority terms should name concrete page/link patterns such as 'quarterly results', "
-                        "'event-detail pages', 'earnings call transcript', or 'speaker turns'. "
-                        "Avoid terms should name concrete low-value patterns such as 'blog', 'webcast-only', "
-                        "'presentation', 'shareholders meeting', or non-English path variants. "
-                        "Do not output the ticker, company name, generic placeholders, or plain words like "
-                        "'IR-related' as priority_terms or avoid_terms. "
-                        "Do not recommend third-party transcript sources, SEC/finance portals, news sites, "
-                        "or any action that ignores, disables, bypasses, or fails open on robots.txt. "
-                        "Return JSON only.",
+                        self.SYSTEM_PROMPT,
                     ),
                     (
                         "human",
-                        "Company: {company}\n"
-                        "Memory JSON:\n{memory_json}\n\n"
-                        "Return empty arrays/strings when memory is too thin for specific guidance. "
-                        "Do not include URLs unless they already appear in memory, and prefer describing URL patterns "
-                        "over copying full URLs. "
-                        "Return exactly:\n"
-                        "{{\"priority_terms\":[\"term\"],\"avoid_terms\":[\"term\"],"
-                        "\"navigation_guidance\":\"short guidance\","
-                        "\"transcript_guidance\":\"short guidance\","
-                        "\"risk_notes\":[\"short note\"]}}",
+                        self.HUMAN_PROMPT,
                     ),
                 ]
             )
@@ -358,15 +865,17 @@ class PromptPlannerAgent:
                 "memory_json": memory_json,
             }
         )
-        model_guidance = sanitize_prompt_guidance(
+        return sanitize_prompt_guidance(
             PromptGuidance.model_validate(extract_json_object(message.content)),
             company=company,
         )
-        return merge_prompt_guidance(model_guidance, guidance_from_memory(memory))
 
 
 class CrawlReflectionAgent:
     """Learns advisory navigation guidance from a failed supervised attempt."""
+
+    SYSTEM_PROMPT = CRAWL_REFLECTION_PROMPT.system_prompt
+    HUMAN_PROMPT = CRAWL_REFLECTION_PROMPT.human_prompt or ""
 
     def __init__(self, model: str, base_url: str | None = None, *, text_chars: int = 1800) -> None:
         self.text_chars = text_chars
@@ -375,26 +884,11 @@ class CrawlReflectionAgent:
                 [
                     (
                         "system",
-                        "Analyze a failed official investor-relations transcript crawl. "
-                        "Return company-specific advisory memory updates for the next attempt. "
-                        "Use only evidence in the crawl summary. Do not invent URLs. "
-                        "Do not grant permissions, ignore robots.txt, fail open, or recommend third-party transcript sources. "
-                        "Return JSON only.",
+                        self.SYSTEM_PROMPT,
                     ),
                     (
                         "human",
-                        "Company: {company}\n"
-                        "Crawl evidence JSON:\n{evidence_json}\n\n"
-                        "Return exactly:\n"
-                        "{{\"preferred_urls\":[\"https://example.com/earnings\"],"
-                        "\"preferred_terms\":[\"quarterly results detail pages\"],"
-                        "\"avoid_urls\":[\"https://example.com/shareholders\"],"
-                        "\"avoid_terms\":[\"shareholders meeting\"],"
-                        "\"prompt_guidance\":{{\"priority_terms\":[\"term\"],\"avoid_terms\":[\"term\"],"
-                        "\"navigation_guidance\":\"short guidance\","
-                        "\"transcript_guidance\":\"short guidance\","
-                        "\"risk_notes\":[\"short note\"]}},"
-                        "\"reason\":\"short reason\"}}",
+                        self.HUMAN_PROMPT,
                     ),
                 ]
             )
@@ -415,15 +909,7 @@ class CrawlReflectionAgent:
 class LinkSelectionAgent:
     """Small specialist agent that chooses links for one navigation task."""
 
-    HUMAN_PROMPT = (
-        "{company_name} ({ticker})\n{url}\nTitle: {title}\n"
-        "Run guidance:\n{guidance}\n\n"
-        "Text:\n{text}\n\n"
-        "Links JSON:\n{links_json}\n\n"
-        "Return exactly: "
-        "{{\"chosen_urls\":[\"https://example.com/investor\"],\"confidence\":0.8,"
-        "\"reason\":\"short reason\",\"stop_reason\":null}}"
-    )
+    HUMAN_PROMPT = LINK_SELECTION_PROMPT.human_prompt or ""
 
     def __init__(
         self,
@@ -467,7 +953,7 @@ class LinkSelectionAgent:
                 "url": url,
                 "title": title,
                 "guidance": combine_guidance(
-                    guidance_for_agent(getattr(self, "guidance", None), "navigation"),
+                    guidance_for_agent(getattr(self, "guidance", None), "navigation", agent_name=self.__class__.__name__),
                     repair_guidance,
                 ),
                 "text": compact_text(text, self.text_chars),
@@ -483,24 +969,8 @@ class LinkSelectionAgent:
 class NavigationValidationAgent:
     """Soft semantic validator for specialist navigation choices."""
 
-    SYSTEM_PROMPT = (
-        "Validate a specialist IR navigation choice. Hard policy already removed "
-        "invented URLs and disallowed hosts. Decide if the remaining URLs fit the "
-        "specialist task. Return JSON only."
-    )
-    HUMAN_PROMPT = (
-        "Specialist: {kind}\n"
-        "Company: {company_name} ({ticker})\n"
-        "Current URL: {url}\n"
-        "Title: {title}\n"
-        "Guidance: {guidance}\n"
-        "Chosen URLs: {chosen_urls_json}\n"
-        "Candidate links JSON:\n{links_json}\n\n"
-        "Return exactly: "
-        "{{\"is_valid\":true,\"accepted_urls\":[\"https://example.com\"],"
-        "\"rejected_urls\":[],\"reason\":\"short reason\","
-        "\"repair_guidance\":null}}"
-    )
+    SYSTEM_PROMPT = NAVIGATION_VALIDATION_PROMPT.system_prompt
+    HUMAN_PROMPT = NAVIGATION_VALIDATION_PROMPT.human_prompt or ""
 
     def __init__(
         self,
@@ -541,7 +1011,7 @@ class NavigationValidationAgent:
                 "ticker": ticker,
                 "url": url,
                 "title": title,
-                "guidance": guidance_for_agent(getattr(self, "guidance", None), "navigation"),
+                "guidance": guidance_for_agent(getattr(self, "guidance", None), "navigation", agent_name="NavigationValidationAgent"),
                 "chosen_urls_json": json.dumps(decision.chosen_urls, ensure_ascii=True),
                 "links_json": json.dumps(compact_links, ensure_ascii=True),
             }
@@ -557,12 +1027,7 @@ class NavigationValidationAgent:
 
 
 class HomepageNavAgent(LinkSelectionAgent):
-    SYSTEM_PROMPT = (
-        "Pick links from an official company homepage toward investor relations. "
-        "Use only provided URLs. Prefer Investors/IR, shareholders, financial reports, "
-        "earnings, events, webcast, transcript. Footer links matter. Avoid careers, "
-        "products, legal, privacy, blogs/news, third-party finance. Return JSON only."
-    )
+    SYSTEM_PROMPT = HOMEPAGE_NAV_PROMPT.system_prompt
 
     def __init__(
         self,
@@ -584,13 +1049,7 @@ class HomepageNavAgent(LinkSelectionAgent):
 
 
 class IRSectionAgent(LinkSelectionAgent):
-    SYSTEM_PROMPT = (
-        "You are inside investor relations. Pick section links that move toward "
-        "earnings-call transcript materials. Use only provided URLs. Prefer Earnings, "
-        "Events, Quarterly Results, Financial Reports, Presentations/Webcasts. Avoid "
-        "governance, stock quote, SEC-only, annual meeting, alerts, privacy/legal, "
-        "careers, blogs/news unless no better IR links exist. Return JSON only."
-    )
+    SYSTEM_PROMPT = IR_SECTION_PROMPT.system_prompt
 
     def __init__(
         self,
@@ -612,13 +1071,7 @@ class IRSectionAgent(LinkSelectionAgent):
 
 
 class EventListingAgent(LinkSelectionAgent):
-    SYSTEM_PROMPT = (
-        "You are on an earnings/events listing. Pick the latest earnings-call event "
-        "or transcript-related event. Use only provided URLs. Prefer current-year or "
-        "newest quarter earnings call links, event-details pages, and links mentioning "
-        "transcript. Avoid annual meetings, conferences, SEC filings, generic news, "
-        "blog posts, YouTube/webcast-only links unless no event page exists. Return JSON only."
-    )
+    SYSTEM_PROMPT = EVENT_LISTING_PROMPT.system_prompt
 
     def __init__(
         self,
@@ -640,13 +1093,7 @@ class EventListingAgent(LinkSelectionAgent):
 
 
 class TranscriptLinkAgent(LinkSelectionAgent):
-    SYSTEM_PROMPT = (
-        "You are on a specific earnings-call event page. Pick transcript material links. "
-        "Use only provided URLs. Prefer links or documents containing transcript, PDF, "
-        "DOCX, Q&A, prepared remarks, or earnings-call transcript. Avoid webcast-only, "
-        "YouTube, calendar, email alerts, presentations, press releases, blogs/news, "
-        "privacy/legal. Return JSON only."
-    )
+    SYSTEM_PROMPT = TRANSCRIPT_LINK_PROMPT.system_prompt
 
     def __init__(
         self,
@@ -1073,20 +1520,38 @@ def compact_candidate_links(
     return compact_links
 
 
-def guidance_for_agent(guidance: PromptGuidance | None, mode: Literal["navigation", "page"]) -> str:
+def guidance_for_agent(
+    guidance: PromptGuidance | None,
+    mode: Literal["homepage", "navigation", "page", "search"],
+    *,
+    agent_name: str | None = None,
+) -> str:
     if not guidance:
         return "None."
     parts = []
+    if guidance.run_objective:
+        parts.append(f"Objective: {guidance.run_objective}")
+    if guidance.strategy:
+        parts.append(f"Run strategy: {guidance.strategy}")
     if guidance.priority_terms:
         parts.append(f"Prefer: {', '.join(guidance.priority_terms[:8])}.")
     if guidance.avoid_terms:
         parts.append(f"Avoid: {', '.join(guidance.avoid_terms[:8])}.")
-    text = guidance.transcript_guidance if mode == "page" else guidance.navigation_guidance
+    if mode == "homepage":
+        text = guidance.homepage_guidance or guidance.navigation_guidance
+    elif mode == "search":
+        text = guidance.search_guidance or guidance.navigation_guidance
+    elif mode == "page":
+        text = guidance.transcript_guidance
+    else:
+        text = guidance.navigation_guidance
     if text:
         parts.append(text)
+    if agent_name and guidance.agent_guidance.get(agent_name):
+        parts.append(f"{agent_name}: {guidance.agent_guidance[agent_name]}")
     if guidance.risk_notes:
         parts.append(f"Risks: {'; '.join(guidance.risk_notes[:3])}.")
-    return compact_text(" ".join(parts), 500) or "None."
+    return compact_text(" ".join(parts), 900) or "None."
 
 
 def combine_guidance(base_guidance: str, repair_guidance: str | None) -> str:
@@ -1128,6 +1593,8 @@ def sanitize_prompt_guidance(guidance: PromptGuidance, *, company: Company | Non
     ]
     banned_exact_terms = prompt_guidance_banned_exact_terms(company)
     return PromptGuidance(
+        run_objective="" if not safe_reflection_text(guidance.run_objective, banned) else compact_text(guidance.run_objective, 220),
+        strategy="" if not safe_reflection_text(guidance.strategy, banned) else compact_text(guidance.strategy, 360),
         priority_terms=[
             compact_text(term, 80)
             for term in guidance.priority_terms[:10]
@@ -1138,9 +1605,103 @@ def sanitize_prompt_guidance(guidance: PromptGuidance, *, company: Company | Non
             for term in guidance.avoid_terms[:10]
             if safe_prompt_guidance_term(term, banned, banned_exact_terms)
         ],
+        homepage_guidance="" if not safe_reflection_text(guidance.homepage_guidance, banned) else compact_text(guidance.homepage_guidance, 280),
+        search_guidance="" if not safe_reflection_text(guidance.search_guidance, banned) else compact_text(guidance.search_guidance, 280),
         navigation_guidance="" if not safe_reflection_text(guidance.navigation_guidance, banned) else compact_text(guidance.navigation_guidance, 280),
         transcript_guidance="" if not safe_reflection_text(guidance.transcript_guidance, banned) else compact_text(guidance.transcript_guidance, 280),
+        agent_guidance={
+            compact_text(name, 80): compact_text(text, 240)
+            for name, text in list(guidance.agent_guidance.items())[:12]
+            if safe_reflection_text(name, banned) and safe_reflection_text(text, banned)
+        },
         risk_notes=risk_notes,
+    )
+
+
+def sanitize_company_playbook(playbook: CompanyPlaybook) -> CompanyPlaybook:
+    banned = ("ignore robots", "disable robots", "fail open", "third-party transcript", "seeking alpha", "quartr")
+    return CompanyPlaybook(
+        issuer_name=compact_text(playbook.issuer_name or "", 120) or None,
+        brand_names=[
+            compact_text(value, 80)
+            for value in playbook.brand_names[:8]
+            if safe_reflection_text(value, banned)
+        ],
+        official_homepage_candidates=[
+            value
+            for value in playbook.official_homepage_candidates[:8]
+            if safe_reflection_text(value, banned) and value.startswith(("http://", "https://"))
+        ],
+        preferred_ir_urls=[
+            value
+            for value in playbook.preferred_ir_urls[:12]
+            if safe_reflection_text(value, banned) and value.startswith(("http://", "https://"))
+        ],
+        avoid_hosts=[
+            compact_text(value, 120)
+            for value in playbook.avoid_hosts[:12]
+            if safe_reflection_text(value, banned)
+        ],
+        avoid_urls=[
+            value
+            for value in playbook.avoid_urls[:12]
+            if safe_reflection_text(value, banned) and value.startswith(("http://", "https://"))
+        ],
+        planner_prompt="" if not safe_reflection_text(playbook.planner_prompt, banned) else compact_text(playbook.planner_prompt, 360),
+        homepage_strategy="" if not safe_reflection_text(playbook.homepage_strategy, banned) else compact_text(playbook.homepage_strategy, 280),
+        ir_strategy="" if not safe_reflection_text(playbook.ir_strategy, banned) else compact_text(playbook.ir_strategy, 280),
+        transcript_strategy="" if not safe_reflection_text(playbook.transcript_strategy, banned) else compact_text(playbook.transcript_strategy, 280),
+        avoid_strategy="" if not safe_reflection_text(playbook.avoid_strategy, banned) else compact_text(playbook.avoid_strategy, 280),
+        confidence=playbook.confidence,
+        evidence=[
+            compact_text(value, 120)
+            for value in playbook.evidence[:8]
+            if safe_reflection_text(value, banned)
+        ],
+    )
+
+
+def guidance_from_playbook(playbook: CompanyPlaybook, *, ticker: str) -> PromptGuidance:
+    if not playbook_has_content(playbook):
+        return PromptGuidance()
+    issuer = playbook.issuer_name or ticker
+    brands = f" Brands: {', '.join(playbook.brand_names[:4])}." if playbook.brand_names else ""
+    return PromptGuidance(
+        run_objective=f"Find the latest official quarterly earnings-call transcript for {issuer} ({ticker}).",
+        strategy=playbook.planner_prompt,
+        priority_terms=[
+            value
+            for value in [
+                *(f"issuer: {issuer}" for _ in [0] if issuer),
+                *[f"brand: {brand}" for brand in playbook.brand_names[:4]],
+                "official issuer homepage",
+                "official investor relations",
+            ]
+            if value
+        ][:10],
+        avoid_terms=playbook.avoid_hosts[:6],
+        homepage_guidance=f"{playbook.homepage_strategy}{brands}".strip(),
+        search_guidance=playbook.ir_strategy,
+        navigation_guidance=playbook.ir_strategy,
+        transcript_guidance=playbook.transcript_strategy,
+        agent_guidance={
+            "PromptPlannerAgent": playbook.planner_prompt,
+            "HomepagePredictionAgent": playbook.homepage_strategy,
+            "SearchQueryPlannerAgent": playbook.ir_strategy,
+            "SearchCandidateRankingAgent": playbook.ir_strategy,
+            "CrawlNavigatorAgent": playbook.ir_strategy,
+        },
+        risk_notes=[playbook.avoid_strategy] if playbook.avoid_strategy else [],
+    )
+
+
+def playbook_has_content(playbook: CompanyPlaybook) -> bool:
+    return bool(
+        playbook.issuer_name
+        or playbook.brand_names
+        or playbook.official_homepage_candidates
+        or playbook.preferred_ir_urls
+        or playbook.planner_prompt
     )
 
 
@@ -1246,20 +1807,67 @@ def guidance_from_memory(memory: CompanyMemory) -> PromptGuidance:
     )
 
 
+def sanitize_search_queries(queries: list[str], *, limit: int, ticker: str | None = None) -> list[str]:
+    safe: list[str] = []
+    banned = (
+        "seeking alpha",
+        "quartr",
+        "marketbeat",
+        "stockanalysis",
+        "yahoo finance",
+        "motley fool",
+        "sec.gov",
+    )
+    for query in queries:
+        cleaned = compact_text(" ".join(str(query).split()), 120)
+        cleaned = re.sub(r"\bsite:\S+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = compact_text(" ".join(cleaned.split()), 120)
+        if ticker and ticker.lower() not in cleaned.lower():
+            cleaned = compact_text(f"{ticker} {cleaned}", 120)
+        lowered = cleaned.lower()
+        if not cleaned or any(token in lowered for token in banned):
+            continue
+        append_unique_text(safe, cleaned)
+        if len(safe) >= limit:
+            break
+    return safe
+
+
 def merge_prompt_guidance(primary: PromptGuidance, memory_guidance: PromptGuidance) -> PromptGuidance:
     return PromptGuidance(
+        run_objective=compact_text(primary.run_objective or memory_guidance.run_objective, 220),
+        strategy=compact_text(primary.strategy or memory_guidance.strategy, 360),
         priority_terms=merge_unique(primary.priority_terms, memory_guidance.priority_terms, limit=10),
         avoid_terms=merge_unique(primary.avoid_terms, memory_guidance.avoid_terms, limit=10),
+        homepage_guidance=compact_text(
+            primary.homepage_guidance or memory_guidance.homepage_guidance,
+            280,
+        ),
+        search_guidance=compact_text(
+            primary.search_guidance or memory_guidance.search_guidance,
+            280,
+        ),
         navigation_guidance=compact_text(
-            memory_guidance.navigation_guidance or primary.navigation_guidance,
+            primary.navigation_guidance or memory_guidance.navigation_guidance,
             280,
         ),
         transcript_guidance=compact_text(
-            memory_guidance.transcript_guidance or primary.transcript_guidance,
+            primary.transcript_guidance or memory_guidance.transcript_guidance,
             280,
         ),
+        agent_guidance=merge_agent_guidance(primary.agent_guidance, memory_guidance.agent_guidance),
         risk_notes=merge_unique(primary.risk_notes, memory_guidance.risk_notes, limit=5),
     )
+
+
+def merge_agent_guidance(primary: dict[str, str], secondary: dict[str, str]) -> dict[str, str]:
+    merged = dict(secondary)
+    merged.update(primary)
+    return {
+        compact_text(name, 80): compact_text(text, 240)
+        for name, text in list(merged.items())[:12]
+        if name and text
+    }
 
 
 def merge_unique(first: list[str], second: list[str], *, limit: int) -> list[str]:

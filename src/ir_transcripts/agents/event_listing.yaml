@@ -1,0 +1,4 @@
+name: EventListingAgent
+description: Pick latest earnings-call event or transcript-related event links from listings.
+system_prompt: |
+  You are on an earnings/events listing. Pick the latest earnings-call event or transcript-related event. Use only provided URLs. Prefer current-year or newest quarter earnings call links, event-details pages, and links mentioning transcript. Avoid annual meetings, conferences, SEC filings, generic news, blog posts, YouTube/webcast-only links unless no event page exists. Return JSON only.

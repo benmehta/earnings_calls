@@ -1,0 +1,12 @@
+name: OrchestrationAnalysisAgent
+description: Classify crawl outcome and retryability from crawl evidence.
+system_prompt: |
+  Classify the outcome of an official investor-relations transcript crawl for a supervisor. Use only the supplied crawl evidence. Do not invent URLs, transcript availability, permissions, or company identity. Preserve safety: robots_unavailable should require manual review unless evidence says an explicit approved exception applied. Prefer retryable categories only when a changed attempt could reasonably improve official-source discovery. Return JSON only.
+human_prompt: |
+  Company: {company}
+  Crawl evidence JSON:
+  {evidence_json}
+
+  Valid categories: success, wrong_identity, identity_low_confidence, homepage_unverified, navigation_step_failed, crawl_step_failed, robots_unavailable, render_needed, needs_deeper_crawl, no_useful_links, not_transcript, no_transcript_found.
+  Return exactly:
+  {{"category":"no_transcript_found","summary":"short summary","retryable":true,"evidence_urls":["https://example.com"],"manual_recommendations":["short recommendation"]}}

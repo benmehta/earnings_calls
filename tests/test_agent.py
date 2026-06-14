@@ -1,6 +1,8 @@
 from ir_transcripts.agent import (
     IRNavigationAgent,
     IRPageAgent,
+    IRSectionAgent,
+    NavigationValidationAgent,
     compact_candidate_links,
     extract_json_object,
     fallback_links_for_kind,
@@ -10,6 +12,7 @@ from ir_transcripts.agent import (
     sanitize_crawl_reflection,
     sanitize_prompt_guidance,
 )
+from ir_transcripts.agent_prompts import load_agent_prompt, parse_prompt_yaml
 from ir_transcripts.models import CandidateLink, Company, CompanyMemory, CrawlReflection, IRDiscoverySelection, NavigationDecision, NavigationValidationResult, PromptGuidance
 
 
@@ -95,6 +98,133 @@ def test_page_agent_accepts_object_useful_urls(monkeypatch) -> None:
 
 def test_extract_json_object_handles_fenced_output() -> None:
     assert extract_json_object('```json\n{"page_type":"ir_index"}\n```') == {"page_type": "ir_index"}
+
+
+def test_navigation_prompts_prefer_quarterly_results_over_stock_pages() -> None:
+    ir_prompt = IRSectionAgent.SYSTEM_PROMPT.lower()
+    validation_prompt = NavigationValidationAgent.SYSTEM_PROMPT.lower()
+
+    for prompt in (ir_prompt, validation_prompt):
+        assert "prefer" in prompt
+        assert "quarterly-results" in prompt
+        assert "transcript" in prompt
+        assert "stock-info" in prompt
+        assert "only if no preferred" in prompt
+        assert "avoid stock-info paths only when no preferred" not in prompt
+
+
+def test_agent_prompt_yaml_loader_supports_multiline_values() -> None:
+    parsed = parse_prompt_yaml(
+        """
+name: ExampleAgent
+description: Example prompt
+system_prompt: |
+  Prefer quarterly-results.
+  Choose stock-info only if no preferred links exist.
+"""
+    )
+
+    assert parsed["name"] == "ExampleAgent"
+    assert parsed["system_prompt"] == (
+        "Prefer quarterly-results.\n"
+        "Choose stock-info only if no preferred links exist."
+    )
+
+
+def test_agent_prompts_load_from_yaml() -> None:
+    prompt = load_agent_prompt("ir_section")
+
+    assert prompt.name == "IRSectionAgent"
+    assert "quarterly-results" in prompt.system_prompt
+    assert "only if no preferred" in prompt.system_prompt
+
+    navigator_prompt = load_agent_prompt("crawl_navigator")
+    assert navigator_prompt.name == "CrawlNavigatorAgent"
+    assert "main navigator" in navigator_prompt.system_prompt
+    assert "latest official quarterly earnings-call transcript" in navigator_prompt.system_prompt
+
+    document_prompt = load_agent_prompt("document_link_triage")
+    assert document_prompt.name == "DocumentLinkTriageAgent"
+    assert "earnings-call transcript" in document_prompt.system_prompt
+
+    transcript_prompt = load_agent_prompt("transcript_evidence")
+    assert transcript_prompt.name == "TranscriptEvidenceAgent"
+    assert "true written public-company earnings-call transcript" in transcript_prompt.system_prompt
+
+    link_prompt = load_agent_prompt("link_batch_triage")
+    assert link_prompt.name == "LinkBatchTriageAgent"
+    assert "official written earnings-call transcript artifacts" in link_prompt.system_prompt
+
+    nav_rank_prompt = load_agent_prompt("navigation_candidate_ranking")
+    assert nav_rank_prompt.name == "NavigationCandidateRankingAgent"
+    assert "Rank candidate links" in nav_rank_prompt.system_prompt
+
+    discovery_prompt = load_agent_prompt("ir_discovery")
+    assert discovery_prompt.name == "IRDiscoveryAgent"
+    assert "not responsible for predicting or validating company homepages" in discovery_prompt.system_prompt
+    assert "official IR/navigation seeds" in discovery_prompt.system_prompt
+
+    search_rank_prompt = load_agent_prompt("search_candidate_ranking")
+    assert search_rank_prompt.name == "SearchCandidateRankingAgent"
+    assert "ranks IR/navigation seeds, not company homepages" in search_rank_prompt.system_prompt
+
+    planner_prompt = load_agent_prompt("prompt_planner")
+    assert planner_prompt.name == "PromptPlannerAgent"
+    assert "Compile a safe run strategy" in planner_prompt.system_prompt
+    assert "agent_guidance" in planner_prompt.human_prompt
+
+
+def test_guidance_for_agent_includes_run_strategy_and_agent_specific_guidance() -> None:
+    from ir_transcripts.agent import guidance_for_agent
+
+    guidance = PromptGuidance(
+        run_objective="Find the latest official quarterly earnings-call transcript.",
+        strategy="Start from official homepage, then official IR, then quarterly results.",
+        navigation_guidance="Prefer earnings result pages over generic stock pages.",
+        agent_guidance={"HomepageNavAgent": "Use footer and corporate navigation to find Investors."},
+    )
+
+    text = guidance_for_agent(guidance, "navigation", agent_name="HomepageNavAgent")
+
+    assert "Objective: Find the latest official quarterly earnings-call transcript." in text
+    assert "Run strategy: Start from official homepage" in text
+    assert "HomepageNavAgent: Use footer" in text
+
+
+def test_search_query_sanitizer_strips_invented_site_operator() -> None:
+    from ir_transcripts.agent import sanitize_search_queries
+
+    queries = sanitize_search_queries(
+        ["site:investor.goo.gl 'latest quarterly earnings report'"],
+        limit=4,
+        ticker="GOOG",
+    )
+
+    assert queries == ["GOOG 'latest quarterly earnings report'"]
+
+
+def test_guidance_from_playbook_compiles_company_specific_strategy() -> None:
+    from ir_transcripts.agent import guidance_from_playbook
+    from ir_transcripts.models import CompanyPlaybook
+
+    guidance = guidance_from_playbook(
+        CompanyPlaybook(
+            issuer_name="Alphabet",
+            brand_names=["Google"],
+            official_homepage_candidates=["https://abc.xyz/"],
+            planner_prompt="Treat Alphabet as issuer and Google as brand.",
+            homepage_strategy="Prefer abc.xyz over google.com when finding investor relations.",
+            ir_strategy="Use Alphabet investor event pages.",
+            transcript_strategy="Prefer official earnings-call transcript artifacts.",
+            avoid_strategy="Avoid fake composite hosts.",
+        ),
+        ticker="GOOG",
+    )
+
+    assert "Alphabet" in guidance.run_objective
+    assert "issuer: Alphabet" in guidance.priority_terms
+    assert guidance.homepage_guidance.startswith("Prefer abc.xyz")
+    assert guidance.agent_guidance["HomepagePredictionAgent"].startswith("Prefer abc.xyz")
 
 
 def test_discovery_selection_accepts_percentage_confidence() -> None:

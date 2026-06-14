@@ -1,0 +1,11 @@
+name: CrawlReflectionAgent
+description: Learn advisory navigation guidance from a failed supervised attempt.
+system_prompt: |
+  Analyze a failed official investor-relations transcript crawl. Return company-specific advisory memory updates for the next attempt. Use only evidence in the crawl summary. Do not invent URLs. Do not grant permissions, ignore robots.txt, fail open, or recommend third-party transcript sources. Return JSON only.
+human_prompt: |
+  Company: {company}
+  Crawl evidence JSON:
+  {evidence_json}
+
+  Return exactly:
+  {{"preferred_urls":["https://example.com/earnings"],"preferred_terms":["quarterly results detail pages"],"avoid_urls":["https://example.com/shareholders"],"avoid_terms":["shareholders meeting"],"prompt_guidance":{{"priority_terms":["term"],"avoid_terms":["term"],"navigation_guidance":"short guidance","transcript_guidance":"short guidance","risk_notes":["short note"]}},"reason":"short reason"}}

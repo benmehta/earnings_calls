@@ -12,6 +12,7 @@ from .models import (
     Company,
     CompanyMemory,
     CompanyNavigationMemory,
+    CompanyPlaybook,
     CrawlReflection,
     CrawlResult,
     FailureAnalysis,
@@ -52,6 +53,7 @@ def merge_company_memory(existing: CompanyMemory, incoming: CompanyMemory) -> Co
     merged.official_homepage_urls = merge_unique_strings(existing.official_homepage_urls, incoming.official_homepage_urls)
     merged.successful_path_urls = merge_unique_strings(existing.successful_path_urls, incoming.successful_path_urls)
     merged.known_ir_urls = merge_unique_strings(existing.known_ir_urls, incoming.known_ir_urls)
+    merged.playbook = merge_company_playbook(existing.playbook, incoming.playbook)
     merged.attempted_configs = merge_unique_models(existing.attempted_configs, incoming.attempted_configs)
     merged.failure_summaries = merge_unique_models(existing.failure_summaries, incoming.failure_summaries)
     merged.rejected_urls = merge_unique_strings(existing.rejected_urls, incoming.rejected_urls)
@@ -112,6 +114,27 @@ def merge_navigation_memory(
     )
 
 
+def merge_company_playbook(existing: CompanyPlaybook, incoming: CompanyPlaybook) -> CompanyPlaybook:
+    return CompanyPlaybook(
+        issuer_name=incoming.issuer_name or existing.issuer_name,
+        brand_names=merge_unique_strings(incoming.brand_names, existing.brand_names),
+        official_homepage_candidates=merge_unique_strings(
+            incoming.official_homepage_candidates,
+            existing.official_homepage_candidates,
+        ),
+        preferred_ir_urls=merge_unique_strings(incoming.preferred_ir_urls, existing.preferred_ir_urls),
+        avoid_hosts=merge_unique_strings(incoming.avoid_hosts, existing.avoid_hosts),
+        avoid_urls=merge_unique_strings(incoming.avoid_urls, existing.avoid_urls),
+        planner_prompt=incoming.planner_prompt or existing.planner_prompt,
+        homepage_strategy=incoming.homepage_strategy or existing.homepage_strategy,
+        ir_strategy=incoming.ir_strategy or existing.ir_strategy,
+        transcript_strategy=incoming.transcript_strategy or existing.transcript_strategy,
+        avoid_strategy=incoming.avoid_strategy or existing.avoid_strategy,
+        confidence=max(existing.confidence, incoming.confidence),
+        evidence=merge_unique_strings(incoming.evidence, existing.evidence),
+    )
+
+
 def merge_saved_prompt_guidance(
     existing: PromptGuidance | None,
     incoming: PromptGuidance | None,
@@ -121,10 +144,15 @@ def merge_saved_prompt_guidance(
     if incoming is None:
         return existing
     return PromptGuidance(
+        run_objective=incoming.run_objective or existing.run_objective,
+        strategy=incoming.strategy or existing.strategy,
         priority_terms=merge_unique_strings(incoming.priority_terms, existing.priority_terms),
         avoid_terms=merge_unique_strings(incoming.avoid_terms, existing.avoid_terms),
+        homepage_guidance=incoming.homepage_guidance or existing.homepage_guidance,
+        search_guidance=incoming.search_guidance or existing.search_guidance,
         navigation_guidance=incoming.navigation_guidance or existing.navigation_guidance,
         transcript_guidance=incoming.transcript_guidance or existing.transcript_guidance,
+        agent_guidance=merge_agent_guidance(incoming.agent_guidance, existing.agent_guidance),
         risk_notes=merge_unique_strings(incoming.risk_notes, existing.risk_notes),
     )
 
@@ -157,8 +185,13 @@ def remember_crawl_result(memory: CompanyMemory, result: CrawlResult, analysis: 
         Company(symbol=memory.company.symbol, name=result.verified_company_name)
     ):
         memory.company = memory.company.model_copy(update={"name": result.verified_company_name})
+        memory.playbook.issuer_name = result.verified_company_name
+        memory.playbook.confidence = max(memory.playbook.confidence, 0.75)
+        append_unique(memory.playbook.evidence, f"verified homepage company name: {result.verified_company_name}")
     for url in result.verified_homepage_urls:
         memory.official_homepage_urls = append_unique(memory.official_homepage_urls, url)
+        memory.playbook.official_homepage_candidates = append_unique(memory.playbook.official_homepage_candidates, url)
+        append_unique(memory.playbook.evidence, f"verified official homepage: {url}")
         homepage_host = host(url)
         if homepage_host:
             memory.official_hosts = append_unique(memory.official_hosts, homepage_host)
@@ -181,6 +214,7 @@ def remember_crawl_result(memory: CompanyMemory, result: CrawlResult, analysis: 
                 memory.ir_hosts = append_unique(memory.ir_hosts, url_host)
             if is_ir_home_url(url):
                 navigation_memory.known_ir_home_urls = append_unique(navigation_memory.known_ir_home_urls, url)
+                memory.playbook.preferred_ir_urls = append_unique(memory.playbook.preferred_ir_urls, url)
             if is_event_listing_url(url) and not low_value_memory_path(url):
                 navigation_memory.known_event_listing_urls = append_unique(navigation_memory.known_event_listing_urls, url)
             remember_low_value_url(navigation_memory.low_value_hosts, navigation_memory.low_value_path_terms, url)
@@ -188,8 +222,14 @@ def remember_crawl_result(memory: CompanyMemory, result: CrawlResult, analysis: 
     for failure in result.failures:
         memory.rejected_urls = append_unique(memory.rejected_urls, failure.url)
         failure_host = host(failure.url)
-        if failure_host and failure.failure_type in {"robots_blocked", "robots_disallowed", "robots_unavailable"}:
+        robots_like_failure = failure.failure_type in {"robots_blocked", "robots_disallowed", "robots_unavailable"} or (
+            failure.failure_type == "navigation_fetch_failed" and "RobotsUnavailableError" in failure.message
+        )
+        if failure_host and robots_like_failure:
             navigation_memory.robots_blocked_hosts = append_unique(navigation_memory.robots_blocked_hosts, failure_host)
+            navigation_memory.low_value_hosts = append_unique(navigation_memory.low_value_hosts, failure_host)
+            memory.playbook.avoid_hosts = append_unique(memory.playbook.avoid_hosts, failure_host)
+            memory.playbook.avoid_urls = append_unique(memory.playbook.avoid_urls, failure.url)
         remember_low_value_url(navigation_memory.low_value_hosts, navigation_memory.low_value_path_terms, failure.url)
 
     for record in result.transcripts:
@@ -274,12 +314,23 @@ def merge_prompt_guidance(existing: PromptGuidance | None, reflected: PromptGuid
     if existing is None:
         return reflected
     return PromptGuidance(
+        run_objective=reflected.run_objective or existing.run_objective,
+        strategy=reflected.strategy or existing.strategy,
         priority_terms=merge_unique(reflected.priority_terms, existing.priority_terms, limit=10),
         avoid_terms=merge_unique(reflected.avoid_terms, existing.avoid_terms, limit=10),
+        homepage_guidance=reflected.homepage_guidance or existing.homepage_guidance,
+        search_guidance=reflected.search_guidance or existing.search_guidance,
         navigation_guidance=reflected.navigation_guidance or existing.navigation_guidance,
         transcript_guidance=reflected.transcript_guidance or existing.transcript_guidance,
+        agent_guidance=merge_agent_guidance(reflected.agent_guidance, existing.agent_guidance),
         risk_notes=merge_unique(reflected.risk_notes, existing.risk_notes, limit=5),
     )
+
+
+def merge_agent_guidance(primary: dict[str, str], secondary: dict[str, str]) -> dict[str, str]:
+    merged = dict(secondary)
+    merged.update(primary)
+    return {key: value for key, value in merged.items() if key and value}
 
 
 def merge_unique(primary: list[str], secondary: list[str], *, limit: int) -> list[str]:

@@ -1,0 +1,18 @@
+name: LinkSelectionAgent
+description: Shared human prompt for specialist navigation link selection.
+system_prompt: |
+  Shared prompt shell for specialist navigation agents.
+human_prompt: |
+  {company_name} ({ticker})
+  {url}
+  Title: {title}
+  Run guidance:
+  {guidance}
+
+  Text:
+  {text}
+
+  Links JSON:
+  {links_json}
+
+  Return exactly: {{"chosen_urls":["https://example.com/investor"],"confidence":0.8,"reason":"short reason","stop_reason":null}}

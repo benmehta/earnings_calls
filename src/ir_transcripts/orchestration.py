@@ -6,7 +6,16 @@ from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from .agent import CrawlReflectionAgent, PromptPlannerAgent, merge_prompt_guidance as merge_agent_prompt_guidance
+from .agent import (
+    CompanyPlaybookAgent,
+    CrawlReflectionAgent,
+    MemoryGuidanceAgent,
+    OrchestrationAnalysisAgent,
+    PromptPlannerAgent,
+    RetryPlanningAgent,
+    guidance_from_playbook,
+    merge_prompt_guidance as merge_agent_prompt_guidance,
+)
 from .crawler import TranscriptCrawler
 from .http import HttpClient
 from .identity import company_display_name, resolve_company_identity_with_overrides
@@ -21,6 +30,8 @@ from .models import (
     CrawlResult,
     FailureAnalysis,
     NavigationTrace,
+    OrchestrationAnalysisDecision,
+    RetryPlanningDecision,
     SupervisorAction,
     SupervisorRunResult,
 )
@@ -161,10 +172,12 @@ class SupervisedCrawler:
         memory = state["memory"]
         memory_name_hint = memory.company.name if memory.company.name and memory.company.name.upper() != memory.company.symbol.upper() else None
         navigation_memory = memory.navigation_memory.model_copy(deep=True)
+        homepage_candidates = list(memory.playbook.official_homepage_candidates)
         if not config.use_prompt_planner:
             updates = {
                 "navigation_memory": navigation_memory,
                 "identity_name_hint": memory_name_hint,
+                "homepage_candidates": homepage_candidates,
             }
             if memory.prompt_guidance:
                 updates["prompt_guidance"] = memory.prompt_guidance.model_copy(deep=True)
@@ -172,6 +185,38 @@ class SupervisedCrawler:
             return state
 
         company = state["current_company"]
+        try:
+            self.progress.log(f"{company.symbol}: company playbook agent starting")
+            with timeout_after(config.llm_timeout_seconds, f"building company playbook for {company.symbol}"):
+                playbook = CompanyPlaybookAgent(
+                    self.model,
+                    base_url=self.ollama_base_url,
+                    text_chars=config.llm_text_chars * 3,
+                ).build(company=company, memory=memory)
+            if playbook.issuer_name or playbook.official_homepage_candidates or playbook.preferred_ir_urls:
+                self.progress.log(f"{company.symbol}: company playbook active")
+            memory.playbook = playbook
+            if playbook.issuer_name and (not memory.company.name or memory.company.name.upper() == memory.company.symbol.upper()):
+                memory.company = memory.company.model_copy(update={"name": playbook.issuer_name})
+                state["current_company"] = state["current_company"].model_copy(update={"name": playbook.issuer_name})
+                company = state["current_company"]
+        except Exception as exc:
+            self.progress.log(f"{company.symbol}: company playbook skipped ({type(exc).__name__}: {exc})")
+
+        playbook_guidance = guidance_from_playbook(memory.playbook, ticker=company.symbol)
+        memory_guidance = None
+        try:
+            self.progress.log(f"{company.symbol}: memory guidance agent starting")
+            with timeout_after(config.llm_timeout_seconds, f"planning memory guidance for {company.symbol}"):
+                memory_guidance = MemoryGuidanceAgent(
+                    self.model,
+                    base_url=self.ollama_base_url,
+                    text_chars=config.llm_text_chars * 2,
+                ).guide(company=company, memory=memory)
+        except Exception as exc:
+            self.progress.log(f"{company.symbol}: memory guidance skipped ({type(exc).__name__}: {exc})")
+            memory_guidance = None
+
         try:
             self.progress.log(f"{company.symbol}: prompt planner starting")
             with timeout_after(config.llm_timeout_seconds, f"planning prompts for {company.symbol}"):
@@ -183,6 +228,16 @@ class SupervisedCrawler:
         except Exception as exc:
             self.progress.log(f"{company.symbol}: prompt planner skipped ({type(exc).__name__}: {exc})")
             guidance = memory.prompt_guidance
+
+        if guidance and memory_guidance:
+            guidance = merge_agent_prompt_guidance(guidance, memory_guidance)
+        elif memory_guidance:
+            guidance = memory_guidance
+
+        if guidance and playbook_guidance:
+            guidance = merge_agent_prompt_guidance(guidance, playbook_guidance)
+        elif playbook_guidance:
+            guidance = playbook_guidance
 
         if guidance and memory.prompt_guidance:
             guidance = merge_agent_prompt_guidance(guidance, memory.prompt_guidance)
@@ -197,6 +252,7 @@ class SupervisedCrawler:
                     "prompt_guidance": guidance.model_copy(deep=True),
                     "navigation_memory": memory.navigation_memory.model_copy(deep=True),
                     "identity_name_hint": memory_name_hint,
+                    "homepage_candidates": homepage_candidates,
                 }
             )
             if should_save_memory_incrementally(config):
@@ -207,6 +263,7 @@ class SupervisedCrawler:
                 update={
                     "navigation_memory": memory.navigation_memory.model_copy(deep=True),
                     "identity_name_hint": memory_name_hint,
+                    "homepage_candidates": homepage_candidates,
                 }
             )
         return state
@@ -234,7 +291,20 @@ class SupervisedCrawler:
     def _analyze_node(self, state: SupervisorState) -> SupervisorState:
         result = state["result"]
         config = state["current_config"]
-        analysis = analyze_crawl_result(result, config)
+        analysis_agent = None
+        if config.use_prompt_planner:
+            analysis_agent = OrchestrationAnalysisAgent(
+                self.model,
+                base_url=self.ollama_base_url,
+                text_chars=config.llm_text_chars * 3,
+            )
+        analysis = analyze_crawl_result(
+            result,
+            config,
+            analysis_agent=analysis_agent,
+            timeout_seconds=config.llm_timeout_seconds,
+            progress=self.progress,
+        )
         self.progress.log(f"{result.company.symbol}: analysis={analysis.category}: {analysis.summary}")
         memory = remember_crawl_result(state["memory"], result, analysis)
         state["memory"] = memory
@@ -287,12 +357,22 @@ class SupervisedCrawler:
     def _plan_node(self, state: SupervisorState) -> SupervisorState:
         analysis = state["analyses"][-1]
         attempts = state.get("attempts", [])
+        planner = None
+        if state["current_config"].use_prompt_planner:
+            planner = RetryPlanningAgent(
+                self.model,
+                base_url=self.ollama_base_url,
+                text_chars=state["current_config"].llm_text_chars * 2,
+            )
         action = plan_next_action(
             analysis,
             company=state["current_company"],
             config=state["current_config"],
             attempt_count=len(attempts),
             max_attempts=state.get("max_attempts", self.max_attempts),
+            planner=planner,
+            timeout_seconds=state["current_config"].llm_timeout_seconds,
+            progress=self.progress,
         )
         self.progress.log(f"{state['current_company'].symbol}: supervisor action={action.action_type}: {action.reason}")
         state["actions"] = [*state.get("actions", []), action.model_copy(deep=True)]
@@ -337,6 +417,7 @@ class SupervisedCrawler:
             prompt_guidance=config.prompt_guidance,
             navigation_memory=config.navigation_memory,
             identity_name_hint=config.identity_name_hint,
+            homepage_candidates=config.homepage_candidates,
             search_timeout_seconds=config.search_timeout_seconds,
             llm_timeout_seconds=config.llm_timeout_seconds,
             navigation_llm_max_links=config.navigation_llm_max_links,
@@ -348,7 +429,14 @@ class SupervisedCrawler:
         return crawler.crawl_company(company)
 
 
-def analyze_crawl_result(result: CrawlResult, config: CrawlAttemptConfig) -> FailureAnalysis:
+def analyze_crawl_result(
+    result: CrawlResult,
+    config: CrawlAttemptConfig,
+    *,
+    analysis_agent: OrchestrationAnalysisAgent | None = None,
+    timeout_seconds: float = 45.0,
+    progress: ProgressReporter | None = None,
+) -> FailureAnalysis:
     if result.transcripts:
         return FailureAnalysis(
             category="success",
@@ -417,12 +505,6 @@ def analyze_crawl_result(result: CrawlResult, config: CrawlAttemptConfig) -> Fai
         manual = [
             "At least one URL could not verify robots.txt. Review before rerunning with --robots-fail-open."
         ]
-        for failure in robots_unavailable:
-            if looks_like_transcript_document(failure.url):
-                manual.append(
-                    f"Officially linked transcript document could not verify robots.txt: {failure.url}. "
-                    "Review before rerunning with --robots-fail-open."
-                )
         return FailureAnalysis(
             category="robots_unavailable",
             summary="robots.txt could not be verified for one or more URLs.",
@@ -431,23 +513,35 @@ def analyze_crawl_result(result: CrawlResult, config: CrawlAttemptConfig) -> Fai
             manual_recommendations=manual,
         )
 
-    if needs_playwright_retry(result, config):
-        return FailureAnalysis(
-            category="render_needed",
-            summary="IR or earnings pages appear likely to need browser rendering.",
-            retryable=True,
-            evidence_urls=[candidate.url for candidate in result.candidates],
-        )
+    agent_analysis = analyze_with_orchestration_agent(
+        result,
+        config,
+        analysis_agent=analysis_agent,
+        timeout_seconds=timeout_seconds,
+        progress=progress,
+    )
+    if agent_analysis and agent_analysis.category in {"render_needed", "needs_deeper_crawl"}:
+        return agent_analysis
+    if not agent_analysis:
+        if needs_playwright_retry(result, config):
+            return FailureAnalysis(
+                category="render_needed",
+                summary="IR or earnings pages appear likely to need browser rendering.",
+                retryable=True,
+                evidence_urls=[candidate.url for candidate in result.candidates],
+            )
 
-    if needs_deeper_crawl(result, config):
-        return FailureAnalysis(
-            category="needs_deeper_crawl",
-            summary="Crawl reached promising IR pages but may need more depth or page budget.",
-            retryable=True,
-            evidence_urls=[candidate.url for candidate in result.candidates],
-        )
+        if needs_deeper_crawl(result, config):
+            return FailureAnalysis(
+                category="needs_deeper_crawl",
+                summary="Crawl reached promising IR pages but may need more depth or page budget.",
+                retryable=True,
+                evidence_urls=[candidate.url for candidate in result.candidates],
+            )
 
     if not result.candidates and not result.failures:
+        if agent_analysis:
+            return agent_analysis
         return FailureAnalysis(
             category="no_useful_links",
             summary=result.skipped_reason or "No useful IR candidates were found.",
@@ -456,12 +550,17 @@ def analyze_crawl_result(result: CrawlResult, config: CrawlAttemptConfig) -> Fai
 
     not_transcript = [failure for failure in result.failures if failure.failure_type == "not_transcript"]
     if not_transcript and len(not_transcript) == len(result.failures):
+        if agent_analysis:
+            return agent_analysis
         return FailureAnalysis(
             category="not_transcript",
             summary="Fetched document candidates were rejected by strict transcript detection.",
             retryable=False,
             evidence_urls=[failure.url for failure in not_transcript],
         )
+
+    if agent_analysis:
+        return agent_analysis
 
     return FailureAnalysis(
         category="no_transcript_found",
@@ -478,6 +577,9 @@ def plan_next_action(
     config: CrawlAttemptConfig,
     attempt_count: int,
     max_attempts: int,
+    planner: RetryPlanningAgent | None = None,
+    timeout_seconds: float = 45.0,
+    progress: ProgressReporter | None = None,
 ) -> SupervisorAction:
     if analysis.category == "success":
         return SupervisorAction(action_type="finish", reason=analysis.summary)
@@ -493,6 +595,19 @@ def plan_next_action(
         return SupervisorAction(action_type="finish", reason=f"Reached supervisor max attempts ({max_attempts}).")
 
     next_attempt = attempt_count + 1
+    planned = plan_with_retry_agent(
+        analysis,
+        company=company,
+        config=config,
+        attempt_count=attempt_count,
+        max_attempts=max_attempts,
+        planner=planner,
+        timeout_seconds=timeout_seconds,
+        progress=progress,
+    )
+    if planned:
+        return planned
+
     if analysis.category == "render_needed" and config.playwright_mode == "off" and not config.use_playwright:
         return SupervisorAction(
             action_type="playwright_retry",
@@ -577,6 +692,143 @@ def plan_next_action(
     return SupervisorAction(action_type="finish", reason=analysis.summary)
 
 
+def analyze_with_orchestration_agent(
+    result: CrawlResult,
+    config: CrawlAttemptConfig,
+    *,
+    analysis_agent: OrchestrationAnalysisAgent | None,
+    timeout_seconds: float,
+    progress: ProgressReporter | None = None,
+) -> FailureAnalysis | None:
+    if not analysis_agent:
+        return None
+    progress = progress or ProgressReporter(enabled=False)
+    evidence = orchestration_analysis_evidence(result, config)
+    try:
+        progress.log(f"{result.company.symbol}: orchestration analysis agent starting")
+        with timeout_after(timeout_seconds, f"analyzing {result.company.symbol} crawl outcome"):
+            decision = analysis_agent.analyze(company=result.company, evidence=evidence)
+    except Exception as exc:
+        progress.log(f"{result.company.symbol}: orchestration analysis skipped ({type(exc).__name__}: {exc})")
+        return None
+    return failure_analysis_from_decision(decision, result)
+
+
+def failure_analysis_from_decision(
+    decision: OrchestrationAnalysisDecision,
+    result: CrawlResult,
+) -> FailureAnalysis:
+    evidence_urls = [
+        url
+        for url in decision.evidence_urls[:20]
+        if normalize_url(url) in {normalize_url(candidate.url) for candidate in result.candidates}
+        or normalize_url(url) in {normalize_url(failure.url) for failure in result.failures if failure.url}
+        or normalize_url(url) in {normalize_url(str(record.source_url)) for record in result.transcripts}
+    ]
+    return FailureAnalysis(
+        category=decision.category,
+        summary=decision.summary[:240] or "Crawl outcome analyzed by orchestration agent.",
+        retryable=decision.retryable,
+        evidence_urls=evidence_urls,
+        manual_recommendations=decision.manual_recommendations[:5],
+    )
+
+
+def plan_with_retry_agent(
+    analysis: FailureAnalysis,
+    *,
+    company: Company,
+    config: CrawlAttemptConfig,
+    attempt_count: int,
+    max_attempts: int,
+    planner: RetryPlanningAgent | None,
+    timeout_seconds: float,
+    progress: ProgressReporter | None = None,
+) -> SupervisorAction | None:
+    if not planner:
+        return None
+    progress = progress or ProgressReporter(enabled=False)
+    evidence = retry_planning_evidence(
+        analysis,
+        config=config,
+        attempt_count=attempt_count,
+        max_attempts=max_attempts,
+    )
+    try:
+        progress.log(f"{company.symbol}: retry planning agent starting")
+        with timeout_after(timeout_seconds, f"planning {company.symbol} retry"):
+            decision = planner.plan(company=company, evidence=evidence)
+    except Exception as exc:
+        progress.log(f"{company.symbol}: retry planning skipped ({type(exc).__name__}: {exc})")
+        return None
+    return supervisor_action_from_retry_decision(
+        decision,
+        analysis=analysis,
+        config=config,
+        attempt_count=attempt_count,
+        max_attempts=max_attempts,
+    )
+
+
+VALID_RETRY_ACTIONS = {
+    "finish",
+    "identity_correction",
+    "identity_retry",
+    "step_retry",
+    "retry",
+    "search_first",
+    "playwright_retry",
+    "deeper_crawl",
+    "manual_review",
+}
+
+CONFIG_UPDATE_FIELDS = set(CrawlAttemptConfig.model_fields)
+
+
+def supervisor_action_from_retry_decision(
+    decision: RetryPlanningDecision,
+    *,
+    analysis: FailureAnalysis,
+    config: CrawlAttemptConfig,
+    attempt_count: int,
+    max_attempts: int,
+) -> SupervisorAction | None:
+    if decision.action_type not in VALID_RETRY_ACTIONS:
+        return None
+    if attempt_count >= max_attempts and decision.action_type != "finish":
+        return None
+    if decision.action_type == "manual_review":
+        return SupervisorAction(
+            action_type="manual_review",
+            reason=decision.reason or analysis.summary,
+            manual_recommendations=decision.manual_recommendations or analysis.manual_recommendations,
+        )
+    if decision.action_type == "finish":
+        return SupervisorAction(action_type="finish", reason=decision.reason or analysis.summary)
+
+    updates = {
+        key: value
+        for key, value in decision.config_updates.items()
+        if key in CONFIG_UPDATE_FIELDS
+    }
+    updates["attempt"] = attempt_count + 1
+    updates.setdefault("reason", f"{analysis.category}_retry")
+
+    if decision.action_type == "playwright_retry":
+        updates.setdefault("use_playwright", True)
+        updates.setdefault("playwright_mode", "auto")
+    elif decision.action_type == "deeper_crawl":
+        updates.setdefault("max_depth", min(config.max_depth + 1, 6))
+        updates.setdefault("max_pages_per_company", min(max(config.max_pages_per_company + 5, 10), 80))
+
+    return SupervisorAction(
+        action_type=decision.action_type,  # type: ignore[arg-type]
+        reason=decision.reason or analysis.summary,
+        next_config=config.model_copy(deep=True, update=updates),
+        manual_recommendations=decision.manual_recommendations,
+    )
+
+
 def needs_playwright_retry(result: CrawlResult, config: CrawlAttemptConfig) -> bool:
     if config.use_playwright or config.playwright_mode != "off":
         return False
@@ -600,6 +852,62 @@ def promising_candidate(candidate: CandidatePage) -> bool:
 
 def page_haystack(candidate: CandidatePage) -> str:
     return f"{candidate.url} {candidate.title} {candidate.llm_page_type or ''} {candidate.reason}"
+
+
+def orchestration_analysis_evidence(result: CrawlResult, config: CrawlAttemptConfig) -> dict[str, Any]:
+    return {
+        "config": {
+            "attempt": config.attempt,
+            "max_depth": config.max_depth,
+            "max_pages_per_company": config.max_pages_per_company,
+            "use_playwright": config.use_playwright,
+            "playwright_mode": config.playwright_mode,
+            "discovery_mode": config.discovery_mode,
+            "latest_only": config.latest_only,
+            "reason": config.reason,
+        },
+        "visited_count": result.visited_count,
+        "ir_url": result.ir_url,
+        "skipped_reason": result.skipped_reason,
+        "transcripts": [
+            {"url": str(record.source_url), "title": record.title}
+            for record in result.transcripts[:10]
+        ],
+        "candidates": [
+            {
+                "url": candidate.url,
+                "title": candidate.title,
+                "depth": candidate.depth,
+                "page_type": candidate.llm_page_type,
+                "confidence": candidate.llm_confidence,
+                "reason": candidate.reason,
+            }
+            for candidate in result.candidates[:30]
+        ],
+        "failures": [
+            {
+                "url": failure.url,
+                "failure_type": failure.failure_type,
+                "message": failure.message[:180],
+            }
+            for failure in result.failures[:30]
+        ],
+    }
+
+
+def retry_planning_evidence(
+    analysis: FailureAnalysis,
+    *,
+    config: CrawlAttemptConfig,
+    attempt_count: int,
+    max_attempts: int,
+) -> dict[str, Any]:
+    return {
+        "analysis": analysis.model_dump(mode="json"),
+        "attempt_count": attempt_count,
+        "max_attempts": max_attempts,
+        "current_config": config.model_dump(mode="json"),
+    }
 
 
 def load_navigation_trace(out_dir: Path, company: Company) -> NavigationTrace | None:
@@ -683,12 +991,6 @@ def evidence_url_set(evidence: dict[str, Any]) -> set[str]:
 
     collect(evidence)
     return urls
-
-
-def looks_like_transcript_document(url: str) -> bool:
-    lowered = url.lower()
-    has_transcript_hint = any(token in lowered for token in ("transcript", "earnings-call", "earnings_call", "earnings"))
-    return has_transcript_hint and (lowered.endswith((".pdf", ".docx")) or "is/content" in lowered)
 
 
 def supervisor_status(result: CrawlResult | None, actions: list[SupervisorAction]) -> str:

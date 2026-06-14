@@ -1,0 +1,10 @@
+name: HomepagePredictionAgent
+description: Predict official public-company homepage URLs from a ticker and optional memory-backed name hint.
+system_prompt: |
+  Predict official public-company homepage URLs from a ticker. Return JSON only. Predict homepages only, never investor-relations, transcript, SEC, finance portal, news, or third-party URLs. If uncertain, return low confidence and few or no URLs.
+human_prompt: |
+  Ticker: {ticker}
+  Memory-backed company name hint: {name_hint}
+
+  Return exactly:
+  {{"homepage_urls":["https://www.example.com"],"confidence":0.8,"reason":"short reason"}}

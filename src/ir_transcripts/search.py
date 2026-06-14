@@ -6,7 +6,7 @@ import requests
 from bs4 import BeautifulSoup
 from duckduckgo_search import DDGS
 
-from .agent import IRDiscoveryAgent
+from .agent import IRDiscoveryAgent, SearchCandidateRankingAgent, SearchQueryPlannerAgent
 from .identity import company_display_name, resolve_company_identity_with_overrides
 from .models import Company, CompanyNavigationMemory, IRDiscoveryCandidate, PromptGuidance
 from .runtime import ProgressReporter, timeout_after
@@ -89,6 +89,11 @@ def discover_ir_candidates(
             company,
             max_results=max_results,
             timeout_seconds=search_timeout_seconds,
+            query_model=rerank_model,
+            ollama_base_url=ollama_base_url,
+            llm_timeout_seconds=llm_timeout_seconds,
+            prompt_guidance=prompt_guidance,
+            navigation_memory=navigation_memory,
             progress=progress,
         )
     )
@@ -107,6 +112,17 @@ def discover_ir_candidates(
             )
 
     ranked = dedupe_candidates(sorted(candidates, key=lambda item: item.score, reverse=True))
+    if rerank_model and ranked:
+        ranked = rank_search_candidates(
+            company,
+            ranked,
+            model=rerank_model,
+            ollama_base_url=ollama_base_url,
+            timeout_seconds=llm_timeout_seconds,
+            prompt_guidance=prompt_guidance,
+            navigation_memory=navigation_memory,
+            progress=progress,
+        )
     ranked = apply_discovery_memory(ranked, navigation_memory=navigation_memory)
     if rerank_model and ranked:
         ranked = rerank_ir_candidates(
@@ -228,6 +244,11 @@ def search_ir_candidates(
     max_results: int = 10,
     *,
     timeout_seconds: float = 30.0,
+    query_model: str | None = None,
+    ollama_base_url: str | None = None,
+    llm_timeout_seconds: float = 45.0,
+    prompt_guidance: PromptGuidance | None = None,
+    navigation_memory: CompanyNavigationMemory | None = None,
     progress: ProgressReporter | None = None,
 ) -> list[IRDiscoveryCandidate]:
     candidates: list[IRDiscoveryCandidate] = []
@@ -235,7 +256,15 @@ def search_ir_candidates(
 
     try:
         with DDGS() as ddgs:
-            for query in search_queries(company):
+            for query in planned_search_queries(
+                company,
+                model=query_model,
+                ollama_base_url=ollama_base_url,
+                timeout_seconds=llm_timeout_seconds,
+                prompt_guidance=prompt_guidance,
+                navigation_memory=navigation_memory,
+                progress=progress,
+            ):
                 progress.log(f"{company.symbol}: DuckDuckGo query: {query}")
                 try:
                     with timeout_after(timeout_seconds, f"searching DuckDuckGo for {query}"):
@@ -244,12 +273,13 @@ def search_ir_candidates(
                             if not url:
                                 continue
                             candidates.append(
-                                score_ir_candidate(
+                                search_result_candidate(
                                     url=url,
                                     title=result.get("title", ""),
                                     snippet=result.get("body", ""),
                                     company=company,
                                     source="search",
+                                    use_agent_scoring=bool(query_model),
                                 )
                             )
                 except Exception as exc:
@@ -267,6 +297,11 @@ def search_ir_candidates(
                 company,
                 max_results=max_results,
                 timeout_seconds=timeout_seconds,
+                query_model=query_model,
+                ollama_base_url=ollama_base_url,
+                llm_timeout_seconds=llm_timeout_seconds,
+                prompt_guidance=prompt_guidance,
+                navigation_memory=navigation_memory,
                 progress=progress,
             )
         )
@@ -279,6 +314,11 @@ def search_ir_candidates_lite_html(
     max_results: int = 10,
     *,
     timeout_seconds: float = 30.0,
+    query_model: str | None = None,
+    ollama_base_url: str | None = None,
+    llm_timeout_seconds: float = 45.0,
+    prompt_guidance: PromptGuidance | None = None,
+    navigation_memory: CompanyNavigationMemory | None = None,
     progress: ProgressReporter | None = None,
 ) -> list[IRDiscoveryCandidate]:
     candidates: list[IRDiscoveryCandidate] = []
@@ -286,7 +326,15 @@ def search_ir_candidates_lite_html(
     session = requests.Session()
     session.headers.update({"User-Agent": "local-ir-discovery/0.1"})
 
-    for query in search_queries(company):
+    for query in planned_search_queries(
+        company,
+        model=query_model,
+        ollama_base_url=ollama_base_url,
+        timeout_seconds=llm_timeout_seconds,
+        prompt_guidance=prompt_guidance,
+        navigation_memory=navigation_memory,
+        progress=progress,
+    ):
         progress.log(f"{company.symbol}: lite HTML query: {query}")
         try:
             request_timeout = min(timeout_seconds, 20) if timeout_seconds > 0 else 20
@@ -309,12 +357,13 @@ def search_ir_candidates_lite_html(
                 continue
             snippet = anchor.find_parent("td").get_text(" ", strip=True) if anchor.find_parent("td") else ""
             candidates.append(
-                score_ir_candidate(
+                search_result_candidate(
                     url=url,
                     title=title,
                     snippet=snippet,
                     company=company,
                     source="search",
+                    use_agent_scoring=bool(query_model),
                 )
             )
             if len(candidates) >= max_results:
@@ -323,6 +372,109 @@ def search_ir_candidates_lite_html(
             break
 
     return dedupe_candidates(candidates)
+
+
+def planned_search_queries(
+    company: Company,
+    *,
+    model: str | None = None,
+    ollama_base_url: str | None = None,
+    timeout_seconds: float = 45.0,
+    prompt_guidance: PromptGuidance | None = None,
+    navigation_memory: CompanyNavigationMemory | None = None,
+    progress: ProgressReporter | None = None,
+) -> list[str]:
+    progress = progress or ProgressReporter(enabled=False)
+    if not model:
+        return search_queries(company)
+    try:
+        progress.log(f"{company.symbol}: planning search queries with Ollama")
+        with timeout_after(timeout_seconds, f"planning search queries for {company.symbol}"):
+            plan = SearchQueryPlannerAgent(model, base_url=ollama_base_url).plan(
+                company=company,
+                guidance=prompt_guidance,
+                navigation_memory=navigation_memory,
+                limit=4,
+            )
+    except Exception as exc:
+        progress.log(f"{company.symbol}: search query planning skipped ({type(exc).__name__}: {exc})")
+        return []
+    return plan.queries
+
+
+def rank_search_candidates(
+    company: Company,
+    candidates: list[IRDiscoveryCandidate],
+    *,
+    model: str,
+    ollama_base_url: str | None = None,
+    timeout_seconds: float = 45.0,
+    prompt_guidance: PromptGuidance | None = None,
+    navigation_memory: CompanyNavigationMemory | None = None,
+    progress: ProgressReporter | None = None,
+) -> list[IRDiscoveryCandidate]:
+    progress = progress or ProgressReporter(enabled=False)
+    by_url = {normalize_url(candidate.url): candidate for candidate in candidates}
+    try:
+        progress.log(f"{company.symbol}: Ollama ranking {len(candidates)} search candidate(s)")
+        with timeout_after(timeout_seconds, f"ranking search candidates for {company.symbol}"):
+            decision = SearchCandidateRankingAgent(model, base_url=ollama_base_url).rank(
+                company=company,
+                candidates=candidates,
+                guidance=prompt_guidance,
+                navigation_memory=navigation_memory,
+            )
+    except Exception as exc:
+        progress.log(f"{company.symbol}: search candidate ranking skipped ({type(exc).__name__}: {exc})")
+        return candidates
+
+    ranked: list[IRDiscoveryCandidate] = []
+    seen: set[str] = set()
+    for selection in sorted(decision.selections, key=lambda item: item.priority, reverse=True):
+        normalized = normalize_url(selection.url)
+        candidate = by_url.get(normalized)
+        if not candidate or normalized in seen:
+            continue
+        adjusted = candidate.model_copy(deep=True)
+        if selection.is_official_candidate:
+            adjusted.score += selection.priority
+        else:
+            adjusted.score -= max(20, selection.priority)
+        append_reason(adjusted, f"ollama search rank: {selection.reason}")
+        ranked.append(adjusted)
+        seen.add(normalized)
+
+    for candidate in candidates:
+        if normalize_url(candidate.url) not in seen:
+            ranked.append(candidate)
+    return ranked
+
+
+def search_result_candidate(
+    *,
+    url: str,
+    title: str,
+    snippet: str,
+    company: Company,
+    source: IRDiscoveryCandidate.model_fields["source"].annotation,
+    use_agent_scoring: bool,
+) -> IRDiscoveryCandidate:
+    if not use_agent_scoring:
+        return score_ir_candidate(
+            url=url,
+            title=title,
+            snippet=snippet,
+            company=company,
+            source=source,
+        )
+    return IRDiscoveryCandidate(
+        url=url,
+        title=title,
+        snippet=snippet,
+        source=source,
+        score=1,
+        reasons=["raw search result for agent ranking"],
+    )
 
 
 def search_queries(company: Company) -> list[str]:

@@ -1,4 +1,5 @@
 from pathlib import Path
+import requests
 from urllib.parse import urljoin
 
 from ir_transcripts.http import RobotsUnavailableError
@@ -198,6 +199,80 @@ def test_navigation_start_urls_can_disable_alphabet_homepage_override(monkeypatc
     )
 
     assert "https://abc.xyz/" not in starts
+    assert "https://www.alphabetgoogle.com" not in starts
+
+
+def test_navigation_start_urls_exclude_memory_robots_failed_hosts(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "ir_transcripts.navigation.discover_ir_candidates",
+        lambda *args, **kwargs: [
+            IRDiscoveryCandidate(url="https://www.alphabetgoogle.com", title="Fake", score=100),
+            IRDiscoveryCandidate(url="https://abc.xyz/investor/", title="Alphabet Investor Relations", score=80),
+        ],
+    )
+    memory = CompanyNavigationMemory(
+        robots_blocked_hosts=["www.alphabetgoogle.com"],
+        low_value_hosts=["www.alphabetgoogle.com"],
+    )
+
+    starts = navigation_start_urls(
+        Company(symbol="GOOG", name="Alphabet Google"),
+        model="test-model",
+        disable_official_homepage_overrides=True,
+        navigation_memory=memory,
+    )
+
+    assert "https://www.alphabetgoogle.com" not in starts
+    assert "https://abc.xyz/investor/" in starts
+
+
+def test_goog_override_disabled_uses_predictive_homepage_before_search(monkeypatch) -> None:
+    class FakeHomepagePredictionAgent:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def predict(self, **kwargs):
+            return HomepagePrediction(homepage_urls=["https://abc.xyz/"], confidence=0.9, reason="Alphabet homepage")
+
+    class FakeHomepageValidationAgent:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def validate(self, **kwargs):
+            return HomepageValidationDecision(
+                is_official=True,
+                confidence=0.9,
+                official_company_name="Alphabet",
+                linked_ir_urls=["https://abc.xyz/investor/"],
+                reason="official Alphabet evidence",
+            )
+
+    pages = {
+        "https://abc.xyz/": """
+        <html><head><title>Alphabet</title></head>
+        <body><a href="/investor/">Investor relations</a></body></html>
+        """,
+        "https://abc.xyz/investor/": """
+        <html><head><title>Alphabet Investor Relations</title></head>
+        <body><a href="/investor/events/default.aspx">Events</a></body></html>
+        """,
+    }
+    monkeypatch.setattr("ir_transcripts.navigation.HomepagePredictionAgent", FakeHomepagePredictionAgent)
+    monkeypatch.setattr("ir_transcripts.navigation.HomepageValidationAgent", FakeHomepageValidationAgent)
+    monkeypatch.setattr("ir_transcripts.navigation.IRNavigationAgent", FakeNavigationAgent)
+    monkeypatch.setattr("ir_transcripts.navigation.discover_ir_candidates", lambda *args, **kwargs: [])
+
+    result = discover_navigation_seeds(
+        Company(symbol="GOOG", name="Alphabet Google"),
+        http=FakeHttp(pages),  # type: ignore[arg-type]
+        model="test-model",
+        max_steps=1,
+        disable_official_homepage_overrides=True,
+    )
+
+    assert result.verified_homepage_urls == ["https://abc.xyz/"]
+    assert result.verified_company_name == "Alphabet"
+    assert result.trace.steps[0].current_url == "https://abc.xyz/"
 
 
 def test_navigation_start_ranking_prefers_broad_ir_home_over_deep_or_blog_urls() -> None:
@@ -359,8 +434,59 @@ def test_navigation_trace_records_candidates_when_agent_fails(monkeypatch) -> No
 
     assert result.failure_type == "navigation_llm_failed"
     assert result.trace.steps[0].candidate_urls == ["https://www.example.com/investors"]
+    assert result.trace.steps[0].candidate_links[0].url == "https://www.example.com/investors"
+    assert result.trace.steps[0].candidate_links[0].label == "Investor Relations"
+    assert result.trace.steps[0].candidate_links[0].context == "body"
+    assert result.trace.steps[0].candidate_links[0].score > 0
     assert result.trace.steps[0].raw_link_count == 2
     assert result.trace.steps[0].stop_reason == "navigation_llm_failed"
+
+
+def test_navigation_renders_verified_official_domain_after_http_error(monkeypatch) -> None:
+    class FailingSubpageHttp(FakeHttp):
+        def get(self, url: str) -> FakeResponse:
+            if url == "https://www.example.com/investors":
+                raise requests.HTTPError("500 Server Error")
+            return super().get(url)
+
+    class FakeRenderer:
+        def __init__(self, http) -> None:
+            self.http = http
+
+        def render_html(self, url: str) -> str:
+            assert url == "https://www.example.com/investors"
+            return """
+            <html><head><title>Example Investor Relations</title></head>
+            <body>
+              <a href="/events/q1-transcript.pdf">Q1 FY27 Earnings Call Transcript</a>
+            </body></html>
+            """
+
+    pages = {
+        "https://www.example.com": """
+        <html><head><title>Example Company</title></head>
+        <body>
+          <footer>Copyright Example. All rights reserved.</footer>
+          <a href="/investors">Investor Relations</a>
+        </body></html>
+        """,
+    }
+    monkeypatch.setattr("ir_transcripts.navigation.IRNavigationAgent", FakeNavigationAgent)
+    monkeypatch.setattr("ir_transcripts.navigation.PlaywrightRenderer", FakeRenderer)
+    monkeypatch.setattr("ir_transcripts.navigation.discover_ir_candidates", lambda *args, **kwargs: [])
+
+    result = discover_navigation_seeds(
+        Company(symbol="EX", name="Example"),
+        http=FailingSubpageHttp(pages),  # type: ignore[arg-type]
+        model="test-model",
+        max_steps=2,
+        playwright_mode="auto",
+    )
+
+    assert result.failure_type is None
+    assert result.trace.steps[1].current_url == "https://www.example.com/investors"
+    assert result.trace.steps[1].render_strategy == "playwright_after_http_error"
+    assert "https://www.example.com/events/q1-transcript.pdf" in result.seeds
 
 
 def test_navigation_delegates_unavailable_robots_for_official_ir_subdomain(monkeypatch) -> None:
@@ -436,6 +562,61 @@ def test_navigation_fetch_failure_stops_current_attempt(monkeypatch) -> None:
     assert result.seeds == []
     assert result.failure_type == "navigation_fetch_failed"
     assert result.failure_urls == ["https://www.example.com"]
+
+
+def test_verified_homepage_name_guides_navigation_host_matching(monkeypatch) -> None:
+    class FakeHomepagePredictionAgent:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def predict(self, **kwargs):
+            return HomepagePrediction(
+                homepage_urls=["https://www.amazon.com"],
+                confidence=0.9,
+                reason="Amazon ticker",
+            )
+
+    class FakeHomepageValidationAgent:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def validate(self, **kwargs):
+            return HomepageValidationDecision(
+                is_official=True,
+                confidence=0.9,
+                official_company_name="Amazon",
+                linked_ir_urls=["https://www.amazon.com/ir"],
+                reason="official Amazon homepage evidence",
+            )
+
+    monkeypatch.setattr("ir_transcripts.navigation.HomepagePredictionAgent", FakeHomepagePredictionAgent)
+    monkeypatch.setattr("ir_transcripts.navigation.HomepageValidationAgent", FakeHomepageValidationAgent)
+    monkeypatch.setattr("ir_transcripts.navigation.IRNavigationAgent", FakeNavigationAgent)
+    monkeypatch.setattr("ir_transcripts.navigation.discover_ir_candidates", lambda *args, **kwargs: [])
+
+    result = discover_navigation_seeds(
+        Company(symbol="AMZN", name=None),
+        http=FakeHttp(
+            {
+                "https://www.amazon.com": """
+                <html><head><title>Amazon.com</title></head>
+                <body><a href="/ir">Investor Relations</a></body></html>
+                """,
+                "https://www.amazon.com/ir": """
+                <html><head><title>Amazon Investor Relations</title></head>
+                <body>
+                  <a href="https://ir.aboutamazon.com/quarterly-results/default.aspx">Quarterly results</a>
+                </body></html>
+                """,
+            }
+        ),  # type: ignore[arg-type]
+        model="test-model",
+        max_steps=2,
+        disable_official_homepage_overrides=True,
+    )
+
+    assert result.trace.company.name == "Amazon"
+    assert "https://ir.aboutamazon.com/quarterly-results/default.aspx" in result.seeds
 
 
 def test_predictive_homepage_uses_ticker_without_name_hint_and_discards_ir_predictions(monkeypatch) -> None:

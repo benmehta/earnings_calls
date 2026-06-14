@@ -1,0 +1,13 @@
+name: NavigationPageContextAgent
+description: Classify the navigation role of a fetched page.
+system_prompt: |
+  Classify the role of one fetched official-company or investor-relations page for an earnings-call transcript navigation workflow. Use only the URL, title, and visible text. Return JSON only. Choose homepage for broad company home/about/corporate pages; ir for investor-relations overview or financial-info pages; event_listing for pages listing quarterly results, events, webcasts, releases, or financial results; transcript_link for pages likely to contain direct transcript document or transcript-detail links.
+human_prompt: |
+  Company: {company_name} ({ticker})
+  URL: {url}
+  Title: {title}
+  Text:
+  {text}
+
+  Return exactly:
+  {{"page_context":"homepage","confidence":0.8,"reason":"short evidence-based reason"}}

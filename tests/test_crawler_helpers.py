@@ -7,6 +7,7 @@ from ir_transcripts.crawler import (
     content_hash,
     crawl_identity_url,
     fiscal_period_key,
+    is_document_like_link,
     is_docx_response,
     is_non_english_variant,
     keep_latest_transcripts,
@@ -14,8 +15,61 @@ from ir_transcripts.crawler import (
     low_value_after_transcript_document,
 )
 from ir_transcripts.http import RobotsDisallowedError, RobotsUnavailableError
-from ir_transcripts.models import CandidateLink, Company, NavigationTrace, PageDecision, TranscriptRecord
+from ir_transcripts.models import CandidateLink, Company, DocumentLinkTriageDecision, LinkBatchTriageDecision, LinkTriageSelection, NavigationTrace, PageDecision, TranscriptEvidenceDecision, TranscriptRecord
 from ir_transcripts.navigation import NavigationDiscoveryResult
+
+
+class FakeDocumentTriageAgent:
+    def triage(self, *, link: CandidateLink, **kwargs):
+        haystack = f"{link.url} {link.label}".lower()
+        is_transcript = "transcript" in haystack or "earnings-call" in haystack or "earnings call" in haystack
+        return DocumentLinkTriageDecision(
+            is_priority_transcript_document=is_transcript,
+            confidence=0.9 if is_transcript else 0.2,
+            document_type="earnings_call_transcript" if is_transcript else "other",
+            reason="fake triage",
+        )
+
+
+class FakeTranscriptEvidenceAgent:
+    def classify(self, *, text: str, title: str = "", url: str = "", **kwargs):
+        haystack = f"{title} {url} {text}".lower()
+        negative = "press release" in haystack and "operator:" not in haystack
+        is_transcript = not negative and (
+            "lseg streetevents edited transcript" in haystack
+            or "operator:" in haystack
+            or "question-and-answer" in haystack
+            or "question and answer" in haystack
+        )
+        return TranscriptEvidenceDecision(
+            is_transcript=is_transcript,
+            confidence=0.9 if is_transcript else 0.1,
+            evidence=["fake transcript evidence"] if is_transcript else [],
+            rejection_reason="transcript_rejected_press_release_like" if negative else "transcript_rejected_fake_evidence",
+        )
+
+
+class FakeLinkBatchTriageAgent:
+    def triage(self, *, links: list[CandidateLink], **kwargs):
+        selections = []
+        for link in links:
+            haystack = f"{link.url} {link.label}".lower()
+            is_useful = any(token in haystack for token in ("transcript", "earnings-call", "quarterly", "events", "financial"))
+            priority = 95 if "transcript" in haystack or "earnings-call" in haystack else 60
+            selections.append(
+                LinkTriageSelection(
+                    url=link.url,
+                    priority=priority,
+                    should_follow=is_useful,
+                    reason="fake link triage",
+                )
+            )
+        return LinkBatchTriageDecision(selections=selections)
+
+
+def install_fake_transcript_evidence(crawler: TranscriptCrawler) -> TranscriptCrawler:
+    crawler.transcript_evidence_agent = FakeTranscriptEvidenceAgent()  # type: ignore[assignment]
+    return crawler
 
 
 def test_link_score_prefers_transcripts() -> None:
@@ -48,8 +102,14 @@ def test_heuristic_links_prioritize_transcript_document_after_page_chrome(tmp_pa
         source_url="https://investor.example.com/financial-reports",
     )
     crawler = TranscriptCrawler(model="test-model", out_dir=tmp_path, seed_urls=["https://investor.example.com"])
+    crawler.link_triage_agent = FakeLinkBatchTriageAgent()  # type: ignore[assignment]
 
-    prioritized = crawler._heuristic_links([*chrome_links, transcript])
+    prioritized = crawler._heuristic_links(
+        Company(symbol="EX", name="Example"),
+        "https://investor.example.com/financial-reports",
+        "Financial Reports",
+        [*chrome_links, transcript],
+    )
 
     assert prioritized[0] == transcript
     assert transcript in prioritized
@@ -75,6 +135,12 @@ def test_low_value_after_transcript_document_keeps_transcript_links() -> None:
     assert low_value_after_transcript_document(sec)
     assert low_value_after_transcript_document(presentation)
     assert not low_value_after_transcript_document(transcript)
+
+
+def test_document_like_link_is_mechanical_not_semantic() -> None:
+    assert is_document_like_link("https://cdn.example.com/files/release.pdf")
+    assert is_document_like_link("https://cdn.example.com/is/content/example/TranscriptQandA")
+    assert not is_document_like_link("https://investor.example.com/quarterly-results")
 
 
 def test_artifact_stem_and_content_hash_are_stable() -> None:
@@ -195,6 +261,8 @@ def test_crawler_does_not_save_press_release_like_html(tmp_path) -> None:
         http=FakeHttp(),  # type: ignore[arg-type]
     )
     crawler.agent = FakeAgent()  # type: ignore[assignment]
+    crawler.document_triage_agent = FakeDocumentTriageAgent()  # type: ignore[assignment]
+    install_fake_transcript_evidence(crawler)
 
     result = crawler.crawl_company(Company(symbol="EX", name="Example"))
 
@@ -246,6 +314,7 @@ def test_crawler_always_playwright_mode_renders_plain_html(monkeypatch, tmp_path
         playwright_mode="always",
     )
     crawler.agent = FakeAgent()  # type: ignore[assignment]
+    install_fake_transcript_evidence(crawler)
 
     result = crawler.crawl_company(Company(symbol="EX", name="Example"))
 
@@ -285,6 +354,7 @@ def test_crawler_saves_docx_transcript(tmp_path) -> None:
         seed_urls=["https://cdn.example.com/ExampleTranscript"],
         http=FakeHttp(content),  # type: ignore[arg-type]
     )
+    install_fake_transcript_evidence(crawler)
 
     result = crawler.crawl_company(Company(symbol="EX", name="Example"))
 
@@ -348,6 +418,8 @@ def test_official_linked_docx_can_fetch_when_document_robots_unavailable_with_fl
         allow_official_linked_documents_on_robots_unavailable=True,
     )
     crawler.agent = FakeAgent()  # type: ignore[assignment]
+    crawler.document_triage_agent = FakeDocumentTriageAgent()  # type: ignore[assignment]
+    install_fake_transcript_evidence(crawler)
 
     result = crawler.crawl_company(Company(symbol="EX", name="Example"))
 
@@ -386,6 +458,8 @@ def test_official_linked_docx_still_blocks_when_delegated_policy_disabled(tmp_pa
         http=FakeHttp(),  # type: ignore[arg-type]
     )
     crawler.agent = FakeAgent()  # type: ignore[assignment]
+    crawler.document_triage_agent = FakeDocumentTriageAgent()  # type: ignore[assignment]
+    install_fake_transcript_evidence(crawler)
 
     result = crawler.crawl_company(Company(symbol="EX", name="Example"))
 
@@ -447,12 +521,86 @@ def test_latest_only_prunes_low_value_queue_after_transcript_document(monkeypatc
         max_depth=2,
     )
     crawler.agent = FakeAgent()  # type: ignore[assignment]
+    crawler.document_triage_agent = FakeDocumentTriageAgent()  # type: ignore[assignment]
+    install_fake_transcript_evidence(crawler)
 
     result = crawler.crawl_company(Company(symbol="EX", name="Example"))
 
     assert len(result.transcripts) == 1
     assert "https://investor.example.com/financial-info/sec-filings/default.aspx" not in fetched
     assert "https://investor.example.com/financial-info/annual-meeting/default.aspx" not in fetched
+
+
+def test_priority_document_triage_fetches_transcript_before_remaining_seed_pages(monkeypatch, tmp_path) -> None:
+    class FakeResponse:
+        def __init__(self, text: str = "", content: bytes = b"", content_type: str = "text/html") -> None:
+            self.text = text
+            self.content = content
+            self.headers = {"content-type": content_type}
+
+    fetched: list[str] = []
+
+    class FakeHttp:
+        def get(self, url: str):
+            fetched.append(url)
+            if url == "https://investor.example.com/financial-info/quarterly-results/default.aspx":
+                return FakeResponse(
+                    """
+                    <html><head><title>Quarterly Results</title></head>
+                    <body>
+                      <a href="https://cdn.example.com/EX-Q1-2027-Earnings-Call.pdf"
+                         aria-label="Transcript of First Quarter 2027, PDF file">Transcript</a>
+                      <a href="https://cdn.example.com/EX-Q1-2027-Earnings-Release.pdf">Earnings Release</a>
+                    </body></html>
+                    """
+                )
+            if url == "https://cdn.example.com/EX-Q1-2027-Earnings-Call.pdf":
+                return FakeResponse(content=b"%PDF transcript fixture", content_type="application/pdf")
+            return FakeResponse("<html><head><title>Low Value</title></head><body></body></html>")
+
+    class FakeAgent:
+        def decide(self, **kwargs):
+            return PageDecision(page_type="ir_index", confidence=0.7, reason="quarterly page", useful_links=[])
+
+    monkeypatch.setattr(
+        "ir_transcripts.crawler.pdf_text",
+        lambda content: (
+            "LSEG STREETEVENTS EDITED TRANSCRIPT\n"
+            "Example Co Q1 2027 Earnings Call\n"
+            "CORPORATE PARTICIPANTS\n"
+            "JANE DOE Example Co - CFO\n"
+            "CONFERENCE CALL PARTICIPANTS\n"
+            "Analyst One\n"
+            "PRESENTATION\n"
+            "Operator Welcome.\n"
+            "QUESTION AND ANSWER\n"
+            "END"
+        ),
+    )
+    crawler = TranscriptCrawler(
+        model="test-model",
+        out_dir=tmp_path,
+        seed_urls=[
+            "https://investor.example.com/financial-info/quarterly-results/default.aspx",
+            "https://investor.example.com/stock-info/stock-quote-and-chart/default.aspx",
+            "https://investor.example.com/financial-info/sec-filings/default.aspx",
+        ],
+        http=FakeHttp(),  # type: ignore[arg-type]
+        max_pages_per_company=2,
+        max_depth=2,
+    )
+    crawler.agent = FakeAgent()  # type: ignore[assignment]
+    crawler.document_triage_agent = FakeDocumentTriageAgent()  # type: ignore[assignment]
+    install_fake_transcript_evidence(crawler)
+    crawler.document_triage_agent = FakeDocumentTriageAgent()  # type: ignore[assignment]
+
+    result = crawler.crawl_company(Company(symbol="EX", name="Example"))
+
+    assert len(result.transcripts) == 1
+    assert fetched[:2] == [
+        "https://investor.example.com/financial-info/quarterly-results/default.aspx",
+        "https://cdn.example.com/EX-Q1-2027-Earnings-Call.pdf",
+    ]
 
 
 def test_latest_only_stops_after_first_saved_transcript_document(monkeypatch, tmp_path) -> None:
@@ -510,6 +658,7 @@ def test_latest_only_stops_after_first_saved_transcript_document(monkeypatch, tm
         max_depth=2,
     )
     crawler.agent = FakeAgent()  # type: ignore[assignment]
+    install_fake_transcript_evidence(crawler)
 
     result = crawler.crawl_company(Company(symbol="EX", name="Example"))
 
@@ -554,6 +703,7 @@ def test_crawler_latest_only_keeps_newest_transcript_artifacts(tmp_path) -> None
         latest_only=True,
     )
     crawler.agent = FakeAgent()  # type: ignore[assignment]
+    install_fake_transcript_evidence(crawler)
 
     result = crawler.crawl_company(Company(symbol="EX", name="Example"))
 
@@ -626,6 +776,7 @@ def test_crawler_delegates_unavailable_robots_for_navigation_verified_ir_subdoma
         http=http,  # type: ignore[arg-type]
     )
     crawler.agent = FakeAgent()  # type: ignore[assignment]
+    install_fake_transcript_evidence(crawler)
 
     result = crawler.crawl_company(company)
 

@@ -4,15 +4,17 @@ from collections import deque
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-from .agent import HomepagePredictionAgent, HomepageValidationAgent, IRNavigationAgent, compact_candidate_links
+from .agent import CrawlNavigatorAgent, HomepagePredictionAgent, HomepageValidationAgent, NavigationCandidateRankingAgent, NavigationPageContextAgent, compact_candidate_links
 from .browser import BROWSER_COMPATIBLE_USER_AGENT, PlaywrightRenderer
 from .http import HttpClient, RobotsUnavailableError
 from .identity import company_display_name, filter_homepage_prediction_urls, is_homepage_candidate_url, is_weak_identity, official_homepage_urls, resolve_company_identity_with_overrides, verify_homepage_content
-from .models import CandidateLink, Company, CompanyNavigationMemory, FailureType, NavigationStep, NavigationTrace, PromptGuidance
+from .models import CandidateLink, Company, CompanyNavigationMemory, FailureType, NavigationCandidateTrace, NavigationStep, NavigationTrace, PromptGuidance
 from .parsing import extract_links, looks_like_js_shell, page_title, visible_text
 from .runtime import ProgressReporter, timeout_after
 from .search import company_domain_tokens, company_domain_slug, discover_ir_candidates
 from .urls import host, normalize_url, resolve_document_url
+
+IRNavigationAgent = CrawlNavigatorAgent
 
 
 @dataclass
@@ -58,6 +60,7 @@ def discover_navigation_seeds(
     prompt_guidance: PromptGuidance | None = None,
     navigation_memory: CompanyNavigationMemory | None = None,
     identity_name_hint: str | None = None,
+    homepage_candidates: list[str] | None = None,
     disable_predictive_identity: bool = False,
     progress: ProgressReporter | None = None,
 ) -> NavigationDiscoveryResult:
@@ -70,7 +73,7 @@ def discover_navigation_seeds(
     trace = NavigationTrace(company=company)
     verified_homepage_urls: list[str] = []
     verified_company_name: str | None = None
-    if is_weak_identity(company) and not disable_predictive_identity:
+    if should_predict_homepage_identity(company, disable_official_homepage_overrides) and not disable_predictive_identity:
         homepage_resolution = predict_and_validate_homepage_starts(
             company,
             http=http,
@@ -79,6 +82,7 @@ def discover_navigation_seeds(
             llm_timeout_seconds=llm_timeout_seconds,
             llm_text_chars=llm_text_chars,
             identity_name_hint=identity_name_hint,
+            homepage_candidates=homepage_candidates or [],
             progress=progress,
         )
         if homepage_resolution.failure_type:
@@ -96,6 +100,9 @@ def discover_navigation_seeds(
         starts = homepage_resolution.starts
         verified_homepage_urls = homepage_resolution.verified_homepage_urls or []
         verified_company_name = homepage_resolution.verified_company_name
+        if verified_company_name and is_weak_identity(company):
+            company = company.model_copy(update={"name": verified_company_name})
+            trace.company = company
         if navigation_memory:
             starts = dedupe([*starts, *memory_start_urls(navigation_memory)])
     else:
@@ -129,6 +136,17 @@ def discover_navigation_seeds(
         text_chars=llm_text_chars,
         guidance=prompt_guidance,
     )
+    ranking_agent = NavigationCandidateRankingAgent(
+        model,
+        base_url=ollama_base_url,
+        max_links=max_links,
+        guidance=prompt_guidance,
+    )
+    page_context_agent = NavigationPageContextAgent(
+        model,
+        base_url=ollama_base_url,
+        text_chars=llm_text_chars,
+    )
     queue: deque[str] = deque(starts)
     visited: set[str] = set()
     allowed_hosts = {host(url) for url in starts}
@@ -143,6 +161,10 @@ def discover_navigation_seeds(
             continue
         visited.add(normalized)
 
+        html: str | None = None
+        title = ""
+        text = ""
+        render_strategy = "http"
         try:
             progress.log(f"{company.symbol}: fetching navigation page {current_url}")
             response = http.get(current_url)
@@ -169,23 +191,37 @@ def discover_navigation_seeds(
             )
             response = http.get_without_robots_check(current_url)
         except Exception as exc:
-            message = f"navigation fetch failed ({type(exc).__name__}: {exc})"
-            progress.log(f"{company.symbol}: {message}: {current_url}")
-            return NavigationDiscoveryResult(
-                seeds=[],
-                trace=trace,
-                failure_type="navigation_fetch_failed",
-                failure_message=message,
-                failure_urls=[current_url],
-                robots_verified_official_urls=robots_verified_official_urls,
-                verified_homepage_urls=verified_homepage_urls,
-                verified_company_name=verified_company_name,
-            )
+            if renderer and is_within_verified_official_domain(
+                current_url,
+                [*verified_homepage_urls, *robots_verified_official_urls],
+            ):
+                try:
+                    progress.log(f"{company.symbol}: rendering navigation page after HTTP fetch failed {current_url}")
+                    html = renderer.render_html(current_url)
+                    title = page_title(html)
+                    text = visible_text(html)
+                    robots_verified_official_urls.append(current_url)
+                    render_strategy = "playwright_after_http_error"
+                except Exception:
+                    html = None
+            if html is None:
+                message = f"navigation fetch failed ({type(exc).__name__}: {exc})"
+                progress.log(f"{company.symbol}: {message}: {current_url}")
+                return NavigationDiscoveryResult(
+                    seeds=[],
+                    trace=trace,
+                    failure_type="navigation_fetch_failed",
+                    failure_message=message,
+                    failure_urls=[current_url],
+                    robots_verified_official_urls=robots_verified_official_urls,
+                    verified_homepage_urls=verified_homepage_urls,
+                    verified_company_name=verified_company_name,
+                )
 
-        html = response.text
-        title = page_title(html)
-        text = visible_text(html)
-        render_strategy = "http"
+        if html is None:
+            html = response.text
+            title = page_title(html)
+            text = visible_text(html)
         if renderer and should_render_navigation_page(playwright_mode, html, text):
             try:
                 progress.log(f"{company.symbol}: rendering navigation page {current_url}")
@@ -214,12 +250,26 @@ def discover_navigation_seeds(
             text=text,
             links=raw_links,
         )
+        page_context = classify_navigation_page_context(
+            company,
+            current_url,
+            title,
+            text,
+            page_context_agent=page_context_agent,
+            llm_timeout_seconds=llm_timeout_seconds,
+            progress=progress,
+        )
         links = navigation_candidate_links(
             raw_links,
             current_url=current_url,
+            title=title,
+            page_context=page_context,
             allowed_hosts=allowed_hosts,
             company=company,
             limit=max_links,
+            ranking_agent=ranking_agent,
+            llm_timeout_seconds=llm_timeout_seconds,
+            progress=progress,
         )
         if (
             renderer
@@ -247,9 +297,22 @@ def discover_navigation_seeds(
                 links = navigation_candidate_links(
                     raw_links,
                     current_url=current_url,
+                    title=title,
+                    page_context=classify_navigation_page_context(
+                        company,
+                        current_url,
+                        title,
+                        text,
+                        page_context_agent=page_context_agent,
+                        llm_timeout_seconds=llm_timeout_seconds,
+                        progress=progress,
+                    ),
                     allowed_hosts=allowed_hosts,
                     company=company,
                     limit=max_links,
+                    ranking_agent=ranking_agent,
+                    llm_timeout_seconds=llm_timeout_seconds,
+                    progress=progress,
                 )
                 render_strategy = "browser_ua_fallback"
             except Exception as exc:
@@ -263,7 +326,6 @@ def discover_navigation_seeds(
             queue=queue,
             progress=progress,
         )
-        page_context = navigation_page_context(current_url, title, text)
         if not links:
             trace.steps.append(
                 NavigationStep(
@@ -279,20 +341,14 @@ def discover_navigation_seeds(
             continue
 
         try:
-            agent_kind = agent.select_agent_kind(
-                url=current_url,
-                title=title,
-                text=text,
-                links=links,
-                page_context=page_context,
-            )
             sent_link_count = len(compact_candidate_links(links, max_links=navigation_llm_max_links))
             progress.log(
-                f"{company.symbol}: asking {agent_kind} agent to choose from "
+                f"{company.symbol}: asking crawl navigator to choose from "
                 f"{sent_link_count} of {len(links)} navigation candidate(s)"
             )
             with timeout_after(llm_timeout_seconds, f"choosing navigation links for {current_url}"):
-                decision = agent.decide(
+                decision = decide_navigation_links(
+                    agent,
                     company_name=company_display_name(company),
                     ticker=company.symbol,
                     url=current_url,
@@ -309,6 +365,12 @@ def discover_navigation_seeds(
                     current_url=current_url,
                     title=title,
                     candidate_urls=[link.url for link in links],
+                    candidate_links=navigation_candidate_trace(
+                        links,
+                        current_url=current_url,
+                        allowed_hosts=allowed_hosts,
+                        company=company,
+                    ),
                     raw_link_count=len(raw_links),
                     render_strategy=render_strategy,
                     reason=message,
@@ -331,17 +393,19 @@ def discover_navigation_seeds(
             reason = decision.reason
             stop_reason = decision.stop_reason
 
-        chosen_urls = sorted(
-            chosen_urls,
-            key=lambda url: navigation_choice_score(url, company, navigation_memory=navigation_memory),
-            reverse=True,
-        )
+        chosen_urls = order_chosen_urls(chosen_urls, links)
         rejected = [link.url for link in links if link.url not in chosen_urls][:10]
         trace.steps.append(
             NavigationStep(
                 current_url=current_url,
                 title=title,
                 candidate_urls=[link.url for link in links],
+                candidate_links=navigation_candidate_trace(
+                    links,
+                    current_url=current_url,
+                    allowed_hosts=allowed_hosts,
+                    company=company,
+                ),
                 raw_link_count=len(raw_links),
                 chosen_urls=chosen_urls,
                 rejected_urls=rejected,
@@ -356,8 +420,7 @@ def discover_navigation_seeds(
             chosen_host = host(chosen_url)
             if chosen_host not in allowed_hosts:
                 allowed_hosts.add(chosen_host)
-            if navigation_choice_score(chosen_url, company, navigation_memory=navigation_memory) >= 10:
-                discovered.append(chosen_url)
+            discovered.append(chosen_url)
             queue.append(chosen_url)
 
     seeds = rank_discovered_urls(discovered, company, navigation_memory=navigation_memory)
@@ -380,9 +443,11 @@ def predict_and_validate_homepage_starts(
     llm_timeout_seconds: float = 45.0,
     llm_text_chars: int = 900,
     identity_name_hint: str | None = None,
+    homepage_candidates: list[str] | None = None,
     progress: ProgressReporter | None = None,
 ) -> HomepageStartResolution:
     progress = progress or ProgressReporter(enabled=False)
+    homepage_candidates = homepage_candidates or []
     try:
         progress.log(f"{company.symbol}: predicting official homepage candidates")
         with timeout_after(llm_timeout_seconds, f"predicting homepage candidates for {company.symbol}"):
@@ -397,17 +462,20 @@ def predict_and_validate_homepage_starts(
             failure_message=f"homepage prediction failed: {type(exc).__name__}: {exc}",
         )
 
-    homepage_urls = filter_homepage_prediction_urls(prediction.homepage_urls)
+    homepage_urls = filter_homepage_prediction_urls([*homepage_candidates, *prediction.homepage_urls])
     if prediction.confidence < PREDICTIVE_HOMEPAGE_CONFIDENCE_FLOOR:
-        return HomepageStartResolution(
-            starts=[],
-            failure_type="identity_low_confidence",
-            failure_message=(
-                f"homepage prediction confidence {prediction.confidence:.2f} "
-                f"below {PREDICTIVE_HOMEPAGE_CONFIDENCE_FLOOR:.2f}: {prediction.reason}"
-            ),
-            failure_urls=homepage_urls,
-        )
+        if homepage_urls and homepage_candidates:
+            progress.log(f"{company.symbol}: using playbook homepage candidate(s) despite low prediction confidence")
+        else:
+            return HomepageStartResolution(
+                starts=[],
+                failure_type="identity_low_confidence",
+                failure_message=(
+                    f"homepage prediction confidence {prediction.confidence:.2f} "
+                    f"below {PREDICTIVE_HOMEPAGE_CONFIDENCE_FLOOR:.2f}: {prediction.reason}"
+                ),
+                failure_urls=homepage_urls,
+            )
     if not homepage_urls:
         return HomepageStartResolution(
             starts=[],
@@ -510,7 +578,9 @@ def navigation_start_urls(
             )
         )
     slug = company_domain_slug(company.name)
-    if slug and not starts:
+    if slug and not starts and not (
+        disable_official_homepage_overrides and company.symbol.upper() in {"GOOG", "GOOGL"}
+    ):
         starts.append(f"https://www.{slug}.com")
     starts.extend(
         candidate.url
@@ -527,9 +597,29 @@ def navigation_start_urls(
             navigation_memory=navigation_memory,
             progress=progress,
         )
-        if candidate.score > 0 and is_company_host(candidate.url, company) and not is_language_variant_url(candidate.url)
+        if candidate.score > 0
+        and is_company_host(candidate.url, company)
+        and not memory_excluded_url(candidate.url, navigation_memory)
+        and not is_language_variant_url(candidate.url)
     )
-    return rank_navigation_starts(dedupe(starts), company, navigation_memory=navigation_memory)
+    return rank_navigation_starts(
+        [url for url in dedupe(starts) if not memory_excluded_url(url, navigation_memory)],
+        company,
+        navigation_memory=navigation_memory,
+    )
+
+
+def should_predict_homepage_identity(company: Company, disable_official_homepage_overrides: bool) -> bool:
+    return is_weak_identity(company) or (
+        disable_official_homepage_overrides and company.symbol.upper() in {"GOOG", "GOOGL"}
+    )
+
+
+def memory_excluded_url(url: str, navigation_memory: CompanyNavigationMemory | None) -> bool:
+    if not navigation_memory:
+        return False
+    destination = host(url)
+    return bool(destination and (destination in navigation_memory.low_value_hosts or destination in navigation_memory.robots_blocked_hosts))
 
 
 def memory_start_urls(navigation_memory: CompanyNavigationMemory) -> list[str]:
@@ -652,6 +742,12 @@ def rank_navigation_starts(
     *,
     navigation_memory: CompanyNavigationMemory | None = None,
 ) -> list[str]:
+    if navigation_memory:
+        return sorted(
+            urls,
+            key=lambda url: navigation_memory_score(url, navigation_memory=navigation_memory),
+            reverse=True,
+        )
     return sorted(
         urls,
         key=lambda url: navigation_start_score(url, company, navigation_memory=navigation_memory),
@@ -716,22 +812,138 @@ def navigation_candidate_links(
     links: list[CandidateLink],
     *,
     current_url: str,
+    title: str = "",
+    page_context: str = "",
     allowed_hosts: set[str],
     company: Company,
     limit: int,
+    ranking_agent: NavigationCandidateRankingAgent | None = None,
+    llm_timeout_seconds: float = 45.0,
+    progress: ProgressReporter | None = None,
 ) -> list[CandidateLink]:
-    scored: list[tuple[int, CandidateLink]] = []
+    eligible: list[CandidateLink] = []
     for link in links:
         link.url = resolve_document_url(link.url)
-        if is_language_variant_url(link.url):
-            continue
-        score = navigation_link_score(link, current_url=current_url, allowed_hosts=allowed_hosts, company=company)
-        if score <= 0:
+        if not mechanically_eligible_navigation_link(link, current_url=current_url, allowed_hosts=allowed_hosts, company=company):
             continue
         link.reason = link.reason or "body"
-        scored.append((score, link))
+        eligible.append(link)
+    if ranking_agent and eligible:
+        try:
+            with timeout_after(llm_timeout_seconds, f"ranking navigation candidates for {current_url}"):
+                decision = ranking_agent.rank(
+                    company_name=company_display_name(company),
+                    ticker=company.symbol,
+                    url=current_url,
+                    title=title,
+                    page_context=page_context or navigation_page_context(current_url, title, ""),
+                    links=eligible,
+                )
+            links_by_url = {link.url: link for link in eligible}
+            ranked = [
+                (selection.priority, links_by_url[selection.url])
+                for selection in decision.selections
+                if selection.should_follow and selection.url in links_by_url
+            ]
+            ranked.sort(key=lambda item: item[0], reverse=True)
+            if ranked:
+                return [mark_agent_selected(link) for _, link in ranked[:limit]]
+            return []
+        except Exception as exc:
+            if progress:
+                progress.log(f"{company.symbol}: navigation candidate ranking failed ({type(exc).__name__}: {current_url})")
+
+    scored: list[tuple[int, CandidateLink]] = [
+        (navigation_link_score(link, current_url=current_url, allowed_hosts=allowed_hosts, company=company), link)
+        for link in eligible
+        if navigation_link_score(link, current_url=current_url, allowed_hosts=allowed_hosts, company=company) > 0
+    ]
     scored.sort(key=lambda item: item[0], reverse=True)
     return [link for _, link in scored[:limit]]
+
+
+def decide_navigation_links(agent, **kwargs) -> "NavigationDecision":
+    if hasattr(agent, "decide_navigation"):
+        return agent.decide_navigation(**kwargs)
+    return agent.decide(**kwargs)
+
+
+def navigation_candidate_trace(
+    links: list[CandidateLink],
+    *,
+    current_url: str,
+    allowed_hosts: set[str],
+    company: Company,
+) -> list[NavigationCandidateTrace]:
+    return [
+        NavigationCandidateTrace(
+            url=link.url,
+            label=link.label,
+            context=link.reason,
+            score=navigation_link_score(
+                link,
+                current_url=current_url,
+                allowed_hosts=allowed_hosts,
+                company=company,
+            ),
+        )
+        for link in links
+    ]
+
+
+def mechanically_eligible_navigation_link(
+    link: CandidateLink,
+    *,
+    current_url: str,
+    allowed_hosts: set[str],
+    company: Company,
+) -> bool:
+    parsed = urlparse(link.url)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    if is_language_variant_url(link.url):
+        return False
+    destination_host = host(link.url)
+    return destination_host in allowed_hosts or is_same_company_host(link.url, current_url, company)
+
+
+def mark_agent_selected(link: CandidateLink) -> CandidateLink:
+    if "[agent-selected]" not in link.reason:
+        link.reason = f"[agent-selected] {link.reason}".strip()
+    return link
+
+
+def order_chosen_urls(chosen_urls: list[str], links: list[CandidateLink]) -> list[str]:
+    link_order = {link.url: index for index, link in enumerate(links)}
+    return sorted(chosen_urls, key=lambda url: link_order.get(url, len(link_order)))
+
+
+def classify_navigation_page_context(
+    company: Company,
+    url: str,
+    title: str,
+    text: str,
+    *,
+    page_context_agent: NavigationPageContextAgent | None = None,
+    llm_timeout_seconds: float = 45.0,
+    progress: ProgressReporter | None = None,
+) -> str:
+    if not page_context_agent:
+        return navigation_page_context(url, title, text)
+    try:
+        with timeout_after(llm_timeout_seconds, f"classifying navigation page context {url}"):
+            decision = page_context_agent.classify(
+                company_name=company_display_name(company),
+                ticker=company.symbol,
+                url=url,
+                title=title,
+                text=text,
+            )
+    except Exception as exc:
+        if progress:
+            progress.log(f"{company.symbol}: navigation page context failed ({type(exc).__name__}: {url})")
+        return "homepage"
+    return decision.page_context if decision.confidence >= 0.45 else "homepage"
 
 
 def navigation_link_score(

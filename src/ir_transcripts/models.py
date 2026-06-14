@@ -77,6 +77,114 @@ class HomepageValidationDecision(BaseModel):
         return value
 
 
+class DocumentLinkTriageDecision(BaseModel):
+    is_priority_transcript_document: bool = False
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    document_type: Literal[
+        "earnings_call_transcript",
+        "earnings_release",
+        "presentation",
+        "webcast",
+        "filing",
+        "other",
+    ] = "other"
+    reason: str = ""
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def coerce_confidence(cls, value):
+        if isinstance(value, (int, float)) and value > 1:
+            return value / 100
+        return value
+
+
+class TranscriptEvidenceDecision(BaseModel):
+    is_transcript: bool = False
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence: list[str] = Field(default_factory=list)
+    rejection_reason: str = "transcript_rejected_missing_evidence"
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def coerce_confidence(cls, value):
+        if isinstance(value, (int, float)) and value > 1:
+            return value / 100
+        return value
+
+
+class LinkTriageSelection(BaseModel):
+    url: str
+    priority: int = Field(default=0, ge=0, le=100)
+    should_follow: bool = False
+    reason: str = ""
+
+
+class LinkBatchTriageDecision(BaseModel):
+    selections: list[LinkTriageSelection] = Field(default_factory=list)
+
+
+class NavigationCandidateSelection(BaseModel):
+    url: str
+    priority: int = Field(default=0, ge=0, le=100)
+    should_follow: bool = False
+    reason: str = ""
+
+
+class NavigationCandidateRankingDecision(BaseModel):
+    selections: list[NavigationCandidateSelection] = Field(default_factory=list)
+
+
+class NavigationPageContextDecision(BaseModel):
+    page_context: Literal["homepage", "ir", "event_listing", "transcript_link"] = "homepage"
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    reason: str = ""
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def coerce_confidence(cls, value):
+        if isinstance(value, (int, float)) and value > 1:
+            return value / 100
+        return value
+
+
+class SearchQueryPlan(BaseModel):
+    queries: list[str] = Field(default_factory=list)
+    reason: str = ""
+
+
+class SearchCandidateSelection(BaseModel):
+    url: str
+    priority: int = Field(default=0, ge=0, le=100)
+    is_official_candidate: bool = False
+    reason: str = ""
+
+
+class SearchCandidateRankingDecision(BaseModel):
+    selections: list[SearchCandidateSelection] = Field(default_factory=list)
+
+
+class CrawlNavigatorDecision(BaseModel):
+    page_type: Literal[
+        "transcript",
+        "earnings_event",
+        "press_release",
+        "filings",
+        "ir_index",
+        "not_relevant",
+    ] = "not_relevant"
+    chosen_urls: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    reason: str = ""
+    stop_reason: str | None = None
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def coerce_confidence(cls, value):
+        if isinstance(value, (int, float)) and value > 1:
+            return value / 100
+        return value
+
+
 class NavigationDecision(BaseModel):
     chosen_urls: list[str] = Field(default_factory=list)
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -92,10 +200,18 @@ class NavigationValidationResult(BaseModel):
     repair_guidance: str | None = None
 
 
+class NavigationCandidateTrace(BaseModel):
+    url: str
+    label: str = ""
+    context: str = ""
+    score: int = 0
+
+
 class NavigationStep(BaseModel):
     current_url: str
     title: str = ""
     candidate_urls: list[str] = Field(default_factory=list)
+    candidate_links: list[NavigationCandidateTrace] = Field(default_factory=list)
     raw_link_count: int = 0
     chosen_urls: list[str] = Field(default_factory=list)
     rejected_urls: list[str] = Field(default_factory=list)
@@ -111,10 +227,15 @@ class NavigationTrace(BaseModel):
 
 
 class PromptGuidance(BaseModel):
+    run_objective: str = ""
+    strategy: str = ""
     priority_terms: list[str] = Field(default_factory=list)
     avoid_terms: list[str] = Field(default_factory=list)
+    homepage_guidance: str = ""
+    search_guidance: str = ""
     navigation_guidance: str = ""
     transcript_guidance: str = ""
+    agent_guidance: dict[str, str] = Field(default_factory=dict)
     risk_notes: list[str] = Field(default_factory=list)
 
 
@@ -245,6 +366,29 @@ class CompanyNavigationMemory(BaseModel):
     robots_blocked_hosts: list[str] = Field(default_factory=list)
 
 
+class CompanyPlaybook(BaseModel):
+    issuer_name: str | None = None
+    brand_names: list[str] = Field(default_factory=list)
+    official_homepage_candidates: list[str] = Field(default_factory=list)
+    preferred_ir_urls: list[str] = Field(default_factory=list)
+    avoid_hosts: list[str] = Field(default_factory=list)
+    avoid_urls: list[str] = Field(default_factory=list)
+    planner_prompt: str = ""
+    homepage_strategy: str = ""
+    ir_strategy: str = ""
+    transcript_strategy: str = ""
+    avoid_strategy: str = ""
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence: list[str] = Field(default_factory=list)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def coerce_confidence(cls, value):
+        if isinstance(value, (int, float)) and value > 1:
+            return value / 100
+        return value
+
+
 class CrawlAttemptConfig(BaseModel):
     attempt: int = 1
     max_pages_per_company: int = 40
@@ -268,6 +412,7 @@ class CrawlAttemptConfig(BaseModel):
     prompt_guidance: PromptGuidance | None = None
     navigation_memory: CompanyNavigationMemory | None = None
     identity_name_hint: str | None = None
+    homepage_candidates: list[str] = Field(default_factory=list)
     search_timeout_seconds: float = 30.0
     llm_timeout_seconds: float = 45.0
     navigation_llm_max_links: int = 12
@@ -300,6 +445,21 @@ class FailureAnalysis(BaseModel):
     manual_recommendations: list[str] = Field(default_factory=list)
 
 
+class OrchestrationAnalysisDecision(BaseModel):
+    category: FailureCategory
+    summary: str
+    retryable: bool = False
+    evidence_urls: list[str] = Field(default_factory=list)
+    manual_recommendations: list[str] = Field(default_factory=list)
+
+
+class RetryPlanningDecision(BaseModel):
+    action_type: str
+    reason: str
+    config_updates: dict[str, object] = Field(default_factory=dict)
+    manual_recommendations: list[str] = Field(default_factory=list)
+
+
 SupervisorActionType = Literal[
     "finish",
     "identity_correction",
@@ -323,6 +483,7 @@ class SupervisorAction(BaseModel):
 
 class CompanyMemory(BaseModel):
     company: Company
+    playbook: CompanyPlaybook = Field(default_factory=CompanyPlaybook)
     official_hosts: list[str] = Field(default_factory=list)
     ir_hosts: list[str] = Field(default_factory=list)
     official_homepage_urls: list[str] = Field(default_factory=list)
