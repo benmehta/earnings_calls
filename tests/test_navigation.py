@@ -434,6 +434,7 @@ def test_predictive_homepage_uses_ticker_without_name_hint_and_discards_ir_predi
             return HomepageValidationDecision(
                 is_official=True,
                 confidence=0.9,
+                official_company_name="Amazon",
                 linked_ir_urls=["https://ir.aboutamazon.com"],
                 reason="official Amazon homepage evidence",
             )
@@ -457,6 +458,8 @@ def test_predictive_homepage_uses_ticker_without_name_hint_and_discards_ir_predi
     assert captured == {"ticker": "AMZN", "name_hint": None}
     assert "https://www.amazon.com" in result.starts
     assert "https://ir.aboutamazon.com" in result.starts
+    assert result.verified_homepage_urls == ["https://www.amazon.com"]
+    assert result.verified_company_name == "Amazon"
 
 
 def test_predictive_homepage_passes_memory_name_hint(monkeypatch) -> None:
@@ -582,3 +585,49 @@ def test_navigation_auto_renders_q4_event_listing(monkeypatch) -> None:
     )
 
     assert "https://abc.xyz/investor/events/event-details/2026/2026-Q1-Earnings-Call/default.aspx" in result.seeds
+
+
+def test_navigation_browser_ua_fallback_for_sparse_official_domain_homepage(monkeypatch) -> None:
+    sparse_homepage = """
+    <html><head><title>Amazon.com</title></head>
+    <body>Amazon.com Continue shopping Conditions of Use Privacy Policy</body></html>
+    """
+    full_homepage = """
+    <html><head><title>Amazon.com. Spend less. Smile more.</title></head>
+    <body>
+      <footer>
+        <a href="/ir">Investor Relations</a>
+        <a href="https://www.aboutamazon.com/">About Amazon</a>
+      </footer>
+    </body></html>
+    """
+
+    class FakeRenderer:
+        def __init__(self, http) -> None:
+            self.http = http
+
+        def render_html(self, url: str) -> str:
+            assert url == "https://www.amazon.com"
+            return sparse_homepage
+
+        def render_html_with_user_agent(self, url: str, user_agent: str) -> str:
+            assert url == "https://www.amazon.com"
+            assert "Chrome" in user_agent
+            return full_homepage
+
+    monkeypatch.setattr("ir_transcripts.navigation.IRNavigationAgent", FakeNavigationAgent)
+    monkeypatch.setattr("ir_transcripts.navigation.PlaywrightRenderer", FakeRenderer)
+    monkeypatch.setattr("ir_transcripts.navigation.discover_ir_candidates", lambda *args, **kwargs: [])
+
+    result = discover_navigation_seeds(
+        Company(symbol="AMZN", name="Amazon"),
+        http=FakeHttp({"https://www.amazon.com": sparse_homepage}),  # type: ignore[arg-type]
+        model="test-model",
+        max_steps=1,
+        playwright_mode="always",
+        disable_official_homepage_overrides=True,
+    )
+
+    assert result.trace.steps[0].render_strategy == "browser_ua_fallback"
+    assert result.trace.steps[0].chosen_urls == ["https://www.amazon.com/ir"]
+    assert "https://www.amazon.com/ir" in result.seeds

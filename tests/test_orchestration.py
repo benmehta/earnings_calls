@@ -129,6 +129,7 @@ def test_successful_transcript_stops_graph_and_updates_memory(tmp_path: Path) ->
     def runner(run_company: Company, config: CrawlAttemptConfig) -> CrawlResult:
         return CrawlResult(
             company=run_company,
+            verified_homepage_urls=["https://www.example.com"],
             ir_url="https://investor.example.com",
             transcripts=[
                 TranscriptRecord(
@@ -154,6 +155,12 @@ def test_successful_transcript_stops_graph_and_updates_memory(tmp_path: Path) ->
     assert result.status == "success"
     assert len(result.attempts) == 1
     assert memory.successful_transcript_urls == ["https://investor.example.com/q1-transcript.pdf"]
+    assert memory.successful_path_urls == [
+        "https://www.example.com",
+        "https://investor.example.com",
+        "https://investor.example.com/q1-transcript.pdf",
+    ]
+    assert memory.ir_hosts == ["investor.example.com"]
     assert memory.navigation_memory.successful_hosts == ["investor.example.com"]
     assert memory.navigation_memory.preferred_hosts == ["investor.example.com"]
     assert memory.navigation_memory.known_transcript_urls == ["https://investor.example.com/q1-transcript.pdf"]
@@ -163,6 +170,7 @@ def test_save_company_memory_merges_existing_file_instead_of_overwriting(tmp_pat
     company = Company(symbol="EX", name="Example")
     first_pass = CompanyMemory(company=company)
     first_pass.known_ir_urls = ["https://investor.example.com/events"]
+    first_pass.ir_hosts = ["investor.example.com"]
     first_pass.successful_transcript_urls = ["https://investor.example.com/q1-transcript.pdf"]
     first_pass.attempted_configs = [CrawlAttemptConfig(attempt=1)]
     first_pass.prompt_guidance = PromptGuidance(priority_terms=["earnings transcript"])
@@ -174,6 +182,7 @@ def test_save_company_memory_merges_existing_file_instead_of_overwriting(tmp_pat
     save_company_memory(tmp_path, first_pass)
 
     second_pass = CompanyMemory(company=Company(symbol="EX", name="EX"))
+    second_pass.ir_hosts = ["ir.example.com"]
     second_pass.known_ir_urls = [
         "https://investor.example.com/events",
         "https://investor.example.com/results",
@@ -197,6 +206,7 @@ def test_save_company_memory_merges_existing_file_instead_of_overwriting(tmp_pat
         "https://investor.example.com/events",
         "https://investor.example.com/results",
     ]
+    assert memory.ir_hosts == ["investor.example.com", "ir.example.com"]
     assert memory.successful_transcript_urls == ["https://investor.example.com/q1-transcript.pdf"]
     assert memory.rejected_urls == ["https://blog.example.com/results"]
     assert [config.attempt for config in memory.attempted_configs] == [1, 2]
@@ -243,10 +253,85 @@ def test_memory_does_not_mark_blog_or_youtube_as_official_hosts() -> None:
     )
 
     assert "abc.xyz" in memory.official_hosts
+    assert "abc.xyz" in memory.ir_hosts
     assert "blog.google" not in memory.official_hosts
     assert "www.youtube.com" not in memory.official_hosts
+    assert "blog.google" not in memory.ir_hosts
+    assert "www.youtube.com" not in memory.ir_hosts
     assert "blog.google" in memory.navigation_memory.low_value_hosts
     assert "www.youtube.com" in memory.navigation_memory.low_value_hosts
+
+
+def test_memory_records_verified_homepage_identity() -> None:
+    company = Company(symbol="AMZN", name="AMZN")
+    memory = remember_crawl_result(
+        load_company_memory(Path("/tmp/nonexistent-memory-root"), company),
+        CrawlResult(
+            company=company,
+            verified_homepage_urls=["https://www.amazon.com"],
+            verified_company_name="Amazon",
+            skipped_reason="No investor-relations candidates found",
+        ),
+        FailureAnalysis(category="no_useful_links", summary="No investor-relations candidates found"),
+    )
+
+    assert memory.company.name == "Amazon"
+    assert memory.official_homepage_urls == ["https://www.amazon.com"]
+    assert memory.official_hosts == ["www.amazon.com"]
+    assert memory.ir_hosts == []
+
+
+def test_memory_records_all_successful_path_urls() -> None:
+    company = Company(symbol="EX", name="Example")
+    memory = remember_crawl_result(
+        load_company_memory(Path("/tmp/nonexistent-memory-root"), company),
+        CrawlResult(
+            company=company,
+            verified_homepage_urls=["https://www.example.com"],
+            ir_url="https://investor.example.com",
+            candidates=[
+                CandidatePage(company=company, url="https://investor.example.com/financial-reports"),
+                CandidatePage(company=company, url="https://investor.example.com/events/q1"),
+            ],
+            transcripts=[
+                TranscriptRecord(
+                    company=company,
+                    source_url="https://investor.example.com/events/q1/transcript.pdf",
+                    title="Example Q1 Transcript",
+                    text="OPERATOR: Welcome. QUESTION-AND-ANSWER SESSION.",
+                )
+            ],
+        ),
+        FailureAnalysis(category="success", summary="Saved transcript"),
+    )
+
+    assert memory.official_homepage_urls == ["https://www.example.com"]
+    assert memory.successful_path_urls == [
+        "https://www.example.com",
+        "https://investor.example.com",
+        "https://investor.example.com/financial-reports",
+        "https://investor.example.com/events/q1",
+        "https://investor.example.com/events/q1/transcript.pdf",
+    ]
+    assert memory.official_hosts == ["www.example.com", "investor.example.com"]
+    assert memory.ir_hosts == ["investor.example.com"]
+
+
+def test_memory_ignores_weak_verified_company_name() -> None:
+    company = Company(symbol="AMZN", name=None)
+    memory = remember_crawl_result(
+        load_company_memory(Path("/tmp/nonexistent-memory-root"), company),
+        CrawlResult(
+            company=company,
+            verified_homepage_urls=["https://www.amazon.com"],
+            verified_company_name="AMZN",
+        ),
+        FailureAnalysis(category="no_useful_links", summary="No investor-relations candidates found"),
+    )
+
+    assert memory.company.name is None
+    assert memory.official_homepage_urls == ["https://www.amazon.com"]
+    assert memory.ir_hosts == []
 
 
 def test_reflection_memory_learns_preferred_and_avoid_paths() -> None:
@@ -271,6 +356,7 @@ def test_reflection_memory_learns_preferred_and_avoid_paths() -> None:
     )
 
     assert "https://investor.example.com/english/quarterly-results/2026/q1" in memory.navigation_memory.known_event_listing_urls
+    assert "investor.example.com" in memory.ir_hosts
     assert "https://investor.example.com/english/shareholders-meeting" in memory.rejected_urls
     assert "shareholders-meeting" in memory.navigation_memory.low_value_path_terms
     assert "japanese/" in memory.navigation_memory.low_value_path_terms

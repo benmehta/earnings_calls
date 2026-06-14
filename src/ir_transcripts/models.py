@@ -65,6 +65,7 @@ class HomepagePrediction(BaseModel):
 class HomepageValidationDecision(BaseModel):
     is_official: bool = False
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    official_company_name: str | None = None
     linked_ir_urls: list[str] = Field(default_factory=list)
     reason: str = ""
 
@@ -96,6 +97,7 @@ class NavigationStep(BaseModel):
     title: str = ""
     chosen_urls: list[str] = Field(default_factory=list)
     rejected_urls: list[str] = Field(default_factory=list)
+    render_strategy: str | None = None
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     reason: str = ""
     stop_reason: str | None = None
@@ -220,6 +222,8 @@ class CandidatePage(BaseModel):
 class CrawlResult(BaseModel):
     company: Company
     ir_url: str | None = None
+    verified_homepage_urls: list[str] = Field(default_factory=list)
+    verified_company_name: str | None = None
     transcripts: list[TranscriptRecord] = Field(default_factory=list)
     candidates: list[CandidatePage] = Field(default_factory=list)
     failures: list[CrawlFailure] = Field(default_factory=list)
@@ -318,6 +322,9 @@ class SupervisorAction(BaseModel):
 class CompanyMemory(BaseModel):
     company: Company
     official_hosts: list[str] = Field(default_factory=list)
+    ir_hosts: list[str] = Field(default_factory=list)
+    official_homepage_urls: list[str] = Field(default_factory=list)
+    successful_path_urls: list[str] = Field(default_factory=list)
     known_ir_urls: list[str] = Field(default_factory=list)
     attempted_configs: list[CrawlAttemptConfig] = Field(default_factory=list)
     failure_summaries: list[FailureAnalysis] = Field(default_factory=list)

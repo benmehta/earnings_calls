@@ -652,6 +652,30 @@ def test_nav_first_does_not_fallback_to_search_when_navigation_empty(monkeypatch
     assert crawler._discover_seeds(company) == []
 
 
+def test_nav_first_empty_result_preserves_verified_homepage_identity(monkeypatch, tmp_path) -> None:
+    company = Company(symbol="AMZN", name=None)
+    monkeypatch.setattr(
+        "ir_transcripts.crawler.discover_navigation_seeds",
+        lambda *args, **kwargs: NavigationDiscoveryResult(
+            seeds=[],
+            trace=NavigationTrace(company=company),
+            verified_homepage_urls=["https://www.amazon.com"],
+            verified_company_name="Amazon",
+        ),
+    )
+
+    crawler = TranscriptCrawler(
+        model="test-model",
+        out_dir=tmp_path,
+        discovery_mode="nav-first",
+    )
+
+    result = crawler.crawl_company(company)
+
+    assert result.verified_homepage_urls == ["https://www.amazon.com"]
+    assert result.verified_company_name == "Amazon"
+
+
 def test_search_first_preserves_search_discovery(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr("ir_transcripts.crawler.find_ir_candidates", lambda *args, **kwargs: ["https://search.example.com"])
     crawler = TranscriptCrawler(model="test-model", out_dir=tmp_path, discovery_mode="search-first")

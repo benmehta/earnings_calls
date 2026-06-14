@@ -48,6 +48,9 @@ def merge_company_memory(existing: CompanyMemory, incoming: CompanyMemory) -> Co
     merged = existing.model_copy(deep=True)
     merged.company = merge_company(existing.company, incoming.company)
     merged.official_hosts = merge_unique_strings(existing.official_hosts, incoming.official_hosts)
+    merged.ir_hosts = merge_unique_strings(existing.ir_hosts, incoming.ir_hosts)
+    merged.official_homepage_urls = merge_unique_strings(existing.official_homepage_urls, incoming.official_homepage_urls)
+    merged.successful_path_urls = merge_unique_strings(existing.successful_path_urls, incoming.successful_path_urls)
     merged.known_ir_urls = merge_unique_strings(existing.known_ir_urls, incoming.known_ir_urls)
     merged.attempted_configs = merge_unique_models(existing.attempted_configs, incoming.attempted_configs)
     merged.failure_summaries = merge_unique_models(existing.failure_summaries, incoming.failure_summaries)
@@ -150,12 +153,32 @@ def model_identity(value: BaseModel) -> str:
 
 def remember_crawl_result(memory: CompanyMemory, result: CrawlResult, analysis: FailureAnalysis) -> CompanyMemory:
     navigation_memory = memory.navigation_memory
+    if result.verified_company_name and not is_weak_identity(
+        Company(symbol=memory.company.symbol, name=result.verified_company_name)
+    ):
+        memory.company = memory.company.model_copy(update={"name": result.verified_company_name})
+    for url in result.verified_homepage_urls:
+        memory.official_homepage_urls = append_unique(memory.official_homepage_urls, url)
+        homepage_host = host(url)
+        if homepage_host:
+            memory.official_hosts = append_unique(memory.official_hosts, homepage_host)
+
+    if result.transcripts:
+        for url in successful_result_urls(result):
+            memory.successful_path_urls = append_unique(memory.successful_path_urls, url)
+            path_host = host(url)
+            if path_host and not low_value_memory_host(path_host):
+                memory.official_hosts = append_unique(memory.official_hosts, path_host)
+                if url not in result.verified_homepage_urls:
+                    memory.ir_hosts = append_unique(memory.ir_hosts, path_host)
+
     for url in [result.ir_url, *(candidate.url for candidate in result.candidates)]:
         if url:
             memory.known_ir_urls = append_unique(memory.known_ir_urls, url)
             url_host = host(url)
             if url_host and not low_value_memory_host(url_host):
                 memory.official_hosts = append_unique(memory.official_hosts, url_host)
+                memory.ir_hosts = append_unique(memory.ir_hosts, url_host)
             if is_ir_home_url(url):
                 navigation_memory.known_ir_home_urls = append_unique(navigation_memory.known_ir_home_urls, url)
             if is_event_listing_url(url) and not low_value_memory_path(url):
@@ -175,6 +198,7 @@ def remember_crawl_result(memory: CompanyMemory, result: CrawlResult, analysis: 
         navigation_memory.known_transcript_urls = append_unique(navigation_memory.known_transcript_urls, source_url)
         transcript_host = host(source_url)
         if transcript_host:
+            memory.ir_hosts = append_unique(memory.ir_hosts, transcript_host)
             navigation_memory.successful_hosts = append_unique(navigation_memory.successful_hosts, transcript_host)
             navigation_memory.preferred_hosts = append_unique(navigation_memory.preferred_hosts, transcript_host)
         path = urlparse(source_url).path
@@ -187,11 +211,28 @@ def remember_crawl_result(memory: CompanyMemory, result: CrawlResult, analysis: 
     return memory
 
 
+def successful_result_urls(result: CrawlResult) -> list[str]:
+    urls: list[str] = []
+    for url in result.verified_homepage_urls:
+        append_unique(urls, url)
+    if result.ir_url:
+        append_unique(urls, result.ir_url)
+    for candidate in result.candidates:
+        append_unique(urls, candidate.url)
+    for record in result.transcripts:
+        append_unique(urls, str(record.source_url))
+    return urls
+
+
 def apply_crawl_reflection(memory: CompanyMemory, reflection: CrawlReflection) -> CompanyMemory:
     navigation_memory = memory.navigation_memory
     reflection_preferred_hosts = {host(url) for url in reflection.preferred_urls if host(url)}
     for url in reflection.preferred_urls:
         memory.known_ir_urls = append_unique(memory.known_ir_urls, url)
+        preferred_host = host(url)
+        if preferred_host and not low_value_memory_host(preferred_host):
+            memory.ir_hosts = append_unique(memory.ir_hosts, preferred_host)
+            memory.official_hosts = append_unique(memory.official_hosts, preferred_host)
         if is_ir_home_url(url):
             navigation_memory.known_ir_home_urls = append_unique(navigation_memory.known_ir_home_urls, url)
         if is_event_listing_url(url) or looks_like_quarterly_detail_url(url):

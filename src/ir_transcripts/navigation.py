@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from urllib.parse import urlparse
 
 from .agent import HomepagePredictionAgent, HomepageValidationAgent, IRNavigationAgent
-from .browser import PlaywrightRenderer
+from .browser import BROWSER_COMPATIBLE_USER_AGENT, PlaywrightRenderer
 from .http import HttpClient, RobotsUnavailableError
 from .identity import company_display_name, filter_homepage_prediction_urls, is_homepage_candidate_url, is_weak_identity, official_homepage_urls, resolve_company_identity_with_overrides, verify_homepage_content
 from .models import CandidateLink, Company, CompanyNavigationMemory, FailureType, NavigationStep, NavigationTrace, PromptGuidance
@@ -23,6 +23,8 @@ class NavigationDiscoveryResult:
     failure_message: str = ""
     failure_urls: list[str] | None = None
     robots_verified_official_urls: list[str] | None = None
+    verified_homepage_urls: list[str] | None = None
+    verified_company_name: str | None = None
 
 
 @dataclass
@@ -31,6 +33,8 @@ class HomepageStartResolution:
     failure_type: FailureType | None = None
     failure_message: str = ""
     failure_urls: list[str] | None = None
+    verified_homepage_urls: list[str] | None = None
+    verified_company_name: str | None = None
 
 
 PREDICTIVE_HOMEPAGE_CONFIDENCE_FLOOR = 0.55
@@ -64,6 +68,8 @@ def discover_navigation_seeds(
     progress = progress or ProgressReporter(enabled=False)
     progress.log(f"{company.symbol}: navigation discovery starting")
     trace = NavigationTrace(company=company)
+    verified_homepage_urls: list[str] = []
+    verified_company_name: str | None = None
     if is_weak_identity(company) and not disable_predictive_identity:
         homepage_resolution = predict_and_validate_homepage_starts(
             company,
@@ -84,8 +90,12 @@ def discover_navigation_seeds(
                 failure_message=homepage_resolution.failure_message,
                 failure_urls=homepage_resolution.failure_urls or [],
                 robots_verified_official_urls=[],
+                verified_homepage_urls=homepage_resolution.verified_homepage_urls or [],
+                verified_company_name=homepage_resolution.verified_company_name,
             )
         starts = homepage_resolution.starts
+        verified_homepage_urls = homepage_resolution.verified_homepage_urls or []
+        verified_company_name = homepage_resolution.verified_company_name
         if navigation_memory:
             starts = dedupe([*starts, *memory_start_urls(navigation_memory)])
     else:
@@ -103,7 +113,13 @@ def discover_navigation_seeds(
         )
     if not starts:
         progress.log(f"{company.symbol}: navigation discovery has no start URLs")
-        return NavigationDiscoveryResult(seeds=[], trace=trace, robots_verified_official_urls=[])
+        return NavigationDiscoveryResult(
+            seeds=[],
+            trace=trace,
+            robots_verified_official_urls=[],
+            verified_homepage_urls=verified_homepage_urls,
+            verified_company_name=verified_company_name,
+        )
     progress.log(f"{company.symbol}: navigation start URL(s): {', '.join(starts[:5])}")
 
     agent = IRNavigationAgent(
@@ -145,6 +161,8 @@ def discover_navigation_seeds(
                     failure_message=message,
                     failure_urls=[current_url],
                     robots_verified_official_urls=robots_verified_official_urls,
+                    verified_homepage_urls=verified_homepage_urls,
+                    verified_company_name=verified_company_name,
                 )
             progress.log(
                 f"{company.symbol}: fetching official IR subdomain despite unavailable robots.txt {current_url}"
@@ -160,17 +178,21 @@ def discover_navigation_seeds(
                 failure_message=message,
                 failure_urls=[current_url],
                 robots_verified_official_urls=robots_verified_official_urls,
+                verified_homepage_urls=verified_homepage_urls,
+                verified_company_name=verified_company_name,
             )
 
         html = response.text
         title = page_title(html)
         text = visible_text(html)
+        render_strategy = "http"
         if renderer and should_render_navigation_page(playwright_mode, html, text):
             try:
                 progress.log(f"{company.symbol}: rendering navigation page {current_url}")
                 html = renderer.render_html(current_url)
                 title = page_title(html)
                 text = visible_text(html)
+                render_strategy = "playwright_crawler_ua"
             except Exception as exc:
                 message = f"navigation render failed ({type(exc).__name__}: {exc})"
                 progress.log(f"{company.symbol}: {message}: {current_url}")
@@ -181,8 +203,9 @@ def discover_navigation_seeds(
                     failure_message=message,
                     failure_urls=[current_url],
                     robots_verified_official_urls=robots_verified_official_urls,
+                    verified_homepage_urls=verified_homepage_urls,
+                    verified_company_name=verified_company_name,
                 )
-        page_context = navigation_page_context(current_url, title, text)
         raw_links = extract_links(html, current_url)
         verification = verify_homepage_content(
             company,
@@ -191,19 +214,6 @@ def discover_navigation_seeds(
             text=text,
             links=raw_links,
         )
-        if verification.is_official and verification.linked_ir_urls:
-            progress.log(
-                f"{company.symbol}: homepage evidence found {len(verification.linked_ir_urls)} official IR link(s)"
-            )
-            for accepted_host in verification.accepted_hosts:
-                allowed_hosts.add(accepted_host)
-            for linked_url in verification.linked_ir_urls:
-                if is_language_variant_url(linked_url):
-                    continue
-                allowed_hosts.add(host(linked_url))
-                discovered.append(linked_url)
-                queue.append(linked_url)
-
         links = navigation_candidate_links(
             raw_links,
             current_url=current_url,
@@ -211,12 +221,56 @@ def discover_navigation_seeds(
             company=company,
             limit=max_links,
         )
+        if (
+            renderer
+            and not links
+            and should_render_with_browser_user_agent(
+                current_url,
+                text=text,
+                raw_links=raw_links,
+                verified_official_urls=[*verified_homepage_urls, *robots_verified_official_urls],
+            )
+        ):
+            try:
+                progress.log(f"{company.symbol}: browser-UA rendering navigation page {current_url}")
+                html = renderer.render_html_with_user_agent(current_url, BROWSER_COMPATIBLE_USER_AGENT)
+                title = page_title(html)
+                text = visible_text(html)
+                raw_links = extract_links(html, current_url)
+                verification = verify_homepage_content(
+                    company,
+                    url=current_url,
+                    title=title,
+                    text=text,
+                    links=raw_links,
+                )
+                links = navigation_candidate_links(
+                    raw_links,
+                    current_url=current_url,
+                    allowed_hosts=allowed_hosts,
+                    company=company,
+                    limit=max_links,
+                )
+                render_strategy = "browser_ua_fallback"
+            except Exception as exc:
+                progress.log(f"{company.symbol}: browser-UA render fallback skipped ({type(exc).__name__}: {current_url})")
+
+        remember_homepage_ir_evidence(
+            company=company,
+            verification=verification,
+            allowed_hosts=allowed_hosts,
+            discovered=discovered,
+            queue=queue,
+            progress=progress,
+        )
+        page_context = navigation_page_context(current_url, title, text)
         if not links:
             trace.steps.append(
                 NavigationStep(
                     current_url=current_url,
                     title=title,
                     chosen_urls=list(verification.linked_ir_urls),
+                    render_strategy=render_strategy,
                     stop_reason="no_useful_links",
                     reason="homepage_content_verified" if verification.linked_ir_urls else "",
                 )
@@ -254,6 +308,8 @@ def discover_navigation_seeds(
                 failure_message=message,
                 failure_urls=[current_url],
                 robots_verified_official_urls=robots_verified_official_urls,
+                verified_homepage_urls=verified_homepage_urls,
+                verified_company_name=verified_company_name,
             )
         else:
             chosen_urls = decision.chosen_urls or [links[0].url]
@@ -273,6 +329,7 @@ def discover_navigation_seeds(
                 title=title,
                 chosen_urls=chosen_urls,
                 rejected_urls=rejected,
+                render_strategy=render_strategy,
                 confidence=confidence,
                 reason=reason,
                 stop_reason=stop_reason,
@@ -293,6 +350,8 @@ def discover_navigation_seeds(
         seeds=seeds,
         trace=trace,
         robots_verified_official_urls=robots_verified_official_urls,
+        verified_homepage_urls=verified_homepage_urls,
+        verified_company_name=verified_company_name,
     )
 
 
@@ -347,6 +406,8 @@ def predict_and_validate_homepage_starts(
         text_chars=llm_text_chars,
     )
     verified_starts: list[str] = []
+    verified_homepage_urls: list[str] = []
+    verified_company_name: str | None = None
     attempted: list[str] = []
     for url in homepage_urls:
         attempted.append(url)
@@ -380,6 +441,9 @@ def predict_and_validate_homepage_starts(
         accepted_by_llm = bool(decision and decision.is_official and decision.confidence >= 0.55)
         if not accepted_by_llm:
             continue
+        verified_homepage_urls.append(url)
+        if decision and decision.official_company_name and not verified_company_name:
+            verified_company_name = decision.official_company_name
         verified_starts.append(url)
         verified_starts.extend(
             linked_url
@@ -394,8 +458,14 @@ def predict_and_validate_homepage_starts(
             failure_type="homepage_unverified",
             failure_message="no predicted homepage could be verified from fetched page evidence",
             failure_urls=attempted,
+            verified_homepage_urls=verified_homepage_urls,
+            verified_company_name=verified_company_name,
         )
-    return HomepageStartResolution(starts=starts)
+    return HomepageStartResolution(
+        starts=starts,
+        verified_homepage_urls=dedupe(verified_homepage_urls),
+        verified_company_name=verified_company_name,
+    )
 
 
 def navigation_start_urls(
@@ -494,6 +564,53 @@ def can_delegate_unavailable_ir_subdomain_robots(
         if registrable_domain(verified_host) == target_domain and not is_ir_subdomain_host(verified_host):
             return True
     return False
+
+
+def should_render_with_browser_user_agent(
+    url: str,
+    *,
+    text: str,
+    raw_links: list[CandidateLink],
+    verified_official_urls: list[str],
+) -> bool:
+    if not is_within_verified_official_domain(url, verified_official_urls):
+        return False
+    return len(text.strip()) < 1_000 or len(raw_links) < 10
+
+
+def is_within_verified_official_domain(url: str, verified_official_urls: list[str]) -> bool:
+    target_domain = registrable_domain(host(url))
+    if not target_domain:
+        return False
+    for verified_url in verified_official_urls:
+        verified_domain = registrable_domain(host(verified_url))
+        if verified_domain and verified_domain == target_domain:
+            return True
+    return False
+
+
+def remember_homepage_ir_evidence(
+    *,
+    company: Company,
+    verification,
+    allowed_hosts: set[str],
+    discovered: list[str],
+    queue: deque[str],
+    progress: ProgressReporter,
+) -> None:
+    if not (verification.is_official and verification.linked_ir_urls):
+        return
+    progress.log(
+        f"{company.symbol}: homepage evidence found {len(verification.linked_ir_urls)} official IR link(s)"
+    )
+    for accepted_host in verification.accepted_hosts:
+        allowed_hosts.add(accepted_host)
+    for linked_url in verification.linked_ir_urls:
+        if is_language_variant_url(linked_url):
+            continue
+        allowed_hosts.add(host(linked_url))
+        discovered.append(linked_url)
+        queue.append(linked_url)
 
 
 def is_ir_subdomain_host(value: str) -> bool:

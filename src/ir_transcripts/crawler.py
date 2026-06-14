@@ -52,6 +52,8 @@ class SeedDiscoveryResult:
     failures: list[CrawlFailure]
     skipped_reason: str = "No investor-relations candidates found"
     robots_verified_official_urls: list[str] | None = None
+    verified_homepage_urls: list[str] | None = None
+    verified_company_name: str | None = None
 
 
 class TranscriptCrawler:
@@ -130,9 +132,20 @@ class TranscriptCrawler:
         seeds = [resolve_document_url(seed) for seed in seeds]
         if not seeds:
             self.progress.log(f"{company.symbol}: crawl skipped; {discovery.skipped_reason}")
-            return CrawlResult(company=company, failures=discovery.failures, skipped_reason=discovery.skipped_reason)
+            return CrawlResult(
+                company=company,
+                failures=discovery.failures,
+                skipped_reason=discovery.skipped_reason,
+                verified_homepage_urls=discovery.verified_homepage_urls or [],
+                verified_company_name=discovery.verified_company_name,
+            )
 
-        result = CrawlResult(company=company, ir_url=seeds[0])
+        result = CrawlResult(
+            company=company,
+            ir_url=seeds[0],
+            verified_homepage_urls=discovery.verified_homepage_urls or [],
+            verified_company_name=discovery.verified_company_name,
+        )
         self.progress.log(f"{company.symbol}: crawling {len(seeds)} seed URL(s)")
         queue: deque[tuple[str, int, CandidateLink | None]] = deque((seed, 0, None) for seed in seeds)
         run_visited: set[str] = set()
@@ -433,6 +446,8 @@ class TranscriptCrawler:
                 failures=[failure],
                 skipped_reason=navigation.failure_message or str(navigation.failure_type),
                 robots_verified_official_urls=navigation.robots_verified_official_urls or [],
+                verified_homepage_urls=navigation.verified_homepage_urls or [],
+                verified_company_name=navigation.verified_company_name,
             )
         if navigation.seeds:
             self.progress.log(f"{company.symbol}: nav-first discovery produced {len(navigation.seeds)} seed(s)")
@@ -440,9 +455,16 @@ class TranscriptCrawler:
                 seeds=navigation.seeds,
                 failures=[],
                 robots_verified_official_urls=navigation.robots_verified_official_urls or [],
+                verified_homepage_urls=navigation.verified_homepage_urls or [],
+                verified_company_name=navigation.verified_company_name,
             )
         self.progress.log(f"{company.symbol}: nav-first discovery empty; search fallback disabled")
-        return SeedDiscoveryResult(seeds=[], failures=[])
+        return SeedDiscoveryResult(
+            seeds=[],
+            failures=[],
+            verified_homepage_urls=navigation.verified_homepage_urls or [],
+            verified_company_name=navigation.verified_company_name,
+        )
 
     def _search_seeds(self, company: Company) -> list[str]:
         self.progress.log(f"{company.symbol}: search-first discovery")

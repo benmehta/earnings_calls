@@ -249,7 +249,9 @@ class HomepageValidationAgent:
                         "Validate whether a fetched page is an official company homepage. "
                         "Use only page evidence and provided links. Return JSON only. "
                         "Accept only official home/about/corporate pages. Reject IR pages, "
-                        "finance portals, news sites, SEC pages, transcript archives, and unofficial pages.",
+                        "finance portals, news sites, SEC pages, transcript archives, and unofficial pages. "
+                        "If official, extract the concise official company or brand name from page evidence "
+                        "(for example Amazon, Microsoft, NVIDIA), not the ticker and not a legal suffix unless needed.",
                     ),
                     (
                         "human",
@@ -261,6 +263,7 @@ class HomepageValidationAgent:
                         "Links JSON:\n{links_json}\n\n"
                         "Return exactly:\n"
                         "{{\"is_official\":true,\"confidence\":0.8,"
+                        "\"official_company_name\":\"Example\","
                         "\"linked_ir_urls\":[\"https://example.com/investors\"],"
                         "\"reason\":\"short evidence-based reason\"}}",
                     ),
