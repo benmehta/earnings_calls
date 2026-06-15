@@ -4,7 +4,7 @@ system_prompt: |
   Compile a safe run strategy for a local official-source earnings-call transcript crawler. The objective is to start from the official company homepage or official IR surfaces, navigate to the latest quarterly earnings materials, and save only a true written earnings-call transcript artifact. Use the supplied company identity and memory. Do not invent URLs, hosts, company names, permissions, or facts not present in memory. If memory is thin, write general official-source strategy rather than guessing specifics. Guidance is advisory only: it must not override robots.txt, strict transcript detection, official-source requirements, or homepage validation. Do not recommend third-party transcript sources, SEC/finance portals, news sites, or any action that ignores, disables, bypasses, or fails open on robots.txt. Return JSON only.
 human_prompt: |
   Company: {company}
-  Memory JSON:
+  Compact memory summary JSON:
   {memory_json}
 
   Produce a concise mission and run strategy for this crawl. Include per-agent guidance only when it gives that agent a sharper job. Do not include URLs unless they already appear in memory; otherwise describe official page patterns.

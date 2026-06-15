@@ -962,10 +962,7 @@ class PromptPlannerAgent:
         )
 
     def plan(self, *, company: Company, memory: CompanyMemory) -> PromptGuidance:
-        memory_json = compact_text(
-            json.dumps(memory.model_dump(mode="json"), ensure_ascii=True),
-            self.text_chars,
-        )
+        memory_json = prompt_planner_memory_summary(memory, char_budget=self.text_chars)
         message = self.chain.invoke(
             {
                 "company": f"{company_display_name(company)} ({company.symbol})",
@@ -976,6 +973,90 @@ class PromptPlannerAgent:
             PromptGuidance.model_validate(extract_json_object(message.content)),
             company=company,
         )
+
+
+def prompt_planner_memory_summary(memory: CompanyMemory, *, char_budget: int = 1200) -> str:
+    summary = {
+        "company": memory.company.model_dump(mode="json"),
+        "verified_homepage_urls": memory.official_homepage_urls[:6],
+        "known_ir_urls": memory.known_ir_urls[:10],
+        "successful_path_urls": memory.successful_path_urls[:8],
+        "successful_transcript_urls": memory.successful_transcript_urls[:6],
+        "navigation_memory": {
+            "known_ir_home_urls": memory.navigation_memory.known_ir_home_urls[:6],
+            "known_event_listing_urls": memory.navigation_memory.known_event_listing_urls[:6],
+            "known_transcript_urls": memory.navigation_memory.known_transcript_urls[:6],
+            "successful_hosts": memory.navigation_memory.successful_hosts[:6],
+            "preferred_hosts": memory.navigation_memory.preferred_hosts[:6],
+            "low_value_hosts": memory.navigation_memory.low_value_hosts[:6],
+            "low_value_path_terms": memory.navigation_memory.low_value_path_terms[:8],
+            "robots_blocked_hosts": memory.navigation_memory.robots_blocked_hosts[:6],
+        },
+        "playbook": {
+            "issuer_name": memory.playbook.issuer_name,
+            "brand_names": memory.playbook.brand_names[:4],
+            "preferred_ir_urls": memory.playbook.preferred_ir_urls[:6],
+            "confidence": memory.playbook.confidence,
+            "evidence": memory.playbook.evidence[:4],
+        },
+        "recent_failures": [
+            {
+                "category": failure.category,
+                "summary": compact_text(failure.summary, 120),
+                "evidence_urls": failure.evidence_urls[:4],
+            }
+            for failure in memory.failure_summaries[-4:]
+        ],
+        "existing_guidance": memory.prompt_guidance.model_dump(mode="json") if memory.prompt_guidance else None,
+    }
+    text = compact_json(summary)
+    if len(text) <= char_budget:
+        return text
+
+    summary["existing_guidance"] = summarize_prompt_guidance(memory.prompt_guidance)
+    summary["recent_failures"] = summary["recent_failures"][-2:]
+    text = compact_json(summary)
+    if len(text) <= char_budget:
+        return text
+
+    summary["playbook"] = {
+        "issuer_name": memory.playbook.issuer_name,
+        "brand_names": memory.playbook.brand_names[:3],
+        "preferred_ir_urls": memory.playbook.preferred_ir_urls[:3],
+    }
+    summary["known_ir_urls"] = memory.known_ir_urls[:5]
+    summary["successful_path_urls"] = memory.successful_path_urls[:4]
+    text = compact_json(summary)
+    if len(text) <= char_budget:
+        return text
+
+    minimal = {
+        "company": memory.company.model_dump(mode="json"),
+        "verified_homepage_urls": memory.official_homepage_urls[:3],
+        "known_ir_urls": memory.known_ir_urls[:4],
+        "successful_transcript_urls": memory.successful_transcript_urls[:3],
+        "known_event_listing_urls": memory.navigation_memory.known_event_listing_urls[:4],
+        "low_value_hosts": memory.navigation_memory.low_value_hosts[:4],
+        "issuer_name": memory.playbook.issuer_name,
+        "brand_names": memory.playbook.brand_names[:3],
+    }
+    return compact_json(minimal)
+
+
+def compact_json(value) -> str:
+    return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+
+
+def summarize_prompt_guidance(guidance: PromptGuidance | None) -> dict | None:
+    if not guidance:
+        return None
+    return {
+        "priority_terms": guidance.priority_terms[:8],
+        "avoid_terms": guidance.avoid_terms[:8],
+        "navigation_guidance": compact_text(guidance.navigation_guidance, 180),
+        "transcript_guidance": compact_text(guidance.transcript_guidance, 180),
+        "risk_notes": guidance.risk_notes[:3],
+    }
 
 
 class CrawlReflectionAgent:

@@ -286,6 +286,25 @@ def test_memory_does_not_mark_blog_or_youtube_as_official_hosts() -> None:
     assert "www.youtube.com" in memory.navigation_memory.low_value_hosts
 
 
+def test_memory_does_not_mark_third_party_research_candidate_as_official() -> None:
+    company = Company(symbol="GOOG", name="Alphabet Google")
+    url = "https://quartr.com/companies/alphabet-inc_4122"
+    memory = remember_crawl_result(
+        load_company_memory(Path("/tmp/nonexistent-memory-root"), company),
+        CrawlResult(
+            company=company,
+            ir_url=url,
+            candidates=[CandidatePage(company=company, url=url, title="Alphabet Investor Relations Material")],
+        ),
+        FailureAnalysis(category="no_transcript_found", summary="No transcript", evidence_urls=[url]),
+    )
+
+    assert "quartr.com" not in memory.official_hosts
+    assert "quartr.com" not in memory.ir_hosts
+    assert url not in memory.known_ir_urls
+    assert "quartr.com" in memory.navigation_memory.low_value_hosts
+
+
 def test_memory_records_verified_homepage_identity() -> None:
     company = Company(symbol="AMZN", name="AMZN")
     memory = remember_crawl_result(
@@ -828,6 +847,82 @@ def test_disable_memory_ignores_persisted_memory_but_keeps_run_memory_for_retrie
     assert saved_memory.navigation_memory.known_event_listing_urls == ["https://investors.amazon.com/earnings.aspx"]
     assert saved_memory.navigation_memory.low_value_hosts == ["blog.example.com"]
     assert saved_memory.navigation_memory.successful_hosts == ["investors.amazon.com"]
+
+
+def test_disable_memory_with_prompt_planner_starts_from_blank_run_memory(monkeypatch, tmp_path: Path) -> None:
+    company = Company(symbol="GOOG", name=None)
+    persisted = CompanyMemory(company=Company(symbol="GOOG", name="Alphabet Inc."))
+    persisted.known_ir_urls = ["https://abc.xyz/investor/"]
+    persisted.navigation_memory.known_event_listing_urls = ["https://abc.xyz/investor/events/default.aspx"]
+    persisted.playbook.preferred_ir_urls = ["https://abc.xyz/investor/"]
+    persisted.prompt_guidance = PromptGuidance(priority_terms=["persisted-only"])
+    save_company_memory(tmp_path, persisted)
+    seen_planner_memory: list[CompanyMemory] = []
+    seen_configs: list[CrawlAttemptConfig] = []
+
+    class FakePlaybookAgent:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def build(self, *, company: Company, memory: CompanyMemory):
+            assert memory.known_ir_urls == []
+            assert memory.navigation_memory.known_event_listing_urls == []
+            assert memory.playbook.preferred_ir_urls == []
+            return memory.playbook
+
+    class FakeMemoryGuidanceAgent:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def guide(self, *, company: Company, memory: CompanyMemory):
+            assert memory.known_ir_urls == []
+            return PromptGuidance()
+
+    class FakePromptPlannerAgent:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def plan(self, *, company: Company, memory: CompanyMemory):
+            seen_planner_memory.append(memory.model_copy(deep=True))
+            return PromptGuidance(priority_terms=["fresh-run-only"])
+
+    monkeypatch.setattr("ir_transcripts.orchestration.CompanyPlaybookAgent", FakePlaybookAgent)
+    monkeypatch.setattr("ir_transcripts.orchestration.MemoryGuidanceAgent", FakeMemoryGuidanceAgent)
+    monkeypatch.setattr("ir_transcripts.orchestration.PromptPlannerAgent", FakePromptPlannerAgent)
+
+    def runner(run_company: Company, config: CrawlAttemptConfig) -> CrawlResult:
+        seen_configs.append(config.model_copy(deep=True))
+        return CrawlResult(
+            company=run_company,
+            transcripts=[
+                TranscriptRecord(
+                    company=run_company,
+                    source_url="https://abc.xyz/investor/q1-transcript",
+                    title="Alphabet Q1 Earnings Call Transcript",
+                    text="OPERATOR: Welcome.\nQUESTION-AND-ANSWER SESSION\nEND",
+                )
+            ],
+            visited_count=1,
+        )
+
+    supervisor = SupervisedCrawler(
+        model="test-model",
+        out_dir=tmp_path,
+        http=None,  # type: ignore[arg-type]
+        max_attempts=1,
+        base_config=CrawlAttemptConfig(use_prompt_planner=True, disable_memory=True),
+        attempt_runner=runner,
+    )
+
+    result = supervisor.run_company(company)
+
+    assert result.status == "success"
+    assert seen_planner_memory
+    assert seen_planner_memory[0].known_ir_urls == []
+    assert seen_planner_memory[0].navigation_memory.known_event_listing_urls == []
+    assert seen_planner_memory[0].prompt_guidance is None
+    assert seen_configs[0].prompt_guidance
+    assert seen_configs[0].prompt_guidance.priority_terms == ["fresh-run-only"]
 
 
 def test_no_memory_write_keeps_disable_memory_run_ephemeral(tmp_path: Path) -> None:

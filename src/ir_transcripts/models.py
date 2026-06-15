@@ -273,6 +273,13 @@ class PromptGuidance(BaseModel):
     agent_guidance: dict[str, str] = Field(default_factory=dict)
     risk_notes: list[str] = Field(default_factory=list)
 
+    @field_validator("priority_terms", "avoid_terms", "risk_notes", mode="before")
+    @classmethod
+    def coerce_string_list(cls, value):
+        if isinstance(value, str):
+            return [value]
+        return value
+
 
 class CrawlReflection(BaseModel):
     preferred_urls: list[str] = Field(default_factory=list)

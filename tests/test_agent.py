@@ -1,3 +1,5 @@
+import json
+
 from ir_transcripts.agent import (
     IRNavigationAgent,
     IRPageAgent,
@@ -9,6 +11,7 @@ from ir_transcripts.agent import (
     guidance_from_memory,
     hard_validate_navigation_decision,
     navigation_agent_kind,
+    prompt_planner_memory_summary,
     sanitize_crawl_reflection,
     sanitize_prompt_guidance,
 )
@@ -606,6 +609,42 @@ def test_prompt_guidance_sanitizer_removes_ticker_name_and_unsafe_terms() -> Non
     assert guidance.navigation_guidance == "Prefer official earnings event pages."
     assert guidance.transcript_guidance == ""
     assert guidance.risk_notes == ["stay on official pages"]
+
+
+def test_prompt_guidance_coerces_string_lists() -> None:
+    guidance = PromptGuidance.model_validate(
+        {
+            "priority_terms": "quarterly results",
+            "avoid_terms": "stock quote",
+            "risk_notes": "stay official",
+        }
+    )
+
+    assert guidance.priority_terms == ["quarterly results"]
+    assert guidance.avoid_terms == ["stock quote"]
+    assert guidance.risk_notes == ["stay official"]
+
+
+def test_prompt_planner_memory_summary_is_valid_compact_json() -> None:
+    memory = CompanyMemory(company=Company(symbol="GOOG", name="Alphabet Google"))
+    memory.playbook.issuer_name = "Alphabet Inc."
+    memory.playbook.preferred_ir_urls = [
+        "https://investors.alphabeat.com/",
+        "https://abc.xyz/investor/",
+    ]
+    memory.known_ir_urls = [f"https://abc.xyz/investor/events/{index}" for index in range(20)]
+    memory.failure_summaries = []
+    memory.prompt_guidance = PromptGuidance(
+        priority_terms=[f"term-{index}" for index in range(20)],
+        risk_notes=["Avoid generic pages"],
+    )
+
+    summary = prompt_planner_memory_summary(memory, char_budget=900)
+    parsed = json.loads(summary)
+
+    assert len(summary) <= 900
+    assert parsed["company"]["symbol"] == "GOOG"
+    assert "known_ir_urls" in parsed
 
 
 def test_crawl_reflection_sanitizes_unsafe_advice() -> None:

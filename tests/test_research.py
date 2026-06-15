@@ -122,3 +122,62 @@ def test_research_judge_rejection_stops_before_crawl(monkeypatch) -> None:
     assert result.seeds == []
     assert result.failure_type == "official_research_unverified"
     assert "official company" in result.failure_message
+
+
+def test_research_runtime_rejects_third_party_seed_even_if_judge_accepts(monkeypatch) -> None:
+    candidates = [
+        IRDiscoveryCandidate(
+            url="https://abc.xyz/investor/",
+            title="Alphabet Investor Relations",
+            snippet="Official Alphabet investor relations.",
+            source="search",
+            score=90,
+        ),
+        IRDiscoveryCandidate(
+            url="https://quartr.com/companies/alphabet-inc_4122",
+            title="Alphabet (GOOG) Investor Relations Material - 100% Free Access",
+            snippet="Third-party investor material and transcripts.",
+            source="search",
+            score=80,
+        ),
+    ]
+    monkeypatch.setattr("ir_transcripts.research.search_ir_candidates", lambda *args, **kwargs: candidates)
+
+    class FakeResearchAgent:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def research(self, **kwargs) -> TranscriptResearchProposal:
+            return TranscriptResearchProposal(
+                issuer_name="Alphabet Inc.",
+                official_ir_urls=["https://abc.xyz/investor/"],
+                transcript_candidate_urls=["https://quartr.com/companies/alphabet-inc_4122"],
+                confidence=0.9,
+                reason="official IR plus transcript candidate",
+            )
+
+    class FakeJudgeAgent:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def judge(self, **kwargs) -> TranscriptResearchJudgment:
+            return TranscriptResearchJudgment(
+                accepted=True,
+                accepted_transcript_urls=["https://quartr.com/companies/alphabet-inc_4122"],
+                official_company_name="Alphabet Inc.",
+                confidence=0.9,
+                reason="mistakenly accepted third-party result",
+            )
+
+    monkeypatch.setattr("ir_transcripts.research.OfficialTranscriptResearchAgent", FakeResearchAgent)
+    monkeypatch.setattr("ir_transcripts.research.TranscriptResearchJudgeAgent", FakeJudgeAgent)
+
+    result = discover_transcript_research_seeds(
+        Company(symbol="GOOG", name=None),
+        http=FakeHttp(),  # type: ignore[arg-type]
+        model="test-model",
+    )
+
+    assert result.seeds == []
+    assert result.failure_type == "official_research_unverified"
+    assert "third-party" in result.failure_message

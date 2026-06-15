@@ -107,18 +107,29 @@ def discover_transcript_research_seeds(
             failure_urls=proposed_urls,
         )
 
-    accepted = dedupe(
+    judged_accepted = dedupe(
         [
             *judgment.accepted_transcript_urls,
             *judgment.accepted_ir_urls,
             *judgment.accepted_homepage_urls,
         ]
     )
+    accepted = filter_official_research_seed_urls(judged_accepted)
     if not judgment.accepted or judgment.confidence < 0.55 or not accepted:
+        policy_message = (
+            "official transcript research accepted only third-party or non-official URLs"
+            if judged_accepted and not accepted
+            else ""
+        )
         return TranscriptResearchSeedResult(
             seeds=[],
             failure_type="official_research_unverified",
-            failure_message=judgment.retry_guidance or judgment.reason or "official transcript research was not verified",
+            failure_message=(
+                policy_message
+                or judgment.retry_guidance
+                or judgment.reason
+                or "official transcript research was not verified by runtime policy"
+            ),
             failure_urls=proposed_urls,
             verified_company_name=judgment.official_company_name or proposal.issuer_name,
         )
@@ -178,3 +189,23 @@ def research_judge_evidence(
         "search_candidates": [candidate.model_dump(mode="json") for candidate in candidates[:20]],
         "fetched": fetched,
     }
+
+
+def filter_official_research_seed_urls(urls: list[str]) -> list[str]:
+    return [url for url in urls if not is_known_third_party_research_url(url)]
+
+
+def is_known_third_party_research_url(url: str) -> bool:
+    destination = host(url)
+    blocked_hosts = (
+        "sec.gov",
+        "seekingalpha.com",
+        "finance.yahoo.com",
+        "marketbeat.com",
+        "stockanalysis.com",
+        "morningstar.com",
+        "quartr.com",
+        "financialreports.eu",
+        "prnewswire.com",
+    )
+    return any(destination == blocked or destination.endswith(f".{blocked}") for blocked in blocked_hosts)

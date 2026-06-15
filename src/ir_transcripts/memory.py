@@ -207,12 +207,13 @@ def remember_crawl_result(memory: CompanyMemory, result: CrawlResult, analysis: 
 
     for url in [result.ir_url, *(candidate.url for candidate in result.candidates)]:
         if url:
-            memory.known_ir_urls = append_unique(memory.known_ir_urls, url)
+            if not low_value_memory_url(url):
+                memory.known_ir_urls = append_unique(memory.known_ir_urls, url)
             url_host = host(url)
             if url_host and not low_value_memory_host(url_host):
                 memory.official_hosts = append_unique(memory.official_hosts, url_host)
                 memory.ir_hosts = append_unique(memory.ir_hosts, url_host)
-            if is_ir_home_url(url):
+            if is_ir_home_url(url) and not low_value_memory_url(url):
                 navigation_memory.known_ir_home_urls = append_unique(navigation_memory.known_ir_home_urls, url)
                 memory.playbook.preferred_ir_urls = append_unique(memory.playbook.preferred_ir_urls, url)
             if is_event_listing_url(url) and not low_value_memory_path(url):
@@ -349,7 +350,23 @@ def append_unique(values: list[str], value: str) -> list[str]:
 
 
 def low_value_memory_host(value: str) -> bool:
-    return any(token in value.lower() for token in ("blog.", "youtube.com", "youtu.be"))
+    low_value_hosts = (
+        "blog.",
+        "youtube.com",
+        "youtu.be",
+        "quartr.com",
+        "seekingalpha.com",
+        "finance.yahoo.com",
+        "marketbeat.com",
+        "stockanalysis.com",
+        "morningstar.com",
+        "financialreports.eu",
+    )
+    return any(token in value.lower() for token in low_value_hosts)
+
+
+def low_value_memory_url(url: str) -> bool:
+    return low_value_memory_host(host(url)) or low_value_memory_path(url)
 
 
 def low_value_memory_path(url: str) -> bool:
