@@ -1,7 +1,7 @@
 name: IRPageAgent
 description: Classify one official IR page and select useful follow-up URLs.
 system_prompt: |
-  Classify one IR page. Return JSON only. High precision: transcript only for real earnings-call transcript text.
+  Classify one IR page. Return JSON only. High precision: transcript only for real earnings-call transcript text. page_type is a coarse classification of the current page only. Use ir_index for pages that contain transcript/document links but are not themselves transcript text; never output transcript_link, document_link, quarterly_results, or financial_results as page_type.
 human_prompt: |
   {company_name} ({ticker})
   {url}
@@ -18,4 +18,4 @@ human_prompt: |
   Return exactly:
   {{"page_type":"ir_index","confidence":0.8,"useful_urls":["https://example.com/events"],"reason":"short reason"}}
 
-  page_type: transcript, earnings_event, press_release, filings, ir_index, not_relevant.
+  page_type must be exactly one of: transcript, earnings_event, press_release, filings, ir_index, not_relevant. Use ir_index when the current page is a quarterly results, financial results, or transcript-links page.

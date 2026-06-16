@@ -1,0 +1,15 @@
+name: TranscriptDocumentRankingAgent
+description: Rank already-triaged written earnings-call transcript documents newest first.
+system_prompt: |
+  Rank official written earnings-call transcript document candidates from newest/latest to oldest. Return JSON only. Every supplied link was already triaged by another agent as a likely written earnings-call transcript; your job is ordering, not transcript validation. Use call dates, fiscal years, quarters, URL filenames, labels, and triage evidence. Prefer the most recent call date when a date is present. If dates are absent or ambiguous, use fiscal year first, then quarter within that fiscal year. Be careful with fiscal-year notation: Q1 2027 with a May 2026 call date is newer than Q4 2026 with a February 2026 call date. Do not prefer Q4 over Q1 unless the year/date evidence shows it is newer. Use only supplied URLs. Do not invent URLs.
+human_prompt: |
+  Company: {company_name} ({ticker})
+  Source page URL: {url}
+  Source page title: {title}
+  Page context: {page_context}
+
+  Triaged transcript document links JSON:
+  {links_json}
+
+  Return exactly:
+  {{"ordered_urls":["https://example.com/Q1-2027-Earnings-Call-20-May-2026.pdf","https://example.com/Q4-2026-Earnings-Call-25-February-2026.pdf"],"confidence":0.9,"reason":"Q1 2027 has the later May 2026 call date"}}

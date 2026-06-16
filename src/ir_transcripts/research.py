@@ -21,6 +21,7 @@ from .urls import host, resolve_document_url
 @dataclass
 class TranscriptResearchSeedResult:
     seeds: list[str]
+    seed_roles: dict[str, str] | None = None
     failure_type: FailureType | None = None
     failure_message: str = ""
     failure_urls: list[str] | None = None
@@ -135,8 +136,10 @@ def discover_transcript_research_seeds(
         )
 
     progress.log(f"{company.symbol}: official transcript research accepted {len(accepted)} seed URL(s)")
+    seed_roles = research_seed_roles(judgment)
     return TranscriptResearchSeedResult(
         seeds=[resolve_document_url(url) for url in accepted],
+        seed_roles={resolve_document_url(url): seed_roles.get(url, "ir") for url in accepted},
         verified_homepage_urls=judgment.accepted_homepage_urls,
         verified_company_name=judgment.official_company_name or proposal.issuer_name,
     )
@@ -193,6 +196,17 @@ def research_judge_evidence(
 
 def filter_official_research_seed_urls(urls: list[str]) -> list[str]:
     return [url for url in urls if not is_known_third_party_research_url(url)]
+
+
+def research_seed_roles(judgment) -> dict[str, str]:
+    roles: dict[str, str] = {}
+    for url in judgment.accepted_homepage_urls:
+        roles[url] = "homepage"
+    for url in judgment.accepted_ir_urls:
+        roles[url] = "ir"
+    for url in judgment.accepted_transcript_urls:
+        roles[url] = "transcript_link"
+    return roles
 
 
 def is_known_third_party_research_url(url: str) -> bool:

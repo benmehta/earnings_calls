@@ -1,7 +1,9 @@
+from collections import deque
 from io import BytesIO
 from zipfile import ZipFile
 
 from ir_transcripts.crawler import (
+    SeedDiscoveryResult,
     TranscriptCrawler,
     artifact_stem,
     content_hash,
@@ -13,9 +15,13 @@ from ir_transcripts.crawler import (
     keep_latest_transcripts,
     link_score,
     low_value_after_transcript_document,
+    merge_candidate_links,
+    rendered_page_dynamic_hints,
+    rendered_page_recovery_targets,
+    structurally_prioritized_links,
 )
 from ir_transcripts.http import RobotsDisallowedError, RobotsUnavailableError
-from ir_transcripts.models import CandidateLink, Company, DocumentLinkTriageDecision, LinkBatchTriageDecision, LinkTriageSelection, NavigationTrace, PageDecision, TranscriptEvidenceDecision, TranscriptRecord
+from ir_transcripts.models import CandidateLink, Company, CrawlNavigatorDecision, DocumentLinkTriageDecision, LatestTranscriptSelectionDecision, LinkBatchTriageDecision, LinkTriageSelection, NavigationTrace, PageDecision, PageDecisionDraft, RenderedPageRecoveryDecision, TranscriptDocumentRankingDecision, TranscriptEvidenceDecision, TranscriptRecord
 from ir_transcripts.navigation import NavigationDiscoveryResult
 
 
@@ -49,6 +55,15 @@ class FakeTranscriptEvidenceAgent:
         )
 
 
+class CapturingTranscriptEvidenceAgent(FakeTranscriptEvidenceAgent):
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def classify(self, **kwargs):
+        self.calls.append(kwargs)
+        return super().classify(**kwargs)
+
+
 class FakeLinkBatchTriageAgent:
     def triage(self, *, links: list[CandidateLink], **kwargs):
         selections = []
@@ -65,6 +80,25 @@ class FakeLinkBatchTriageAgent:
                 )
             )
         return LinkBatchTriageDecision(selections=selections)
+
+
+class FakeLatestTranscriptSelectionAgent:
+    def select(self, *, links: list[CandidateLink], **kwargs):
+        selected = next((link for link in links if "2027" in f"{link.url} {link.label}"), None)
+        return LatestTranscriptSelectionDecision(
+            selected_urls=[selected.url] if selected else [],
+            confidence=0.9 if selected else 0.0,
+            reason="fake latest selection",
+        )
+
+
+class NoopTranscriptDocumentRankingAgent:
+    def rank(self, *, links: list[CandidateLink], **kwargs):
+        return TranscriptDocumentRankingDecision(
+            ordered_urls=[],
+            confidence=0.0,
+            reason="fake ranking disabled",
+        )
 
 
 def install_fake_transcript_evidence(crawler: TranscriptCrawler) -> TranscriptCrawler:
@@ -115,6 +149,328 @@ def test_heuristic_links_prioritize_transcript_document_after_page_chrome(tmp_pa
     assert transcript in prioritized
 
 
+def test_homepage_prioritize_fallback_keeps_navigation_links(tmp_path) -> None:
+    homepage_link = CandidateLink(
+        url="https://www.example.com/investors",
+        label="Investor Relations",
+        source_url="https://www.example.com",
+    )
+    corporate_pdf = CandidateLink(
+        url="https://www.example.com/content/dam/corporate-overview.pdf",
+        label="Corporate overview PDF",
+        source_url="https://www.example.com",
+    )
+    crawler = TranscriptCrawler(model="test-model", out_dir=tmp_path, seed_urls=["https://www.example.com"])
+    crawler._triaged_links = lambda company, url, title, links, **kwargs: []  # type: ignore[method-assign]
+
+    prioritized = crawler._prioritize_links(
+        Company(symbol="EX", name="Example"),
+        "https://www.example.com",
+        "Example",
+        [homepage_link, corporate_pdf],
+        page_context="homepage",
+    )
+
+    assert homepage_link in prioritized
+    assert corporate_pdf in prioritized
+
+
+def test_structural_link_fallback_prefers_body_links_before_nav() -> None:
+    nav_link = CandidateLink(
+        url="https://investor.example.com/stock-info",
+        label="Stock Info",
+        source_url="https://investor.example.com/events",
+        reason="nav",
+    )
+    body_link = CandidateLink(
+        url="https://investor.example.com/events/event-details/2027/q1",
+        label="Q1 Financial Results",
+        source_url="https://investor.example.com/events",
+        reason="body",
+    )
+
+    assert structurally_prioritized_links([nav_link, body_link])[0] == body_link
+
+
+def test_link_batch_triage_receives_structurally_prioritized_links(tmp_path) -> None:
+    nav_links = [
+        CandidateLink(
+            url=f"https://investor.example.com/nav/{index}",
+            label=f"Navigation {index}",
+            source_url="https://investor.example.com/quarterly-results",
+            reason="nav",
+        )
+        for index in range(20)
+    ]
+    transcript = CandidateLink(
+        url="https://cdn.example.com/files/EX-Q1-2027-Earnings-Call.pdf",
+        label="Transcript",
+        source_url="https://investor.example.com/quarterly-results",
+        reason="body",
+    )
+
+    class RecordingLinkBatchTriageAgent:
+        def __init__(self) -> None:
+            self.received_links: list[CandidateLink] = []
+
+        def triage(self, *, links: list[CandidateLink], **kwargs):
+            self.received_links = links
+            return LinkBatchTriageDecision(selections=[])
+
+    agent = RecordingLinkBatchTriageAgent()
+    crawler = TranscriptCrawler(model="test-model", out_dir=tmp_path, seed_urls=["https://investor.example.com"])
+    crawler.link_triage_agent = agent  # type: ignore[assignment]
+
+    crawler._prioritize_links(
+        Company(symbol="EX", name="Example"),
+        "https://investor.example.com/quarterly-results",
+        "Quarterly Results",
+        [*nav_links, transcript],
+    )
+
+    assert agent.received_links[0] == transcript
+
+
+def test_latest_transcript_selection_prepends_newest_document(tmp_path) -> None:
+    older = CandidateLink(
+        url="https://cdn.example.com/files/EX-Q1-2026-Earnings-Call.pdf",
+        label="Q1 Transcript 2026",
+        source_url="https://investor.example.com/financial-reports",
+        reason="body",
+    )
+    newer = CandidateLink(
+        url="https://cdn.example.com/files/EX-Q1-2027-Earnings-Call.pdf",
+        label="Q1 Transcript 2027",
+        source_url="https://investor.example.com/financial-reports",
+        reason="body",
+    )
+
+    class OlderFirstLinkBatchTriageAgent:
+        def triage(self, *, links: list[CandidateLink], **kwargs):
+            return LinkBatchTriageDecision(
+                selections=[
+                    LinkTriageSelection(url=older.url, priority=95, should_follow=True, reason="older transcript"),
+                    LinkTriageSelection(url=newer.url, priority=80, should_follow=True, reason="newer transcript"),
+                ]
+            )
+
+    crawler = TranscriptCrawler(model="test-model", out_dir=tmp_path, seed_urls=["https://investor.example.com"])
+    crawler.link_triage_agent = OlderFirstLinkBatchTriageAgent()  # type: ignore[assignment]
+    crawler.latest_transcript_selection_agent = FakeLatestTranscriptSelectionAgent()  # type: ignore[assignment]
+
+    ranked = crawler._triaged_links(
+        Company(symbol="EX", name="Example"),
+        "https://investor.example.com/financial-reports",
+        "Financial Reports",
+        [older, newer],
+    )
+
+    assert ranked[0] == newer
+    assert ranked[1] == older
+
+
+def test_document_triage_rescues_latest_selection_uncertainty(tmp_path) -> None:
+    release = CandidateLink(
+        url="https://cdn.example.com/files/EX-Q1-2027-Earnings-Release.pdf",
+        label="Q1 2027 Earnings Release",
+        source_url="https://investor.example.com/quarterly-results",
+        reason="document link",
+    )
+    transcript = CandidateLink(
+        url="https://cdn.example.com/files/EX-Q1-2027-Earnings-Call.pdf",
+        label="Q1 2027 Earnings Call Transcript",
+        source_url="https://investor.example.com/quarterly-results",
+        reason="document link",
+    )
+
+    class ReleaseFirstLinkBatchTriageAgent:
+        def triage(self, *, links: list[CandidateLink], **kwargs):
+            return LinkBatchTriageDecision(
+                selections=[
+                    LinkTriageSelection(url=release.url, priority=95, should_follow=True, reason="release first"),
+                    LinkTriageSelection(url=transcript.url, priority=60, should_follow=True, reason="transcript lower"),
+                ]
+            )
+
+    class UncertainLatestTranscriptSelectionAgent:
+        def select(self, *, links: list[CandidateLink], **kwargs):
+            return LatestTranscriptSelectionDecision(
+                selected_urls=[],
+                confidence=0.0,
+                reason="no likely written earnings-call transcript found",
+            )
+
+    crawler = TranscriptCrawler(model="test-model", out_dir=tmp_path, seed_urls=["https://investor.example.com"])
+    crawler.link_triage_agent = ReleaseFirstLinkBatchTriageAgent()  # type: ignore[assignment]
+    crawler.latest_transcript_selection_agent = UncertainLatestTranscriptSelectionAgent()  # type: ignore[assignment]
+    crawler.transcript_document_ranking_agent = NoopTranscriptDocumentRankingAgent()  # type: ignore[assignment]
+    crawler.document_triage_agent = FakeDocumentTriageAgent()  # type: ignore[assignment]
+
+    ranked = crawler._triaged_links(
+        Company(symbol="EX", name="Example"),
+        "https://investor.example.com/quarterly-results",
+        "Quarterly Results",
+        [release, transcript],
+    )
+
+    assert ranked[0].url == transcript.url
+    assert "[agent-selected]" in ranked[0].reason
+    assert "document_triage type=earnings_call_transcript" in ranked[0].reason
+
+
+def test_latest_selection_receives_document_triage_evidence(tmp_path) -> None:
+    older = CandidateLink(
+        url="https://cdn.example.com/files/EX-Q1-2026-Earnings-Call.pdf",
+        label="Q1 2026 Earnings Call",
+        source_url="https://investor.example.com/quarterly-results",
+        reason="older document",
+    )
+    newer = CandidateLink(
+        url="https://cdn.example.com/files/EX-Q1-2027-Earnings-Call.pdf",
+        label="Q1 2027 Earnings Call",
+        source_url="https://investor.example.com/quarterly-results",
+        reason="newer document",
+    )
+
+    class EmptyLinkBatchTriageAgent:
+        def triage(self, *, links: list[CandidateLink], **kwargs):
+            return LinkBatchTriageDecision(selections=[])
+
+    class TwoStepLatestTranscriptSelectionAgent:
+        def __init__(self) -> None:
+            self.calls: list[list[CandidateLink]] = []
+
+        def select(self, *, links: list[CandidateLink], **kwargs):
+            self.calls.append(links)
+            if len(self.calls) == 1:
+                return LatestTranscriptSelectionDecision(
+                    selected_urls=[],
+                    confidence=0.0,
+                    reason="uncertain without triage evidence",
+                )
+            assert all("document_triage type=earnings_call_transcript" in link.reason for link in links)
+            return LatestTranscriptSelectionDecision(
+                selected_urls=[newer.url],
+                confidence=0.9,
+                reason="newest triaged transcript",
+            )
+
+    latest_agent = TwoStepLatestTranscriptSelectionAgent()
+    crawler = TranscriptCrawler(model="test-model", out_dir=tmp_path, seed_urls=["https://investor.example.com"])
+    crawler.link_triage_agent = EmptyLinkBatchTriageAgent()  # type: ignore[assignment]
+    crawler.latest_transcript_selection_agent = latest_agent  # type: ignore[assignment]
+    crawler.transcript_document_ranking_agent = NoopTranscriptDocumentRankingAgent()  # type: ignore[assignment]
+    crawler.document_triage_agent = FakeDocumentTriageAgent()  # type: ignore[assignment]
+
+    ranked = crawler._triaged_links(
+        Company(symbol="EX", name="Example"),
+        "https://investor.example.com/quarterly-results",
+        "Quarterly Results",
+        [older, newer],
+    )
+
+    assert len(latest_agent.calls) == 2
+    assert ranked[0].url == newer.url
+    assert "newest triaged transcript" in ranked[0].reason
+
+
+def test_transcript_document_ranking_orders_newest_fiscal_document_first(tmp_path) -> None:
+    q4_2026 = CandidateLink(
+        url="https://s201.q4cdn.com/141608511/files/doc_financials/2026/q4/NVDA-Q4-2026-Earnings-Call-25-February-2026-5_00-PM-ET.pdf",
+        label="Q4 2026 Earnings Call",
+        source_url="https://investor.nvidia.com/financial-info/quarterly-results/default.aspx",
+        reason="document link",
+    )
+    q1_2027 = CandidateLink(
+        url="https://s201.q4cdn.com/141608511/files/doc_financials/2027/q1/NVDA-Q1-2027-Earnings-Call-20-May-2026-5_00-PM-ET.pdf",
+        label="Q1 2027 Earnings Call",
+        source_url="https://investor.nvidia.com/financial-info/quarterly-results/default.aspx",
+        reason="document link",
+    )
+
+    class OlderFirstLinkBatchTriageAgent:
+        def triage(self, *, links: list[CandidateLink], **kwargs):
+            return LinkBatchTriageDecision(
+                selections=[
+                    LinkTriageSelection(url=q4_2026.url, priority=95, should_follow=True, reason="older first"),
+                    LinkTriageSelection(url=q1_2027.url, priority=90, should_follow=True, reason="newer second"),
+                ]
+            )
+
+    class UncertainLatestTranscriptSelectionAgent:
+        def select(self, *, links: list[CandidateLink], **kwargs):
+            return LatestTranscriptSelectionDecision(
+                selected_urls=[],
+                confidence=0.0,
+                reason="uncertain",
+            )
+
+    class NewestFirstTranscriptDocumentRankingAgent:
+        def rank(self, *, links: list[CandidateLink], **kwargs):
+            assert all("document_triage type=earnings_call_transcript" in link.reason for link in links)
+            return TranscriptDocumentRankingDecision(
+                ordered_urls=[q1_2027.url, q4_2026.url],
+                confidence=0.9,
+                reason="Q1 2027 has later May 2026 call date than Q4 2026",
+            )
+
+    crawler = TranscriptCrawler(model="test-model", out_dir=tmp_path, seed_urls=["https://investor.nvidia.com"])
+    crawler.link_triage_agent = OlderFirstLinkBatchTriageAgent()  # type: ignore[assignment]
+    crawler.latest_transcript_selection_agent = UncertainLatestTranscriptSelectionAgent()  # type: ignore[assignment]
+    crawler.transcript_document_ranking_agent = NewestFirstTranscriptDocumentRankingAgent()  # type: ignore[assignment]
+    crawler.document_triage_agent = FakeDocumentTriageAgent()  # type: ignore[assignment]
+
+    ranked = crawler._triaged_links(
+        Company(symbol="NVDA", name="NVIDIA"),
+        "https://investor.nvidia.com/financial-info/quarterly-results/default.aspx",
+        "Quarterly Results",
+        [q4_2026, q1_2027],
+    )
+
+    assert ranked[0].url == q1_2027.url
+    assert ranked[1].url == q4_2026.url
+    assert "transcript document ranking after document triage" in ranked[0].reason
+
+
+def test_crawl_navigator_decision_accepts_object_chosen_urls() -> None:
+    decision = CrawlNavigatorDecision.model_validate(
+        {
+            "page_type": "ir_index",
+            "confidence": 0.8,
+            "chosen_urls": [{"url": "https://investor.example.com/events"}],
+            "reason": "object-shaped model output",
+        }
+    )
+
+    assert decision.chosen_urls == ["https://investor.example.com/events"]
+
+
+def test_crawl_navigator_decision_normalizes_page_type_alias() -> None:
+    decision = CrawlNavigatorDecision.model_validate(
+        {
+            "page_type": "transcript_link",
+            "confidence": 0.8,
+            "chosen_urls": ["https://investor.example.com/results"],
+            "reason": "page links to transcript documents",
+        }
+    )
+
+    assert decision.page_type == "ir_index"
+
+
+def test_page_decision_draft_normalizes_page_type_alias() -> None:
+    decision = PageDecisionDraft.model_validate(
+        {
+            "page_type": "quarterly_results",
+            "confidence": 0.8,
+            "useful_urls": ["https://investor.example.com/results"],
+            "reason": "quarterly results page with document links",
+        }
+    )
+
+    assert decision.page_type == "ir_index"
+
+
 def test_low_value_after_transcript_document_keeps_transcript_links() -> None:
     sec = CandidateLink(
         url="https://investor.example.com/financial-info/sec-filings/default.aspx",
@@ -137,10 +493,71 @@ def test_low_value_after_transcript_document_keeps_transcript_links() -> None:
     assert not low_value_after_transcript_document(transcript)
 
 
+def test_latest_only_queue_pruning_does_not_call_link_triage(tmp_path) -> None:
+    sec = CandidateLink(
+        url="https://investor.example.com/financial-info/sec-filings/default.aspx",
+        label="SEC Filings",
+        source_url="https://investor.example.com",
+    )
+    transcript = CandidateLink(
+        url="https://investor.example.com/q1-earnings-call-transcript.pdf",
+        label="Q1 Earnings Call Transcript",
+        source_url="https://investor.example.com",
+    )
+
+    class FailingLinkBatchTriageAgent:
+        def triage(self, **kwargs):
+            raise AssertionError("queue pruning should not ask the LLM")
+
+    crawler = TranscriptCrawler(
+        model="test-model",
+        out_dir=tmp_path,
+        seed_urls=["https://investor.example.com"],
+        latest_only=True,
+    )
+    crawler.link_triage_agent = FailingLinkBatchTriageAgent()  # type: ignore[assignment]
+
+    queue = crawler._trim_queue_after_transcript_document(
+        deque(
+            [
+                (sec.url, 1, sec, None),
+                (transcript.url, 1, transcript, None),
+            ]
+        )
+    )
+
+    assert [item[0] for item in queue] == [transcript.url]
+
+
 def test_document_like_link_is_mechanical_not_semantic() -> None:
     assert is_document_like_link("https://cdn.example.com/files/release.pdf")
     assert is_document_like_link("https://cdn.example.com/is/content/example/TranscriptQandA")
     assert not is_document_like_link("https://investor.example.com/quarterly-results")
+
+
+def test_merge_candidate_links_preserves_rendered_and_recovered_documents() -> None:
+    latest = CandidateLink(
+        url="https://cdn.example.com/EX-Q1-2027-Earnings-Call.pdf",
+        label="Q1 2027 Transcript",
+        source_url="https://investor.example.com/quarterly-results",
+        reason="rendered",
+    )
+    older = CandidateLink(
+        url="https://cdn.example.com/EX-Q4-2026-Earnings-Call.pdf",
+        label="Q4 2026 Transcript",
+        source_url="https://investor.example.com/quarterly-results",
+        reason="recovered",
+    )
+    duplicate_latest = CandidateLink(
+        url="https://cdn.example.com/EX-Q1-2027-Earnings-Call.pdf#maincontent",
+        label="Duplicate latest",
+        source_url="https://investor.example.com/quarterly-results",
+        reason="recovered",
+    )
+
+    merged = merge_candidate_links([latest], [older, duplicate_latest])
+
+    assert [link.url for link in merged] == [latest.url, older.url]
 
 
 def test_artifact_stem_and_content_hash_are_stable() -> None:
@@ -316,6 +733,247 @@ def test_crawler_does_not_save_ir_homepage_on_vague_transcript_evidence(tmp_path
     assert result.transcripts == []
     assert result.candidates[0].reason.endswith("transcript_rejected_agent_evidence")
     assert not [path for path in (tmp_path / "EX").glob("*.json") if not path.name.startswith("_")]
+
+
+def test_research_homepage_seed_passes_homepage_context_to_navigator(tmp_path) -> None:
+    class FakeResponse:
+        headers = {"content-type": "text/html"}
+        content = b""
+        text = """
+        <html><head><title>Example Corp</title></head>
+        <body>
+          <a href="/content/dam/corporate-overview.pdf">Corporate overview PDF</a>
+          <a href="https://investor.example.com/">Investor Relations</a>
+        </body></html>
+        """
+
+    class FakeHttp:
+        def get(self, url: str):
+            return FakeResponse()
+
+    seen_contexts: list[str] = []
+
+    class FakeAgent:
+        def decide_page(self, **kwargs):
+            seen_contexts.append(kwargs.get("page_context"))
+            links = {link.label: link for link in kwargs["links"]}
+            return PageDecision(
+                page_type="ir_index",
+                confidence=0.9,
+                useful_links=[links["Investor Relations"]],
+                reason="homepage-to-IR",
+            )
+
+    crawler = TranscriptCrawler(
+        model="test-model",
+        out_dir=tmp_path,
+        max_pages_per_company=1,
+        seed_urls=[],
+        http=FakeHttp(),  # type: ignore[arg-type]
+    )
+    crawler.agent = FakeAgent()  # type: ignore[assignment]
+    crawler.document_triage_agent = FakeDocumentTriageAgent()  # type: ignore[assignment]
+    install_fake_transcript_evidence(crawler)
+    crawler._triaged_links = lambda company, url, title, links, **kwargs: links  # type: ignore[method-assign]
+    crawler._discover_seed_result = lambda company: SeedDiscoveryResult(  # type: ignore[method-assign]
+        seeds=["https://www.example.com/"],
+        seed_roles={"https://www.example.com/": "homepage"},
+        failures=[],
+    )
+
+    result = crawler.crawl_company(Company(symbol="EX", name="Example Corp"))
+
+    assert seen_contexts == ["homepage"]
+    assert result.transcripts == []
+    assert result.candidates[0].reason.startswith("homepage-to-IR")
+
+
+def test_homepage_context_skips_non_transcript_documents(tmp_path) -> None:
+    class FakeResponse:
+        headers = {"content-type": "text/html"}
+        content = b""
+
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+    class FakeHttp:
+        def __init__(self) -> None:
+            self.urls: list[str] = []
+
+        def get(self, url: str):
+            self.urls.append(url)
+            if url == "https://www.example.com/":
+                return FakeResponse(
+                    """
+                    <html><head><title>Example Corp</title></head>
+                    <body>
+                      <a href="/content/dam/corporate-overview.pdf">Corporate overview PDF</a>
+                      <a href="/investors">Investor Relations</a>
+                    </body></html>
+                    """
+                )
+            return FakeResponse("<html><head><title>Investors</title></head><body>Investor relations</body></html>")
+
+    class FakeAgent:
+        def decide_page(self, **kwargs):
+            links = {link.label: link for link in kwargs["links"]}
+            useful = []
+            if "Corporate overview PDF" in links:
+                useful.append(links["Corporate overview PDF"])
+            if "Investor Relations" in links:
+                useful.append(links["Investor Relations"])
+            return PageDecision(page_type="ir_index", confidence=0.9, useful_links=useful, reason="homepage")
+
+    http = FakeHttp()
+    crawler = TranscriptCrawler(
+        model="test-model",
+        out_dir=tmp_path,
+        max_pages_per_company=3,
+        seed_urls=[],
+        http=http,  # type: ignore[arg-type]
+    )
+    crawler.agent = FakeAgent()  # type: ignore[assignment]
+    crawler.document_triage_agent = FakeDocumentTriageAgent()  # type: ignore[assignment]
+    crawler.link_triage_agent = FakeLinkBatchTriageAgent()  # type: ignore[assignment]
+    install_fake_transcript_evidence(crawler)
+    crawler._discover_seed_result = lambda company: SeedDiscoveryResult(  # type: ignore[method-assign]
+        seeds=["https://www.example.com/"],
+        seed_roles={"https://www.example.com/": "homepage"},
+        failures=[],
+    )
+
+    crawler.crawl_company(Company(symbol="EX", name="Example Corp"))
+
+    assert "https://www.example.com/content/dam/corporate-overview.pdf" not in http.urls
+    assert "https://www.example.com/investors" in http.urls
+
+
+def test_rendered_page_recovery_agent_exposes_dynamic_transcript_link(monkeypatch, tmp_path) -> None:
+    initial_html = """
+    <html><head><title>Example Quarterly Results</title></head>
+    <body>
+      <label for="year">Select Year</label>
+      <select id="year"><option value="">Select Year</option><option value="2027">2027</option></select>
+      <button aria-expanded="false">First Quarter 2027</button>
+      <div id="results">Loading...</div>
+      <script type="text/template">{{docUrl}}</script>
+    </body></html>
+    """
+    recovered_html = """
+    <html><head><title>Example Quarterly Results</title></head>
+    <body>
+      <a href="https://cdn.example.com/EX-Q1-2027-Earnings-Call-Transcript.pdf">Q1 Transcript</a>
+    </body></html>
+    """
+
+    class FakeResponse:
+        content = b""
+
+        def __init__(self, text: str = "", content_type: str = "text/html", content: bytes | None = None) -> None:
+            self.text = text
+            self.content = content if content is not None else text.encode("utf-8")
+            self.headers = {"content-type": content_type}
+
+    class FakeHttp:
+        def __init__(self) -> None:
+            self.urls: list[str] = []
+
+        def get(self, url: str):
+            self.urls.append(url)
+            if url.endswith(".pdf"):
+                return FakeResponse(content_type="application/pdf", content=b"%PDF transcript")
+            return FakeResponse("<html><body>shell</body></html>")
+
+    class FakeRenderer:
+        def __init__(self) -> None:
+            self.actions: list[str] = []
+
+        def render_html(self, url: str) -> str:
+            return initial_html
+
+        def recover_html_with_actions(self, url: str, actions: list[str], targets=None) -> str:
+            self.actions = actions
+            return recovered_html
+
+    class FakeRecoveryAgent:
+        def decide(self, **kwargs):
+            assert "Select Year" in kwargs["dynamic_hints"]
+            return RenderedPageRecoveryDecision(
+                should_recover=True,
+                confidence=0.9,
+                actions=["wait_for_dynamic_content", "select_latest_option", "expand_disclosure_controls"],
+                reason="dynamic controls likely hide document links",
+            )
+
+    class FakeAgent:
+        def decide_page(self, **kwargs):
+            return PageDecision(page_type="ir_index", confidence=0.9, useful_links=kwargs["links"], reason="follow recovered links")
+
+    monkeypatch.setattr(
+        "ir_transcripts.crawler.pdf_text",
+        lambda content: "Operator: Welcome.\nJane Doe: Thanks.\nQuestion-and-answer session\nEND",
+    )
+
+    http = FakeHttp()
+    renderer = FakeRenderer()
+    crawler = TranscriptCrawler(
+        model="test-model",
+        out_dir=tmp_path,
+        max_pages_per_company=3,
+        seed_urls=["https://investor.example.com/quarterly-results"],
+        playwright_mode="always",
+        http=http,  # type: ignore[arg-type]
+    )
+    crawler.renderer = renderer  # type: ignore[assignment]
+    crawler.rendered_page_recovery_agent = FakeRecoveryAgent()  # type: ignore[assignment]
+    crawler.agent = FakeAgent()  # type: ignore[assignment]
+    crawler.document_triage_agent = FakeDocumentTriageAgent()  # type: ignore[assignment]
+    install_fake_transcript_evidence(crawler)
+
+    result = crawler.crawl_company(Company(symbol="EX", name="Example"))
+
+    assert renderer.actions == ["wait_for_dynamic_content", "select_latest_option", "expand_disclosure_controls"]
+    assert result.transcripts
+    assert result.transcripts[0].source_url == "https://cdn.example.com/EX-Q1-2027-Earnings-Call-Transcript.pdf"
+
+
+def test_rendered_page_dynamic_hints_describe_generic_controls() -> None:
+    hints = rendered_page_dynamic_hints(
+        """
+        <html><body>
+          <label for="year">Select Year</label>
+          <select id="year"><option value="">Select Year</option><option value="2027">2027</option></select>
+          <button aria-expanded="false">First Quarter</button>
+          <script type="text/template">{{docUrl}}</script>
+        </body></html>
+        """
+    )
+
+    assert "Select controls" in hints
+    assert "Collapsed controls" in hints
+    assert "Dynamic markers" in hints
+
+
+def test_rendered_page_recovery_targets_include_specific_safe_controls() -> None:
+    targets = rendered_page_recovery_targets(
+        """
+        <html><body>
+          <label for="year">Select Year</label>
+          <select id="year"><option value="">Select Year</option><option value="2027">2027</option></select>
+          <button id="q1" aria-expanded="false">First Quarter 2027</button>
+          <a href="/events/event-details/2027/q1">Q1 Financial Results</a>
+          <a href="/privacy">Privacy</a>
+        </body></html>
+        """
+    )
+
+    labels = [target["label"] for target in targets]
+
+    assert "Select Year -> 2027" in labels
+    assert "First Quarter 2027" in labels
+    assert "Q1 Financial Results" in labels
+    assert "Privacy" not in labels
+    assert all(target["id"].startswith("t") for target in targets)
 
 
 def test_crawler_always_playwright_mode_renders_plain_html(monkeypatch, tmp_path) -> None:
@@ -638,12 +1296,16 @@ def test_priority_document_triage_fetches_transcript_before_remaining_seed_pages
     )
     crawler.agent = FakeAgent()  # type: ignore[assignment]
     crawler.document_triage_agent = FakeDocumentTriageAgent()  # type: ignore[assignment]
-    install_fake_transcript_evidence(crawler)
+    transcript_agent = CapturingTranscriptEvidenceAgent()
+    crawler.transcript_evidence_agent = transcript_agent  # type: ignore[assignment]
     crawler.document_triage_agent = FakeDocumentTriageAgent()  # type: ignore[assignment]
 
     result = crawler.crawl_company(Company(symbol="EX", name="Example"))
 
     assert len(result.transcripts) == 1
+    assert transcript_agent.calls
+    assert "Source page: https://investor.example.com/financial-info/quarterly-results/default.aspx" in transcript_agent.calls[-1]["source_context"]
+    assert "Link label: Transcript" in transcript_agent.calls[-1]["source_context"]
     assert fetched[:2] == [
         "https://investor.example.com/financial-info/quarterly-results/default.aspx",
         "https://cdn.example.com/EX-Q1-2027-Earnings-Call.pdf",

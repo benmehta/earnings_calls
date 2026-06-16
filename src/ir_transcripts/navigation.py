@@ -7,11 +7,11 @@ from urllib.parse import urlparse
 from .agent import CrawlNavigatorAgent, HomepagePredictionAgent, HomepageValidationAgent, NavigationCandidateRankingAgent, NavigationPageContextAgent, compact_candidate_links
 from .browser import BROWSER_COMPATIBLE_USER_AGENT, PlaywrightRenderer
 from .http import HttpClient, RobotsUnavailableError
-from .identity import company_display_name, filter_homepage_prediction_urls, is_homepage_candidate_url, is_weak_identity, official_homepage_urls, resolve_company_identity_with_overrides, verify_homepage_content
+from .identity import company_display_name, curated_homepage_urls, filter_homepage_prediction_urls, is_homepage_candidate_url, is_weak_identity, official_homepage_urls, resolve_company_identity_with_overrides, verify_homepage_content
 from .models import CandidateLink, Company, CompanyNavigationMemory, FailureType, NavigationCandidateTrace, NavigationStep, NavigationTrace, PromptGuidance
 from .parsing import extract_links, looks_like_js_shell, page_title, visible_text
 from .runtime import ProgressReporter, timeout_after
-from .search import company_domain_tokens, company_domain_slug, discover_ir_candidates
+from .search import company_domain_tokens, company_domain_slug
 from .urls import host, normalize_url, resolve_document_url
 
 IRNavigationAgent = CrawlNavigatorAgent
@@ -40,6 +40,8 @@ class HomepageStartResolution:
 
 
 PREDICTIVE_HOMEPAGE_CONFIDENCE_FLOOR = 0.55
+MAX_HOMEPAGE_EVIDENCE_LINKS = 8
+MAX_NAVIGATION_DISCOVERY_SEEDS = 10
 
 
 def discover_navigation_seeds(
@@ -582,26 +584,8 @@ def navigation_start_urls(
         disable_official_homepage_overrides and company.symbol.upper() in {"GOOG", "GOOGL"}
     ):
         starts.append(f"https://www.{slug}.com")
-    starts.extend(
-        candidate.url
-        for candidate in discover_ir_candidates(
-            company,
-            max_results=6,
-            include_guesses=include_guesses,
-            disable_official_homepage_overrides=disable_official_homepage_overrides,
-            rerank_model=model,
-            ollama_base_url=ollama_base_url,
-            search_timeout_seconds=search_timeout_seconds,
-            llm_timeout_seconds=llm_timeout_seconds,
-            prompt_guidance=prompt_guidance,
-            navigation_memory=navigation_memory,
-            progress=progress,
-        )
-        if candidate.score > 0
-        and is_company_host(candidate.url, company)
-        and not memory_excluded_url(candidate.url, navigation_memory)
-        and not is_language_variant_url(candidate.url)
-    )
+    if navigation_memory:
+        starts.extend(memory_start_urls(navigation_memory))
     return rank_navigation_starts(
         [url for url in dedupe(starts) if not memory_excluded_url(url, navigation_memory)],
         company,
@@ -610,8 +594,13 @@ def navigation_start_urls(
 
 
 def should_predict_homepage_identity(company: Company, disable_official_homepage_overrides: bool) -> bool:
-    return is_weak_identity(company) or (
-        disable_official_homepage_overrides and company.symbol.upper() in {"GOOG", "GOOGL"}
+    return (
+        is_weak_identity(company)
+        or disable_official_homepage_overrides
+        or not curated_homepage_urls(
+            company,
+            allow_homepage_overrides=not disable_official_homepage_overrides,
+        )
     )
 
 
@@ -711,9 +700,18 @@ def remember_homepage_ir_evidence(
     )
     for accepted_host in verification.accepted_hosts:
         allowed_hosts.add(accepted_host)
-    for linked_url in verification.linked_ir_urls:
-        if is_language_variant_url(linked_url):
-            continue
+    linked_urls = [
+        linked_url
+        for linked_url in dedupe(list(verification.linked_ir_urls))
+        if not is_language_variant_url(linked_url)
+        and navigation_choice_score(linked_url, company) > 0
+    ]
+    linked_urls = sorted(
+        linked_urls,
+        key=lambda linked_url: navigation_choice_score(linked_url, company),
+        reverse=True,
+    )[:MAX_HOMEPAGE_EVIDENCE_LINKS]
+    for linked_url in linked_urls:
         allowed_hosts.add(host(linked_url))
         discovered.append(linked_url)
         queue.append(linked_url)
@@ -1007,9 +1005,16 @@ def navigation_seed_score(url: str, label: str, context: str, company: Company) 
         "investor": 30,
         "shareholders": 20,
         "financial info": 30,
+        "financial-info": 35,
+        "/financial-info": 40,
         "financial reports": 35,
+        "financial-reports": 55,
+        "/financial-reports": 65,
         "quarterly results": 30,
+        "quarterly-results": 70,
+        "/quarterly-results": 80,
         "earnings releases": 30,
+        "earnings-releases": 35,
         "earnings": 42,
         "events": 16,
         "presentations": 4,
@@ -1022,18 +1027,27 @@ def navigation_seed_score(url: str, label: str, context: str, company: Company) 
         "contact investor relations": 35,
         "contact": 15,
         "email alerts": 25,
+        "email-alert": 35,
+        "/email-alert": 45,
         "stock quote": 25,
+        "stock-info": 35,
+        "/stock-info": 45,
         "governance": 20,
+        "/governance": 45,
         "skip to main content": 50,
         "#maincontent": 50,
         "#main-content": 50,
         "additional information": 20,
         "faqs": 15,
+        "/faqs": 30,
         "home page": 15,
         "sec filings": 55,
         "/sec-filings": 70,
         "governance": 35,
         "annual meeting": 35,
+        "annual-reports": 45,
+        "/annual-reports": 55,
+        "investor-resources": 20,
         "stock": 30,
         "news releases": 20,
     }
@@ -1089,12 +1103,21 @@ def dedupe(urls: list[str]) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
     for url in urls:
-        normalized = normalize_url(url)
+        normalized = normalize_navigation_url(url)
         if normalized in seen:
             continue
         seen.add(normalized)
         result.append(url)
     return result
+
+
+def normalize_navigation_url(url: str) -> str:
+    normalized = normalize_url(url)
+    parsed = urlparse(normalized)
+    path = parsed.path
+    if path.lower().endswith("/default.aspx"):
+        normalized = parsed._replace(path=path.lower()).geturl()
+    return normalized
 
 
 def rank_discovered_urls(
@@ -1104,11 +1127,12 @@ def rank_discovered_urls(
     navigation_memory: CompanyNavigationMemory | None = None,
 ) -> list[str]:
     deduped = dedupe(urls)
-    return sorted(
+    ranked = sorted(
         deduped,
         key=lambda url: navigation_choice_score(url, company, navigation_memory=navigation_memory),
         reverse=True,
     )
+    return ranked[:MAX_NAVIGATION_DISCOVERY_SEEDS]
 
 
 def navigation_choice_score(

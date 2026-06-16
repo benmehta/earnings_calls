@@ -78,7 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--discovery-mode",
         choices=("nav-first", "search-first"),
         default=os.getenv("IR_DISCOVERY_MODE", "nav-first"),
-        help="Use official-site navigation before search, or preserve search-first discovery",
+        help="Discovery flow. nav-first predicts/verifies the official homepage, navigates homepage to IR, then crawls IR pages. search-first is explicit legacy search discovery.",
     )
     parser.add_argument("--include-discovery-guesses", action="store_true", help="Use deterministic IR URL guesses only if search/curated discovery finds nothing")
     parser.add_argument(
@@ -95,7 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--research-agent",
         action="store_true",
-        help="Use a high-level official transcript research agent and judge to produce crawl seeds",
+        help="Experimental opt-in: use search plus a high-level official transcript research judge to produce crawl seeds instead of homepage-first discovery",
     )
     parser.add_argument("--metadata-llm", action="store_true", help="Use a second local Ollama pass for confirmed transcript metadata")
     parser.add_argument("--prompt-planner", action="store_true", help="Use a local Ollama planner to create advisory prompts from company memory in supervised mode")

@@ -737,6 +737,15 @@ def failure_analysis_from_decision(
         or normalize_url(url) in {normalize_url(failure.url) for failure in result.failures if failure.url}
         or normalize_url(url) in {normalize_url(str(record.source_url)) for record in result.transcripts}
     ]
+    if decision.category == "robots_unavailable" and not any(
+        failure.failure_type == "robots_unavailable" for failure in result.failures
+    ):
+        return FailureAnalysis(
+            category="no_transcript_found",
+            summary="No transcript artifact was saved; robots_unavailable was not supported by crawl failures.",
+            retryable=True,
+            evidence_urls=[candidate.url for candidate in result.candidates[:20]],
+        )
     return FailureAnalysis(
         category=decision.category,
         summary=decision.summary[:240] or "Crawl outcome analyzed by orchestration agent.",

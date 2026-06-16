@@ -25,6 +25,7 @@ from .models import (
     IRDiscoveryCandidate,
     IRDiscoveryDecision,
     LinkBatchTriageDecision,
+    LatestTranscriptSelectionDecision,
     NavigationDecision,
     NavigationCandidateRankingDecision,
     NavigationPageContextDecision,
@@ -33,9 +34,11 @@ from .models import (
     PageDecision,
     PageDecisionDraft,
     PromptGuidance,
+    RenderedPageRecoveryDecision,
     RetryPlanningDecision,
     SearchCandidateRankingDecision,
     SearchQueryPlan,
+    TranscriptDocumentRankingDecision,
     TranscriptResearchJudgment,
     TranscriptResearchProposal,
     TranscriptEvidenceDecision,
@@ -52,6 +55,8 @@ HOMEPAGE_VALIDATION_PROMPT = load_agent_prompt("homepage_validation")
 DOCUMENT_LINK_TRIAGE_PROMPT = load_agent_prompt("document_link_triage")
 TRANSCRIPT_EVIDENCE_PROMPT = load_agent_prompt("transcript_evidence")
 LINK_BATCH_TRIAGE_PROMPT = load_agent_prompt("link_batch_triage")
+LATEST_TRANSCRIPT_SELECTION_PROMPT = load_agent_prompt("latest_transcript_selection")
+TRANSCRIPT_DOCUMENT_RANKING_PROMPT = load_agent_prompt("transcript_document_ranking")
 NAVIGATION_CANDIDATE_RANKING_PROMPT = load_agent_prompt("navigation_candidate_ranking")
 NAVIGATION_PAGE_CONTEXT_PROMPT = load_agent_prompt("navigation_page_context")
 MEMORY_GUIDANCE_PROMPT = load_agent_prompt("memory_guidance")
@@ -70,6 +75,7 @@ HOMEPAGE_NAV_PROMPT = load_agent_prompt("homepage_nav")
 IR_SECTION_PROMPT = load_agent_prompt("ir_section")
 EVENT_LISTING_PROMPT = load_agent_prompt("event_listing")
 TRANSCRIPT_LINK_PROMPT = load_agent_prompt("transcript_link")
+RENDERED_PAGE_RECOVERY_PROMPT = load_agent_prompt("rendered_page_recovery")
 
 
 def build_llm(
@@ -233,6 +239,65 @@ class IRPageAgent:
             useful_links=useful_links,
             reason=draft.reason,
         )
+
+
+class RenderedPageRecoveryAgent:
+    """Decides whether a rendered page needs safe generic browser interactions."""
+
+    SYSTEM_PROMPT = RENDERED_PAGE_RECOVERY_PROMPT.system_prompt
+    HUMAN_PROMPT = RENDERED_PAGE_RECOVERY_PROMPT.human_prompt or ""
+
+    def __init__(
+        self,
+        model: str,
+        base_url: str | None = None,
+        *,
+        text_chars: int = 900,
+    ) -> None:
+        self.text_chars = text_chars
+        self.chain = (
+            ChatPromptTemplate.from_messages(
+                [
+                    ("system", self.SYSTEM_PROMPT),
+                    ("human", self.HUMAN_PROMPT),
+                ]
+            )
+            | build_llm(model, base_url=base_url, json_mode=True)
+        )
+
+    def decide(
+        self,
+        *,
+        company_name: str,
+        ticker: str,
+        url: str,
+        title: str,
+        text: str,
+        page_context: str,
+        link_count: int,
+        document_link_count: int,
+        dynamic_hints: str,
+        recovery_targets: list[dict[str, str]] | None = None,
+    ) -> RenderedPageRecoveryDecision:
+        recovery_targets = recovery_targets or []
+        message = self.chain.invoke(
+            {
+                "company_name": company_name,
+                "ticker": ticker,
+                "url": url,
+                "title": title,
+                "page_context": page_context or "unknown",
+                "link_count": link_count,
+                "document_link_count": document_link_count,
+                "dynamic_hints": compact_text(dynamic_hints, 1200),
+                "targets_json": json.dumps(recovery_targets[:24], ensure_ascii=True),
+                "text": compact_text(text, self.text_chars),
+            }
+        )
+        decision = RenderedPageRecoveryDecision.model_validate(extract_json_object(message.content))
+        allowed_target_ids = {str(target.get("id")) for target in recovery_targets}
+        decision.target_ids = [target_id for target_id in decision.target_ids if target_id in allowed_target_ids]
+        return decision
 
 
 class IRDiscoveryAgent:
@@ -459,6 +524,7 @@ class TranscriptEvidenceAgent:
         url: str,
         title: str,
         text: str,
+        source_context: str = "",
     ) -> TranscriptEvidenceDecision:
         message = self.chain.invoke(
             {
@@ -466,6 +532,7 @@ class TranscriptEvidenceAgent:
                 "ticker": ticker,
                 "url": url,
                 "title": title,
+                "source_context": compact_text(source_context, 800),
                 "text": compact_text(text, self.text_chars),
             }
         )
@@ -506,6 +573,7 @@ class LinkBatchTriageAgent:
         url: str,
         title: str,
         links: list[CandidateLink],
+        page_context: str = "",
     ) -> LinkBatchTriageDecision:
         compact_links = compact_candidate_links(links, max_links=self.max_links)
         message = self.chain.invoke(
@@ -514,6 +582,7 @@ class LinkBatchTriageAgent:
                 "ticker": ticker,
                 "url": url,
                 "title": title,
+                "page_context": page_context or "unknown",
                 "guidance": guidance_for_agent(getattr(self, "guidance", None), "page", agent_name="LinkBatchTriageAgent"),
                 "links_json": json.dumps(compact_links, ensure_ascii=True),
             }
@@ -521,6 +590,108 @@ class LinkBatchTriageAgent:
         decision = LinkBatchTriageDecision.model_validate(extract_json_object(message.content))
         candidate_urls = {link.url for link in links}
         decision.selections = [selection for selection in decision.selections if selection.url in candidate_urls]
+        return decision
+
+
+class LatestTranscriptSelectionAgent:
+    """Selects the newest written transcript among document-like links on one page."""
+
+    SYSTEM_PROMPT = LATEST_TRANSCRIPT_SELECTION_PROMPT.system_prompt
+    HUMAN_PROMPT = LATEST_TRANSCRIPT_SELECTION_PROMPT.human_prompt or ""
+
+    def __init__(
+        self,
+        model: str,
+        base_url: str | None = None,
+        *,
+        max_links: int = 60,
+    ) -> None:
+        self.max_links = max_links
+        self.chain = (
+            ChatPromptTemplate.from_messages(
+                [
+                    ("system", self.SYSTEM_PROMPT),
+                    ("human", self.HUMAN_PROMPT),
+                ]
+            )
+            | build_llm(model, base_url=base_url, json_mode=True)
+        )
+
+    def select(
+        self,
+        *,
+        company_name: str,
+        ticker: str,
+        url: str,
+        title: str,
+        links: list[CandidateLink],
+        page_context: str = "",
+    ) -> LatestTranscriptSelectionDecision:
+        compact_links = compact_candidate_links(links, max_links=self.max_links)
+        message = self.chain.invoke(
+            {
+                "company_name": company_name,
+                "ticker": ticker,
+                "url": url,
+                "title": title,
+                "page_context": page_context or "unknown",
+                "links_json": json.dumps(compact_links, ensure_ascii=True),
+            }
+        )
+        decision = LatestTranscriptSelectionDecision.model_validate(extract_json_object(message.content))
+        candidate_urls = {link.url for link in links}
+        decision.selected_urls = [url for url in decision.selected_urls if url in candidate_urls]
+        return decision
+
+
+class TranscriptDocumentRankingAgent:
+    """Ranks triaged transcript document candidates newest first."""
+
+    SYSTEM_PROMPT = TRANSCRIPT_DOCUMENT_RANKING_PROMPT.system_prompt
+    HUMAN_PROMPT = TRANSCRIPT_DOCUMENT_RANKING_PROMPT.human_prompt or ""
+
+    def __init__(
+        self,
+        model: str,
+        base_url: str | None = None,
+        *,
+        max_links: int = 60,
+    ) -> None:
+        self.max_links = max_links
+        self.chain = (
+            ChatPromptTemplate.from_messages(
+                [
+                    ("system", self.SYSTEM_PROMPT),
+                    ("human", self.HUMAN_PROMPT),
+                ]
+            )
+            | build_llm(model, base_url=base_url, json_mode=True)
+        )
+
+    def rank(
+        self,
+        *,
+        company_name: str,
+        ticker: str,
+        url: str,
+        title: str,
+        links: list[CandidateLink],
+        page_context: str = "",
+    ) -> TranscriptDocumentRankingDecision:
+        compact_links = compact_candidate_links(links, max_links=self.max_links)
+        message = self.chain.invoke(
+            {
+                "company_name": company_name,
+                "ticker": ticker,
+                "url": url,
+                "title": title,
+                "page_context": page_context or "unknown",
+                "links_json": json.dumps(compact_links, ensure_ascii=True),
+            }
+        )
+        decision = TranscriptDocumentRankingDecision.model_validate(extract_json_object(message.content))
+        candidate_urls = {link.url for link in links}
+        decision.ordered_urls = [url for url in decision.ordered_urls if url in candidate_urls]
         return decision
 
 

@@ -74,7 +74,56 @@ def test_research_agent_and_judge_can_seed_official_urls(monkeypatch) -> None:
 
     assert result.failure_type is None
     assert result.seeds == ["https://investor.example.com/events"]
+    assert result.seed_roles == {"https://investor.example.com/events": "ir"}
     assert result.verified_company_name == "Example Corp"
+
+
+def test_research_seed_roles_preserve_homepage_context(monkeypatch) -> None:
+    candidate = IRDiscoveryCandidate(
+        url="https://www.example.com/",
+        title="Example Corp",
+        snippet="Official company homepage with investor relations footer.",
+        source="search",
+        score=90,
+    )
+    monkeypatch.setattr("ir_transcripts.research.search_ir_candidates", lambda *args, **kwargs: [candidate])
+
+    class FakeResearchAgent:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def research(self, **kwargs) -> TranscriptResearchProposal:
+            return TranscriptResearchProposal(
+                issuer_name="Example Corp",
+                official_homepage_urls=["https://www.example.com/"],
+                confidence=0.9,
+                reason="official homepage",
+            )
+
+    class FakeJudgeAgent:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def judge(self, **kwargs) -> TranscriptResearchJudgment:
+            return TranscriptResearchJudgment(
+                accepted=True,
+                accepted_homepage_urls=["https://www.example.com/"],
+                official_company_name="Example Corp",
+                confidence=0.9,
+                reason="official homepage evidence verified",
+            )
+
+    monkeypatch.setattr("ir_transcripts.research.OfficialTranscriptResearchAgent", FakeResearchAgent)
+    monkeypatch.setattr("ir_transcripts.research.TranscriptResearchJudgeAgent", FakeJudgeAgent)
+
+    result = discover_transcript_research_seeds(
+        Company(symbol="EXM", name=None),
+        http=FakeHttp(),  # type: ignore[arg-type]
+        model="test-model",
+    )
+
+    assert result.seeds == ["https://www.example.com/"]
+    assert result.seed_roles == {"https://www.example.com/": "homepage"}
 
 
 def test_research_judge_rejection_stops_before_crawl(monkeypatch) -> None:

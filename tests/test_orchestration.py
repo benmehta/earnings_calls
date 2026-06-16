@@ -16,6 +16,7 @@ from ir_transcripts.models import (
     CrawlReflection,
     CrawlResult,
     FailureAnalysis,
+    OrchestrationAnalysisDecision,
     PromptGuidance,
     TranscriptRecord,
 )
@@ -121,6 +122,42 @@ def test_robots_unavailable_transcript_doc_requires_manual_review() -> None:
     assert action.action_type == "manual_review"
     assert action.next_config is None
     assert "--robots-fail-open" in action.manual_recommendations[0]
+
+
+def test_orchestration_agent_cannot_invent_robots_unavailable_without_failure() -> None:
+    company = Company(symbol="NVDA", name="NVIDIA Corporation")
+    result = CrawlResult(
+        company=company,
+        candidates=[
+            CandidatePage(
+                company=company,
+                url="https://investor.nvidia.com/financial-info/quarterly-results/default.aspx",
+                title="NVIDIA Corporation - Financial Info - Quarterly Results",
+                llm_page_type="ir_index",
+                reason="transcript_rejected_agent_evidence",
+            )
+        ],
+        visited_count=1,
+    )
+
+    class FakeAnalysisAgent:
+        def analyze(self, *, company: Company, evidence):
+            return OrchestrationAnalysisDecision(
+                category="robots_unavailable",
+                summary="Robots unavailable",
+                retryable=False,
+                evidence_urls=["https://investor.nvidia.com/financial-info/quarterly-results/default.aspx"],
+            )
+
+    analysis = analyze_crawl_result(
+        result,
+        CrawlAttemptConfig(discovery_mode="nav-first"),
+        analysis_agent=FakeAnalysisAgent(),  # type: ignore[arg-type]
+    )
+
+    assert analysis.category == "no_transcript_found"
+    assert analysis.retryable is True
+    assert analysis.evidence_urls == ["https://investor.nvidia.com/financial-info/quarterly-results/default.aspx"]
 
 
 def test_retryable_analysis_with_manual_recommendation_retries_before_manual_review() -> None:

@@ -145,6 +145,7 @@ def test_agent_prompts_load_from_yaml() -> None:
     assert navigator_prompt.name == "CrawlNavigatorAgent"
     assert "main navigator" in navigator_prompt.system_prompt
     assert "latest official quarterly earnings-call transcript" in navigator_prompt.system_prompt
+    assert "never output transcript_link" in navigator_prompt.system_prompt
 
     document_prompt = load_agent_prompt("document_link_triage")
     assert document_prompt.name == "DocumentLinkTriageAgent"
@@ -157,6 +158,15 @@ def test_agent_prompts_load_from_yaml() -> None:
     link_prompt = load_agent_prompt("link_batch_triage")
     assert link_prompt.name == "LinkBatchTriageAgent"
     assert "official written earnings-call transcript artifacts" in link_prompt.system_prompt
+    assert "rank the newest/latest fiscal period first" in link_prompt.system_prompt
+
+    latest_prompt = load_agent_prompt("latest_transcript_selection")
+    assert latest_prompt.name == "LatestTranscriptSelectionAgent"
+    assert "newest/latest official written earnings-call transcript" in latest_prompt.system_prompt
+
+    ranking_prompt = load_agent_prompt("transcript_document_ranking")
+    assert ranking_prompt.name == "TranscriptDocumentRankingAgent"
+    assert "Q1 2027" in ranking_prompt.system_prompt
 
     nav_rank_prompt = load_agent_prompt("navigation_candidate_ranking")
     assert nav_rank_prompt.name == "NavigationCandidateRankingAgent"
@@ -204,6 +214,25 @@ def test_search_query_sanitizer_strips_invented_site_operator() -> None:
     )
 
     assert queries == ["GOOG 'latest quarterly earnings report'"]
+
+
+def test_search_query_plan_accepts_object_query_items() -> None:
+    from ir_transcripts.models import SearchQueryPlan
+
+    plan = SearchQueryPlan.model_validate(
+        {
+            "queries": [
+                {"query": "NVDA quarterly earnings call transcript"},
+                "NVDA investor relations quarterly results",
+            ],
+            "reason": "planner output",
+        }
+    )
+
+    assert plan.queries == [
+        "NVDA quarterly earnings call transcript",
+        "NVDA investor relations quarterly results",
+    ]
 
 
 def test_guidance_from_playbook_compiles_company_specific_strategy() -> None:

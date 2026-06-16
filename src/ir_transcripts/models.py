@@ -123,6 +123,58 @@ class LinkBatchTriageDecision(BaseModel):
     selections: list[LinkTriageSelection] = Field(default_factory=list)
 
 
+class LatestTranscriptSelectionDecision(BaseModel):
+    selected_urls: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    reason: str = ""
+
+    @field_validator("selected_urls", mode="before")
+    @classmethod
+    def coerce_selected_urls(cls, value):
+        if not isinstance(value, list):
+            return value
+        urls = []
+        for item in value:
+            if isinstance(item, str):
+                urls.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("url"), str):
+                urls.append(item["url"])
+        return urls
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def coerce_confidence(cls, value):
+        if isinstance(value, (int, float)) and value > 1:
+            return value / 100
+        return value
+
+
+class TranscriptDocumentRankingDecision(BaseModel):
+    ordered_urls: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    reason: str = ""
+
+    @field_validator("ordered_urls", mode="before")
+    @classmethod
+    def coerce_ordered_urls(cls, value):
+        if not isinstance(value, list):
+            return value
+        urls = []
+        for item in value:
+            if isinstance(item, str):
+                urls.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("url"), str):
+                urls.append(item["url"])
+        return urls
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def coerce_confidence(cls, value):
+        if isinstance(value, (int, float)) and value > 1:
+            return value / 100
+        return value
+
+
 class NavigationCandidateSelection(BaseModel):
     url: str
     priority: int = Field(default=0, ge=0, le=100)
@@ -147,9 +199,43 @@ class NavigationPageContextDecision(BaseModel):
         return value
 
 
+class RenderedPageRecoveryDecision(BaseModel):
+    should_recover: bool = False
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    actions: list[
+        Literal[
+            "wait_for_dynamic_content",
+            "select_latest_option",
+            "expand_disclosure_controls",
+        ]
+    ] = Field(default_factory=list)
+    target_ids: list[str] = Field(default_factory=list)
+    reason: str = ""
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def coerce_confidence(cls, value):
+        if isinstance(value, (int, float)) and value > 1:
+            return value / 100
+        return value
+
+
 class SearchQueryPlan(BaseModel):
     queries: list[str] = Field(default_factory=list)
     reason: str = ""
+
+    @field_validator("queries", mode="before")
+    @classmethod
+    def coerce_queries(cls, value):
+        if not isinstance(value, list):
+            return value
+        queries = []
+        for item in value:
+            if isinstance(item, str):
+                queries.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("query"), str):
+                queries.append(item["query"])
+        return queries
 
 
 class SearchCandidateSelection(BaseModel):
@@ -211,6 +297,24 @@ class CrawlNavigatorDecision(BaseModel):
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     reason: str = ""
     stop_reason: str | None = None
+
+    @field_validator("page_type", mode="before")
+    @classmethod
+    def normalize_page_type(cls, value):
+        return normalize_agent_page_type(value)
+
+    @field_validator("chosen_urls", mode="before")
+    @classmethod
+    def coerce_chosen_urls(cls, value):
+        if not isinstance(value, list):
+            return value
+        urls = []
+        for item in value:
+            if isinstance(item, str):
+                urls.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("url"), str):
+                urls.append(item["url"])
+        return urls
 
     @field_validator("confidence", mode="before")
     @classmethod
@@ -317,6 +421,11 @@ class PageDecisionDraft(BaseModel):
     useful_urls: list[str] = Field(default_factory=list)
     reason: str = ""
 
+    @field_validator("page_type", mode="before")
+    @classmethod
+    def normalize_page_type(cls, value):
+        return normalize_agent_page_type(value)
+
     @field_validator("useful_urls", mode="before")
     @classmethod
     def coerce_useful_urls(cls, value):
@@ -329,6 +438,36 @@ class PageDecisionDraft(BaseModel):
             elif isinstance(item, dict) and isinstance(item.get("url"), str):
                 urls.append(item["url"])
         return urls
+
+
+def normalize_agent_page_type(value):
+    if not isinstance(value, str):
+        return value
+    normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "transcript_link": "ir_index",
+        "transcript_links": "ir_index",
+        "transcript_document_link": "ir_index",
+        "document_link": "ir_index",
+        "document_links": "ir_index",
+        "quarterly_results": "ir_index",
+        "financial_results": "ir_index",
+        "results_page": "ir_index",
+        "investor_relations": "ir_index",
+        "ir_page": "ir_index",
+        "event": "earnings_event",
+        "event_detail": "earnings_event",
+        "earnings_call": "earnings_event",
+        "earnings_results": "earnings_event",
+        "earnings_release": "press_release",
+        "press_release_page": "press_release",
+        "sec_filings": "filings",
+        "sec_filing": "filings",
+        "filing": "filings",
+        "irrelevant": "not_relevant",
+        "not relevant": "not_relevant",
+    }
+    return aliases.get(normalized, normalized)
 
 
 class TranscriptRecord(BaseModel):

@@ -38,3 +38,10 @@ def test_no_memory_write_flag_is_available() -> None:
     args = build_parser().parse_args(["--no-memory-write"])
 
     assert args.no_memory_write is True
+
+
+def test_default_discovery_is_homepage_first_without_research_agent() -> None:
+    args = build_parser().parse_args([])
+
+    assert args.discovery_mode == "nav-first"
+    assert args.research_agent is False

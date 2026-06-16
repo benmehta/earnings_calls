@@ -112,6 +112,20 @@ def official_homepage_urls(
     return dedupe([*identity.homepage_urls, *deterministic_homepage_urls(identity.company.name)])
 
 
+def curated_homepage_urls(
+    company: Company,
+    *,
+    allow_homepage_overrides: bool = True,
+) -> list[str]:
+    symbol = company.symbol.upper()
+    known = KNOWN_COMPANY_IDENTITIES.get(symbol)
+    if not known:
+        return []
+    if symbol in {"GOOG", "GOOGL"} and not allow_homepage_overrides:
+        return []
+    return dedupe(list(known.homepage_urls))
+
+
 def deterministic_homepage_urls(company_name: str | None) -> list[str]:
     from .search import company_domain_slug
 
