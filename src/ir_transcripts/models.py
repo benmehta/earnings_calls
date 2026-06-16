@@ -123,6 +123,33 @@ class LinkBatchTriageDecision(BaseModel):
     selections: list[LinkTriageSelection] = Field(default_factory=list)
 
 
+class EarningsArtifactSelection(BaseModel):
+    url: str
+    role: Literal[
+        "transcript",
+        "press_release",
+        "slides",
+        "financial_statement",
+        "webcast",
+        "other",
+    ] = "other"
+    priority: int = Field(default=0, ge=0, le=100)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    reason: str = ""
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def coerce_confidence(cls, value):
+        if isinstance(value, (int, float)) and value > 1:
+            return value / 100
+        return value
+
+
+class EarningsArtifactExtractionDecision(BaseModel):
+    selections: list[EarningsArtifactSelection] = Field(default_factory=list)
+    reason: str = ""
+
+
 class LatestTranscriptSelectionDecision(BaseModel):
     selected_urls: list[str] = Field(default_factory=list)
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)

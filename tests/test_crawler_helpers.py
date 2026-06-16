@@ -21,7 +21,7 @@ from ir_transcripts.crawler import (
     structurally_prioritized_links,
 )
 from ir_transcripts.http import RobotsDisallowedError, RobotsUnavailableError
-from ir_transcripts.models import CandidateLink, Company, CrawlNavigatorDecision, DocumentLinkTriageDecision, LatestTranscriptSelectionDecision, LinkBatchTriageDecision, LinkTriageSelection, NavigationTrace, PageDecision, PageDecisionDraft, RenderedPageRecoveryDecision, TranscriptDocumentRankingDecision, TranscriptEvidenceDecision, TranscriptRecord
+from ir_transcripts.models import CandidateLink, Company, CrawlNavigatorDecision, CrawlResult, DocumentLinkTriageDecision, EarningsArtifactExtractionDecision, EarningsArtifactSelection, LatestTranscriptSelectionDecision, LinkBatchTriageDecision, LinkTriageSelection, NavigationTrace, PageDecision, PageDecisionDraft, RenderedPageRecoveryDecision, TranscriptDocumentRankingDecision, TranscriptEvidenceDecision, TranscriptRecord
 from ir_transcripts.navigation import NavigationDiscoveryResult
 
 
@@ -80,6 +80,34 @@ class FakeLinkBatchTriageAgent:
                 )
             )
         return LinkBatchTriageDecision(selections=selections)
+
+
+class FakeEarningsArtifactExtractionAgent:
+    def extract(self, *, links: list[CandidateLink], **kwargs):
+        selections = []
+        for link in links:
+            haystack = f"{link.url} {link.label} {link.reason}".lower()
+            if "transcript" in haystack:
+                selections.append(
+                    EarningsArtifactSelection(
+                        url=link.url,
+                        role="transcript",
+                        priority=95,
+                        confidence=0.9,
+                        reason="fake transcript artifact",
+                    )
+                )
+            elif any(token in haystack for token in ("income statement", "financial statements", "performance", "metrics")):
+                selections.append(
+                    EarningsArtifactSelection(
+                        url=link.url,
+                        role="financial_statement",
+                        priority=30,
+                        confidence=0.8,
+                        reason="fake financial table",
+                    )
+                )
+        return EarningsArtifactExtractionDecision(selections=selections, reason="fake artifacts")
 
 
 class FakeLatestTranscriptSelectionAgent:
@@ -229,6 +257,75 @@ def test_link_batch_triage_receives_structurally_prioritized_links(tmp_path) -> 
     )
 
     assert agent.received_links[0] == transcript
+
+
+def test_earnings_artifact_extraction_prioritizes_msft_style_transcript_link(tmp_path) -> None:
+    transcript = CandidateLink(
+        url="https://cdn.example.com/is/content/examplecorp/TranscriptQandAFY26Q3",
+        label="Transcript",
+        source_url="https://www.example.com/en-us/investor/events/fy-2026/earnings-fy-2026-q3",
+        reason="body",
+    )
+    webcast = CandidateLink(
+        url="https://www.example.com/en-us/Investor/earnings/FY-2026-Q3/press-release-webcast",
+        label="Press Release & Webcast",
+        source_url="https://www.example.com/en-us/investor/events/fy-2026/earnings-fy-2026-q3",
+        reason="nav",
+    )
+    financials = CandidateLink(
+        url="https://www.example.com/en-us/Investor/earnings/FY-2026-Q3/income-statements",
+        label="Financial Statements",
+        source_url="https://www.example.com/en-us/investor/events/fy-2026/earnings-fy-2026-q3",
+        reason="nav",
+    )
+    performance = CandidateLink(
+        url="https://www.example.com/en-us/Investor/earnings/FY-2026-Q3/performance",
+        label="Performance",
+        source_url="https://www.example.com/en-us/investor/events/fy-2026/earnings-fy-2026-q3",
+        reason="nav",
+    )
+    metrics = CandidateLink(
+        url="https://www.example.com/en-us/Investor/earnings/FY-2026-Q3/metrics",
+        label="Metrics",
+        source_url="https://www.example.com/en-us/investor/events/fy-2026/earnings-fy-2026-q3",
+        reason="nav",
+    )
+
+    class FinancialsFirstLinkBatchTriageAgent:
+        def triage(self, *, links: list[CandidateLink], **kwargs):
+            return LinkBatchTriageDecision(
+                selections=[
+                    LinkTriageSelection(url=financials.url, priority=95, should_follow=True, reason="financials first"),
+                    LinkTriageSelection(url=performance.url, priority=90, should_follow=True, reason="performance second"),
+                    LinkTriageSelection(url=metrics.url, priority=85, should_follow=True, reason="metrics third"),
+                    LinkTriageSelection(url=webcast.url, priority=80, should_follow=True, reason="webcast fourth"),
+                    LinkTriageSelection(url=transcript.url, priority=60, should_follow=True, reason="transcript too low"),
+                ]
+            )
+
+    crawler = TranscriptCrawler(model="test-model", out_dir=tmp_path, seed_urls=["https://www.example.com/investor"])
+    crawler.earnings_artifact_agent = FakeEarningsArtifactExtractionAgent()  # type: ignore[assignment]
+    crawler.link_triage_agent = FinancialsFirstLinkBatchTriageAgent()  # type: ignore[assignment]
+    diagnostics = CrawlResult(company=Company(symbol="EX", name="Example"), ir_url="https://www.example.com/investor")
+
+    ranked = crawler._prioritize_links(
+        Company(symbol="EX", name="Example"),
+        "https://www.example.com/en-us/investor/events/fy-2026/earnings-fy-2026-q3",
+        "Example Fiscal Year 2026 Third Quarter Earnings Conference Call",
+        [financials, performance, webcast, metrics, transcript],
+        text="Wednesday, April 29, 2026. Transcript. Press Release & Webcast.",
+        page_context="earnings_event",
+        result=diagnostics,
+    )
+
+    ranked_urls = [link.url for link in ranked]
+    assert ranked[0].url == transcript.url
+    assert "earnings_artifact role=transcript" in ranked[0].reason
+    assert ranked_urls.index(transcript.url) < ranked_urls.index(financials.url)
+    assert any(
+        candidate.url == transcript.url and "earnings_artifact role=transcript" in candidate.reason
+        for candidate in diagnostics.candidates
+    )
 
 
 def test_latest_transcript_selection_prepends_newest_document(tmp_path) -> None:
@@ -487,9 +584,16 @@ def test_low_value_after_transcript_document_keeps_transcript_links() -> None:
         label="Q1 transcript",
         source_url="https://investor.example.com",
     )
+    financial_statement = CandidateLink(
+        url="https://investor.example.com/earnings/fy-2026-q3/income-statements",
+        label="Income Statements",
+        source_url="https://investor.example.com/events/fy-2026/q3",
+        reason="[agent-selected] earnings_artifact role=financial_statement confidence=0.90",
+    )
 
     assert low_value_after_transcript_document(sec)
     assert low_value_after_transcript_document(presentation)
+    assert low_value_after_transcript_document(financial_statement)
     assert not low_value_after_transcript_document(transcript)
 
 
@@ -569,6 +673,20 @@ def test_artifact_stem_and_content_hash_are_stable() -> None:
 
 def test_crawl_identity_url_ignores_http_https_scheme() -> None:
     assert crawl_identity_url("http://example.com/investors/") == crawl_identity_url("https://example.com/investors")
+
+
+def test_crawl_identity_url_dedupes_page_casing_and_fragments() -> None:
+    upper = "https://www.example.com/en-us/Investor/earnings/FY-2026-Q3/press-release-webcast#mainContent"
+    lower = "https://www.example.com/en-us/investor/earnings/fy-2026-q3/press-release-webcast"
+
+    assert crawl_identity_url(upper) == crawl_identity_url(lower)
+
+
+def test_crawl_identity_url_preserves_document_path_casing() -> None:
+    upper = "https://cdn.example.com/is/content/examplecorp/TranscriptQandAFY26Q3"
+    lower = "https://cdn.example.com/is/content/examplecorp/transcriptqandafy26q3"
+
+    assert crawl_identity_url(upper) != crawl_identity_url(lower)
 
 
 def test_non_english_variant_is_skipped_from_english_page() -> None:

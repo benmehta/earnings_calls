@@ -20,6 +20,7 @@ from .models import (
     CrawlNavigatorDecision,
     CrawlReflection,
     DocumentLinkTriageDecision,
+    EarningsArtifactExtractionDecision,
     HomepagePrediction,
     HomepageValidationDecision,
     IRDiscoveryCandidate,
@@ -55,6 +56,7 @@ HOMEPAGE_VALIDATION_PROMPT = load_agent_prompt("homepage_validation")
 DOCUMENT_LINK_TRIAGE_PROMPT = load_agent_prompt("document_link_triage")
 TRANSCRIPT_EVIDENCE_PROMPT = load_agent_prompt("transcript_evidence")
 LINK_BATCH_TRIAGE_PROMPT = load_agent_prompt("link_batch_triage")
+EARNINGS_ARTIFACT_EXTRACTION_PROMPT = load_agent_prompt("earnings_artifact_extraction")
 LATEST_TRANSCRIPT_SELECTION_PROMPT = load_agent_prompt("latest_transcript_selection")
 TRANSCRIPT_DOCUMENT_RANKING_PROMPT = load_agent_prompt("transcript_document_ranking")
 NAVIGATION_CANDIDATE_RANKING_PROMPT = load_agent_prompt("navigation_candidate_ranking")
@@ -588,6 +590,64 @@ class LinkBatchTriageAgent:
             }
         )
         decision = LinkBatchTriageDecision.model_validate(extract_json_object(message.content))
+        candidate_urls = {link.url for link in links}
+        decision.selections = [selection for selection in decision.selections if selection.url in candidate_urls]
+        return decision
+
+
+class EarningsArtifactExtractionAgent:
+    """Ranks artifact links on an earnings event/materials page by document role."""
+
+    SYSTEM_PROMPT = EARNINGS_ARTIFACT_EXTRACTION_PROMPT.system_prompt
+    HUMAN_PROMPT = EARNINGS_ARTIFACT_EXTRACTION_PROMPT.human_prompt or ""
+
+    def __init__(
+        self,
+        model: str,
+        base_url: str | None = None,
+        *,
+        max_links: int = 80,
+        text_chars: int = 1200,
+        guidance: PromptGuidance | None = None,
+    ) -> None:
+        self.max_links = max_links
+        self.text_chars = text_chars
+        self.guidance = guidance
+        self.chain = (
+            ChatPromptTemplate.from_messages(
+                [
+                    ("system", self.SYSTEM_PROMPT),
+                    ("human", self.HUMAN_PROMPT),
+                ]
+            )
+            | build_llm(model, base_url=base_url, json_mode=True)
+        )
+
+    def extract(
+        self,
+        *,
+        company_name: str,
+        ticker: str,
+        url: str,
+        title: str,
+        text: str,
+        links: list[CandidateLink],
+        page_context: str = "",
+    ) -> EarningsArtifactExtractionDecision:
+        compact_links = compact_candidate_links(links, max_links=self.max_links)
+        message = self.chain.invoke(
+            {
+                "company_name": company_name,
+                "ticker": ticker,
+                "url": url,
+                "title": title,
+                "page_context": page_context or "unknown",
+                "guidance": guidance_for_agent(getattr(self, "guidance", None), "page", agent_name="EarningsArtifactExtractionAgent"),
+                "text": compact_text(text, self.text_chars),
+                "links_json": json.dumps(compact_links, ensure_ascii=True),
+            }
+        )
+        decision = EarningsArtifactExtractionDecision.model_validate(extract_json_object(message.content))
         candidate_urls = {link.url for link in links}
         decision.selections = [selection for selection in decision.selections if selection.url in candidate_urls]
         return decision

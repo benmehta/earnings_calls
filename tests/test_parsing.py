@@ -60,7 +60,7 @@ def test_extract_links_reads_custom_link_attributes() -> None:
     )
     links = extract_links(html, "https://www.microsoft.com/en-us/investor")
 
-    assert links[0].url == "https://cdn-dynmedia-1.microsoft.com/is/content/microsoftcorp/TranscriptQandAFY26Q3"
+    assert links[0].url == "https://aka.ms/transcriptfy26q3"
     assert links[0].label == "Earnings Call Transcript"
 
 

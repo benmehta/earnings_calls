@@ -18,11 +18,8 @@ def test_resolve_document_url_extracts_office_viewer_source() -> None:
     ) == "https://cdn.example.com/transcript.docx"
 
 
-def test_resolve_document_url_uses_curated_document_redirect() -> None:
-    assert (
-        resolve_document_url("https://aka.ms/transcriptfy26q3")
-        == "https://cdn-dynmedia-1.microsoft.com/is/content/microsoftcorp/TranscriptQandAFY26Q3"
-    )
+def test_resolve_document_url_does_not_curate_short_links() -> None:
+    assert resolve_document_url("https://aka.ms/transcriptfy26q3") == "https://aka.ms/transcriptfy26q3"
 
 
 def test_crawl_state_round_trip(tmp_path: Path) -> None:

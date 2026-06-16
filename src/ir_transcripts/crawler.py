@@ -7,12 +7,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
-from .agent import CrawlNavigatorAgent, DocumentLinkTriageAgent, LatestTranscriptSelectionAgent, LinkBatchTriageAgent, RenderedPageRecoveryAgent, TranscriptDocumentRankingAgent, TranscriptEvidenceAgent
+from .agent import CrawlNavigatorAgent, DocumentLinkTriageAgent, EarningsArtifactExtractionAgent, LatestTranscriptSelectionAgent, LinkBatchTriageAgent, RenderedPageRecoveryAgent, TranscriptDocumentRankingAgent, TranscriptEvidenceAgent
 from .browser import PlaywrightRenderer
 from .http import HttpClient, RobotsDisallowedError, RobotsUnavailableError
 from .identity import company_display_name
 from .metadata import TranscriptMetadataAgent, extract_metadata_heuristic
-from .models import CandidateLink, CandidatePage, Company, CompanyNavigationMemory, CrawlFailure, CrawlResult, DocumentLinkTriageDecision, FailureType, PageDecision, PromptGuidance, TranscriptRecord
+from .models import CandidateLink, CandidatePage, Company, CompanyNavigationMemory, CrawlFailure, CrawlResult, DocumentLinkTriageDecision, EarningsArtifactExtractionDecision, FailureType, PageDecision, PromptGuidance, TranscriptRecord
 from .navigation import can_delegate_unavailable_ir_subdomain_robots, discover_navigation_seeds
 from .parsing import TranscriptDetection, docx_text, extract_links, looks_like_js_shell, page_title, pdf_text, visible_text
 from .research import discover_transcript_research_seeds
@@ -91,6 +91,13 @@ class TranscriptCrawler:
             model,
             base_url=ollama_base_url,
             max_links=80,
+            guidance=prompt_guidance,
+        )
+        self.earnings_artifact_agent = EarningsArtifactExtractionAgent(
+            model,
+            base_url=ollama_base_url,
+            max_links=80,
+            text_chars=llm_text_chars,
             guidance=prompt_guidance,
         )
         self.latest_transcript_selection_agent = LatestTranscriptSelectionAgent(model, base_url=ollama_base_url)
@@ -297,7 +304,16 @@ class TranscriptCrawler:
             try:
                 self.progress.log(f"{company.symbol}: asking Ollama to classify page {url}")
                 page_context = seed_context or ""
-                prioritized_links = self._prioritize_links(company, url, title, links, page_context=page_context)
+                prioritized_links = self._prioritize_links(
+                    company,
+                    url,
+                    title,
+                    links,
+                    text=text,
+                    page_context=page_context,
+                    result=result,
+                    depth=depth,
+                )
                 with timeout_after(self.llm_timeout_seconds, f"classifying page {url}"):
                     decision = self._decide_page(
                         company_name=company_display_name(company),
@@ -923,9 +939,21 @@ class TranscriptCrawler:
         title: str,
         links: list[CandidateLink],
         *,
+        text: str = "",
         page_context: str = "",
+        result: CrawlResult | None = None,
+        depth: int = 0,
     ) -> list[CandidateLink]:
-        triaged = self._triaged_links(company, url, title, links, page_context=page_context)
+        triaged = self._triaged_links(
+            company,
+            url,
+            title,
+            links,
+            text=text,
+            page_context=page_context,
+            result=result,
+            depth=depth,
+        )
         if triaged:
             return triaged[:80]
         return structurally_prioritized_links(links)[:80]
@@ -951,13 +979,26 @@ class TranscriptCrawler:
         title: str,
         links: list[CandidateLink],
         *,
+        text: str = "",
         page_context: str = "",
+        result: CrawlResult | None = None,
+        depth: int = 0,
     ) -> list[CandidateLink]:
         triage_input_links = structurally_prioritized_links(links)
         cache_key = (normalize_url(url), page_context, "|".join(link.url for link in triage_input_links[:120]))
         cached = self._link_triage_cache.get(cache_key)
         if cached is not None:
             return cached
+        artifact_ranked = self._earnings_artifact_links(
+            company,
+            url,
+            title,
+            text,
+            triage_input_links,
+            page_context=page_context,
+            result=result,
+            depth=depth,
+        )
         try:
             with timeout_after(self.llm_timeout_seconds, f"triaging page links {url}"):
                 decision = self.link_triage_agent.triage(
@@ -983,6 +1024,7 @@ class TranscriptCrawler:
             selected.append((selection.priority, link))
         selected.sort(key=lambda item: item[0], reverse=True)
         ranked = [link for _, link in selected]
+        ranked = merge_candidate_links(artifact_ranked, ranked)
         ranked = self._prefer_latest_transcript_documents(
             company,
             url,
@@ -993,6 +1035,109 @@ class TranscriptCrawler:
         )
         self._link_triage_cache[cache_key] = ranked
         return ranked
+
+    def _earnings_artifact_links(
+        self,
+        company: Company,
+        url: str,
+        title: str,
+        text: str,
+        links: list[CandidateLink],
+        *,
+        page_context: str = "",
+        result: CrawlResult | None = None,
+        depth: int = 0,
+    ) -> list[CandidateLink]:
+        if page_context == "homepage":
+            return []
+        if not text.strip():
+            return []
+        if not links:
+            return []
+        try:
+            with timeout_after(self.llm_timeout_seconds, f"extracting earnings artifacts {url}"):
+                decision = self.earnings_artifact_agent.extract(
+                    company_name=company_display_name(company),
+                    ticker=company.symbol,
+                    url=url,
+                    title=title,
+                    text=text,
+                    links=links,
+                    page_context=page_context,
+                )
+        except Exception as exc:
+            self.progress.log(f"{company.symbol}: earnings artifact extraction skipped ({type(exc).__name__}: {url})")
+            return []
+        ranked = self._rank_artifact_decision_links(company, links, decision)
+        if result is not None:
+            self._record_artifact_decision_candidates(company, result, links, decision, depth=depth + 1)
+        if ranked:
+            summary = ", ".join(
+                f"{selection.role}:{selection.priority}:{selection.url}"
+                for selection in decision.selections[:5]
+            )
+            self.progress.log(f"{company.symbol}: earnings artifact extraction ranked {len(ranked)} link(s): {summary}")
+        return ranked
+
+    @staticmethod
+    def _rank_artifact_decision_links(
+        company: Company,
+        links: list[CandidateLink],
+        decision: EarningsArtifactExtractionDecision,
+    ) -> list[CandidateLink]:
+        links_by_url = {link.url: link for link in links}
+        role_bonus = {
+            "transcript": 1000,
+            "press_release": 500,
+            "slides": 420,
+            "webcast": 320,
+            "financial_statement": 120,
+            "other": 0,
+        }
+        ranked = []
+        for selection in decision.selections:
+            link = links_by_url.get(selection.url)
+            if not link:
+                continue
+            score = role_bonus.get(selection.role, 0) + selection.priority + int(selection.confidence * 100)
+            reason = (
+                f"earnings_artifact role={selection.role} "
+                f"confidence={selection.confidence:.2f} priority={selection.priority} "
+                f"reason={selection.reason}"
+            )
+            ranked.append((score, link.model_copy(update={"reason": f"[agent-selected] {reason}; {link.reason}".strip()})))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return [link for _, link in ranked]
+
+    @staticmethod
+    def _record_artifact_decision_candidates(
+        company: Company,
+        result: CrawlResult,
+        links: list[CandidateLink],
+        decision: EarningsArtifactExtractionDecision,
+        *,
+        depth: int,
+    ) -> None:
+        links_by_url = {link.url: link for link in links}
+        for selection in decision.selections[:10]:
+            link = links_by_url.get(selection.url)
+            if not link:
+                continue
+            result.candidates.append(
+                CandidatePage(
+                    company=company,
+                    url=selection.url,
+                    title=link.label or selection.url.rstrip("/").split("/")[-1],
+                    depth=depth,
+                    heuristic_score=0,
+                    llm_page_type="ir_index",
+                    llm_confidence=selection.confidence,
+                    reason=(
+                        f"earnings_artifact role={selection.role} priority={selection.priority} "
+                        f"reason={selection.reason}"
+                    ),
+                )
+            )
 
     def _prefer_latest_transcript_documents(
         self,
@@ -1383,9 +1528,11 @@ def crawl_identity_url(url: str) -> str:
     normalized = normalize_url(url)
     parsed = urlparse(normalized)
     if parsed.scheme in {"http", "https"}:
-        return parsed._replace(scheme="https").geturl()
+        path = parsed.path
+        if not is_document_like_link(normalized):
+            path = path.lower()
+        return parsed._replace(scheme="https", path=path, fragment="").geturl()
     return normalized
-
 
 def is_docx_response(url: str, content_type: str, content: bytes) -> bool:
     return (
@@ -1564,6 +1711,12 @@ def low_value_after_transcript_document(link: CandidateLink) -> bool:
     haystack = f"{link.url} {link.label}".lower()
     if is_document_like_link(link.url):
         return False
+    reason = link.reason.lower()
+    if any(
+        f"earnings_artifact role={role}" in reason
+        for role in ("press_release", "slides", "financial_statement", "webcast", "other")
+    ):
+        return True
     low_value_after_transcript_terms = (
         "annual-meeting",
         "annual meeting",

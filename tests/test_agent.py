@@ -160,6 +160,10 @@ def test_agent_prompts_load_from_yaml() -> None:
     assert "official written earnings-call transcript artifacts" in link_prompt.system_prompt
     assert "rank the newest/latest fiscal period first" in link_prompt.system_prompt
 
+    artifact_prompt = load_agent_prompt("earnings_artifact_extraction")
+    assert artifact_prompt.name == "EarningsArtifactExtractionAgent"
+    assert "Transcript, Q&A Transcript" in artifact_prompt.system_prompt
+
     latest_prompt = load_agent_prompt("latest_transcript_selection")
     assert latest_prompt.name == "LatestTranscriptSelectionAgent"
     assert "newest/latest official written earnings-call transcript" in latest_prompt.system_prompt
